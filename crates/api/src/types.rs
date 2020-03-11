@@ -210,7 +210,10 @@ impl FuncType {
             .iter()
             .map(|p| p.get_wasmtime_type().map(AbiParam::new))
             .collect::<Option<Vec<_>>>()?;
+        #[cfg(not(target_arch = "arm"))]
         params.insert(0, AbiParam::special(types::I64, ArgumentPurpose::VMContext));
+        #[cfg(target_arch = "arm")]
+        params.insert(0, AbiParam::special(types::I32, ArgumentPurpose::VMContext));
         params.insert(1, AbiParam::new(pointer_type));
 
         Some(Signature {

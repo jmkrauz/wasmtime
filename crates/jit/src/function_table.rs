@@ -163,7 +163,13 @@ impl FunctionTable {
 
         extern "C" {
             // libunwind import
+            #[cfg(not(target_arch = "arm"))]
             fn __register_frame(fde: *const u8);
+        }
+
+        #[cfg(target_arch = "arm")]
+        unsafe fn __register_frame(_fde: *const u8) {
+            unimplemented!();
         }
 
         for reloc in self.relocs.iter() {
@@ -196,7 +202,13 @@ impl Drop for FunctionTable {
     fn drop(&mut self) {
         extern "C" {
             // libunwind import
+            #[cfg(not(target_arch = "arm"))]
             fn __deregister_frame(fde: *const u8);
+        }
+
+        #[cfg(target_arch = "arm")]
+        unsafe fn __deregister_frame(_fde: *const u8) {
+            unimplemented!();
         }
 
         if let Some(published) = &self.published {
