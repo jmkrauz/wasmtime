@@ -346,7 +346,7 @@ fn emit_dst_inst(def: &Def, def_pool: &DefPool, var_pool: &VarPool, fmt: &mut Fo
         fmt.line("let srcloc = pos.srcloc();");
         fmtln!(
             fmt,
-            "let {} = split::{}(pos.func, cfg, curpos, srcloc, {});",
+            "let {} = {}(pos.func, cfg, curpos, srcloc, {});",
             defined_vars,
             def.apply.inst.snake_name(),
             def.apply.args[0].to_rust_code(var_pool)

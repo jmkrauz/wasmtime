@@ -40,6 +40,7 @@ pub fn link_module(
                         FloorF64 => wasmtime_f64_floor as usize,
                         TruncF64 => wasmtime_f64_trunc as usize,
                         NearestF64 => wasmtime_f64_nearest as usize,
+                        #[cfg(not(target_arch = "arm"))]
                         Probestack => PROBESTACK as usize,
                         other => panic!("unexpected libcall: {}", other),
                     }
@@ -88,6 +89,23 @@ pub fn link_module(
                 Reloc::X86PCRelRodata4 => {
                     // ignore
                 }
+                Reloc::Arm32Call => unsafe {
+                    // Absolute address
+                    let reloc_address = body.add(r.offset as usize) as usize;
+                    let target_func_address = target_func_address as u32;
+
+                    // Split address into movw and movt immediate operands.
+                    let mut movw: u32 = *(reloc_address as *const u32);
+                    movw |= target_func_address & 0xffc;
+                    movw |= ((target_func_address >> 12) & 0xf) << 16;
+
+                    let mut movt: u32 = *(reloc_address as *const u32).offset(1);
+                    movt |= (target_func_address >> 16) & 0xfff;
+                    movt |= ((target_func_address >> 28) & 0xf) << 16;
+
+                    write_unaligned(reloc_address as *mut u32, movw);
+                    write_unaligned((reloc_address + 4) as *mut u32, movt);
+                },
                 _ => panic!("unsupported reloc kind"),
             }
         }
@@ -96,6 +114,7 @@ pub fn link_module(
 
 // A declaration for the stack probe function in Rust's standard library, for
 // catching callstack overflow.
+#[cfg(not(target_arch = "arm"))]
 cfg_if::cfg_if! {
     if #[cfg(any(
         target_arch="aarch64",

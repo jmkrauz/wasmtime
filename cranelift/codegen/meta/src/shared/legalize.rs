@@ -60,10 +60,12 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let bxor_not = insts.by_name("bxor_not");
     let cls = insts.by_name("cls");
     let clz = insts.by_name("clz");
+    let copy = insts.by_name("copy");
     let ctz = insts.by_name("ctz");
     let fabs = insts.by_name("fabs");
     let f32const = insts.by_name("f32const");
     let f64const = insts.by_name("f64const");
+    let fcmp = insts.by_name("fcmp");
     let fcopysign = insts.by_name("fcopysign");
     let fcvt_from_sint = insts.by_name("fcvt_from_sint");
     let fneg = insts.by_name("fneg");
@@ -73,6 +75,7 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let iadd_carry = insts.by_name("iadd_carry");
     let iadd_ifcin = insts.by_name("iadd_ifcin");
     let iadd_ifcout = insts.by_name("iadd_ifcout");
+    let iadd_ifcarry = insts.by_name("iadd_ifcarry");
     let iadd_imm = insts.by_name("iadd_imm");
     let icmp = insts.by_name("icmp");
     let icmp_imm = insts.by_name("icmp_imm");
@@ -89,6 +92,7 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let isplit = insts.by_name("isplit");
     let istore8 = insts.by_name("istore8");
     let istore16 = insts.by_name("istore16");
+    let istore32 = insts.by_name("istore32");
     let isub = insts.by_name("isub");
     let isub_bin = insts.by_name("isub_bin");
     let isub_bout = insts.by_name("isub_bout");
@@ -106,6 +110,9 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let sdiv_imm = insts.by_name("sdiv_imm");
     let select = insts.by_name("select");
     let sextend = insts.by_name("sextend");
+    let sload8 = insts.by_name("sload8");
+    let sload16 = insts.by_name("sload16");
+    let sload32 = insts.by_name("sload32");
     let sshr = insts.by_name("sshr");
     let sshr_imm = insts.by_name("sshr_imm");
     let srem = insts.by_name("srem");
@@ -116,6 +123,7 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let uextend = insts.by_name("uextend");
     let uload8 = insts.by_name("uload8");
     let uload16 = insts.by_name("uload16");
+    let uload32 = insts.by_name("uload32");
     let umulhi = insts.by_name("umulhi");
     let ushr = insts.by_name("ushr");
     let ushr_imm = insts.by_name("ushr_imm");
@@ -141,6 +149,10 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     expand.custom_legalize(select, "expand_select");
     widen.custom_legalize(select, "expand_select"); // small ints
 
+    narrow.custom_legalize(trapz, "expand_cond_trap");
+    narrow.custom_legalize(trapnz, "expand_cond_trap");
+    narrow.custom_legalize(br_table, "expand_br_table");
+
     // Custom expansions for floating point constants.
     // These expansions require bit-casting or creating constant pool entries.
     expand.custom_legalize(f32const, "expand_fconst");
@@ -153,6 +165,24 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     // Custom expansions for small stack memory acccess.
     widen.custom_legalize(insts.by_name("stack_load"), "expand_stack_load");
     widen.custom_legalize(insts.by_name("stack_store"), "expand_stack_store");
+
+    // Custom expansions for division and remainder computation.
+    expand.custom_legalize(udiv, "expand_udiv_urem");
+    expand.custom_legalize(urem, "expand_udiv_urem");
+    expand.custom_legalize(sdiv, "expand_sdiv_srem");
+    expand.custom_legalize(srem, "expand_sdiv_srem");
+
+    narrow.custom_legalize(udiv, "expand_udiv_urem");
+    narrow.custom_legalize(urem, "expand_udiv_urem");
+    narrow.custom_legalize(sdiv, "expand_sdiv_srem");
+    narrow.custom_legalize(srem, "expand_sdiv_srem");
+
+    // Custom legalization for shifts and rotates.
+    narrow.custom_legalize(ishl, "narrow_ishl");
+    narrow.custom_legalize(ushr, "narrow_ushr");
+    narrow.custom_legalize(sshr, "narrow_sshr");
+    narrow.custom_legalize(rotr, "narrow_rotr");
+    narrow.custom_legalize(rotl, "narrow_rotl");
 
     // List of variables to reuse in patterns.
     let x = var("x");
@@ -212,23 +242,19 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     // embedded as part of arguments), so use a custom legalization for now.
     narrow.custom_legalize(iconst, "narrow_iconst");
 
-    {
-        let inst = uextend.bind(I128).bind(I64);
+    for &(big_ty, small_ty, bits) in &[(I128, I64, 63), (I64, I32, 31)] {
         narrow.legalize(
-            def!(a = inst(x)),
+            def!(a = uextend.big_ty.small_ty(x)),
             vec![
                 def!(ah = iconst(Literal::constant(&imm.imm64, 0))),
                 def!(a = iconcat(x, ah)),
             ],
         );
-    }
 
-    {
-        let inst = sextend.bind(I128).bind(I64);
         narrow.legalize(
-            def!(a = inst(x)),
+            def!(a = sextend.big_ty.small_ty(x)),
             vec![
-                def!(ah = sshr_imm(x, Literal::constant(&imm.imm64, 63))), // splat sign bit to whole number
+                def!(ah = sshr_imm(x, Literal::constant(&imm.imm64, bits))), // splat sign bit to whole number
                 def!(a = iconcat(x, ah)),
             ],
         );
@@ -268,28 +294,30 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
         ],
     );
 
-    narrow.legalize(
-        def!(brz.I128(x, block, vararg)),
-        vec![
-            def!((xl, xh) = isplit(x)),
-            def!(
-                a = icmp_imm(
-                    Literal::enumerator_for(&imm.intcc, "eq"),
-                    xl,
-                    Literal::constant(&imm.imm64, 0)
-                )
-            ),
-            def!(
-                b = icmp_imm(
-                    Literal::enumerator_for(&imm.intcc, "eq"),
-                    xh,
-                    Literal::constant(&imm.imm64, 0)
-                )
-            ),
-            def!(c = band(a, b)),
-            def!(brnz(c, block, vararg)),
-        ],
-    );
+    for &ty in &[I64, I128] {
+        narrow.legalize(
+            def!(brz.ty(x, block, vararg)),
+            vec![
+                def!((xl, xh) = isplit(x)),
+                def!(
+                    a = icmp_imm(
+                        Literal::enumerator_for(&imm.intcc, "eq"),
+                        xl,
+                        Literal::constant(&imm.imm64, 0)
+                    )
+                ),
+                def!(
+                    b = icmp_imm(
+                        Literal::enumerator_for(&imm.intcc, "eq"),
+                        xh,
+                        Literal::constant(&imm.imm64, 0)
+                    )
+                ),
+                def!(c = band(a, b)),
+                def!(brnz(c, block, vararg)),
+            ],
+        );
+    }
 
     narrow.legalize(
         def!(brnz.I128(x, block1, vararg)),
@@ -298,6 +326,18 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
             def!(brnz(xl, block1, vararg)),
             def!(jump(block2, Literal::empty_vararg())),
             block!(block2),
+            def!(brnz(xh, block1, vararg)),
+        ],
+    );
+
+    let block3 = var("block3");
+    narrow.legalize(
+        def!(brnz.I64(x, block1, vararg)),
+        vec![
+            def!((xl, xh) = isplit(x)),
+            def!(brnz(xl, block1, vararg)),
+            def!(jump(block3, Literal::empty_vararg())),
+            block!(block3),
             def!(brnz(xh, block1, vararg)),
         ],
     );
@@ -393,6 +433,174 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
                 def!(a = iconcat(al, ah)),
             ],
         );
+    }
+
+    for &(inst_imm, inst) in &[
+        (iadd_imm, iadd),
+        (imul_imm, imul),
+        (sdiv_imm, sdiv),
+        (udiv_imm, udiv),
+        (srem_imm, srem),
+        (urem_imm, urem),
+        (band_imm, band),
+        (bor_imm, bor),
+        (bxor_imm, bxor),
+    ] {
+        narrow.legalize(
+            def!(a = inst_imm(x, y)),
+            vec![def!(z = iconst(y)), def!(a = inst(x, z))],
+        );
+    }
+
+    for &(inst_imm, inst) in &[
+        (rotl_imm, rotl),
+        (rotr_imm, rotr),
+        (ishl_imm, ishl),
+        (sshr_imm, sshr),
+        (ushr_imm, ushr),
+    ] {
+        narrow.legalize(
+            def!(a = inst_imm.I64(x, y)),
+            vec![def!(a1 = iconst.I64(y)), def!(a = inst.I64(x, a1))],
+        );
+    }
+
+    narrow.legalize(
+        def!(x = copy(y)),
+        vec![
+            def!((yl, yh) = isplit(y)),
+            def!(xl = copy(yl)),
+            def!(xh = copy(yh)),
+            def!(x = iconcat(xl, xh)),
+        ],
+    );
+
+    for &ty in &[I8, I16] {
+        narrow.legalize(
+            def!(a = uextend.I64.ty(x)),
+            vec![
+                def!(al = uextend.I32.ty(x)),
+                def!(ah = iconst.I32(Literal::constant(&imm.imm64, 0))),
+                def!(a = iconcat(al, ah)),
+            ],
+        );
+
+        narrow.legalize(
+            def!(a = sextend.I64.ty(x)),
+            vec![
+                def!(al = sextend.I32.ty(x)),
+                def!(ah = sshr_imm(al, Literal::constant(&imm.imm64, 31))),
+                def!(a = iconcat(al, ah)),
+            ],
+        );
+    }
+
+    for &ty in &[I8, I16, I32] {
+        narrow.legalize(
+            def!(a = uextend.I128.ty(x)),
+            vec![
+                def!(al = uextend.I64.ty(x)),
+                def!(ah = iconst.I64(Literal::constant(&imm.imm64, 0))),
+                def!(a = iconcat(al, ah)),
+            ],
+        );
+
+        narrow.legalize(
+            def!(a = sextend.I128.ty(x)),
+            vec![
+                def!(al = sextend.I64.ty(x)),
+                def!(ah = sshr_imm(al, Literal::constant(&imm.imm64, 63))),
+                def!(a = iconcat(al, ah)),
+            ],
+        );
+    }
+
+    for &(op, ty) in &[(istore8, I8), (istore16, I16), (istore32, I32)] {
+        narrow.legalize(
+            def!(op.I64(flags, x, ptr, offset)),
+            vec![
+                def!(xl = ireduce.ty(x)),
+                def!(store.ty(flags, xl, ptr, offset)),
+            ],
+        );
+    }
+
+    for &(op, ty) in &[(uload8, I8), (uload16, I16), (uload32, I32)] {
+        narrow.legalize(
+            def!(x = op.I64(flags, ptr, offset)),
+            vec![
+                def!(xl = load.ty(flags, ptr, offset)),
+                def!(x = uextend.I64(xl)),
+            ],
+        );
+    }
+
+    for &(op, ty) in &[(sload8, I8), (sload16, I16), (sload32, I32)] {
+        narrow.legalize(
+            def!(x = op.I64(flags, ptr, offset)),
+            vec![
+                def!(xl = load.ty(flags, ptr, offset)),
+                def!(x = sextend.I64(xl)),
+            ],
+        );
+    }
+
+    for &ty in &[I64, I128] {
+        narrow.legalize(
+            def!(x = clz.ty(y)),
+            vec![
+                def!((yl, yh) = isplit(y)),
+                def!(a1 = clz(yl)),
+                def!(a2 = clz(yh)),
+                def!(a3 = iadd(a1, a2)),
+                def!(
+                    b = icmp_imm(
+                        Literal::enumerator_for(&imm.intcc, "eq"),
+                        yh,
+                        Literal::constant(&imm.imm64, 0)
+                    )
+                ),
+                def!(xl = select(b, a3, a2)),
+                def!(x = uextend(xl)),
+            ],
+        );
+
+        narrow.legalize(
+            def!(x = ctz.ty(y)),
+            vec![
+                def!((yl, yh) = isplit(y)),
+                def!(a1 = ctz(yl)),
+                def!(a2 = ctz(yh)),
+                def!(a3 = iadd(a1, a2)),
+                def!(
+                    b = icmp_imm(
+                        Literal::enumerator_for(&imm.intcc, "eq"),
+                        yl,
+                        Literal::constant(&imm.imm64, 0)
+                    )
+                ),
+                def!(xl = select(b, a3, a1)),
+                def!(x = uextend(xl)),
+            ],
+        );
+    }
+
+    // This uses expand not narrow because controlling type is I32, which is legalized using expand.
+    for &(big_ty, small_ty) in &[(I64, I32), (I128, I64)] {
+        expand.legalize(
+            def!(x = ireduce.small_ty.big_ty(y)),
+            vec![def!((yl, yh) = isplit(y)), def!(x = copy(yl))],
+        );
+    }
+
+    // This uses widen not narrow because controlling type is I8 or I16, which are legalized using widen.
+    for &big_ty in &[I64, I128] {
+        for &small_ty in &[I8, I16] {
+            widen.legalize(
+                def!(x = ireduce.small_ty.big_ty(y)),
+                vec![def!((yl, yh) = isplit(y)), def!(x = ireduce.small_ty(yl))],
+            );
+        }
     }
 
     // Widen instructions with one input operand.
@@ -934,6 +1142,100 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
         );
     }
 
+    expand.legalize(
+        def!(x = uload32(flags, ptr, offset)),
+        vec![
+            def!(xl = load.I32(flags, ptr, offset)),
+            def!(x = uextend(xl)),
+        ],
+    );
+
+    expand.legalize(
+        def!(x = sload32(flags, ptr, offset)),
+        vec![
+            def!(xl = load.I32(flags, ptr, offset)),
+            def!(x = sextend(xl)),
+        ],
+    );
+
+    for &ty in &[I32, I64] {
+        expand.legalize(
+            def!(x = uload16.ty(flags, ptr, offset)),
+            vec![
+                def!(y = load.I16(flags, ptr, offset)),
+                def!(x = uextend.ty(y)),
+            ],
+        );
+
+        expand.legalize(
+            def!(x = sload16.ty(flags, ptr, offset)),
+            vec![
+                def!(y = load.I16(flags, ptr, offset)),
+                def!(x = sextend.ty(y)),
+            ],
+        );
+
+        expand.legalize(
+            def!(x = uload8.ty(flags, ptr, offset)),
+            vec![
+                def!(y = load.I8(flags, ptr, offset)),
+                def!(x = uextend.ty(y)),
+            ],
+        );
+
+        expand.legalize(
+            def!(x = sload8.ty(flags, ptr, offset)),
+            vec![
+                def!(y = load.I8(flags, ptr, offset)),
+                def!(x = sextend.ty(y)),
+            ],
+        );
+    }
+
+    for &(ty, bitnum) in &[(I32, 32), (I64, 64)] {
+        expand.legalize(
+            def!(a = rotl.ty(x, y)),
+            vec![
+                def!(b = iconst(Literal::constant(&imm.imm64, bitnum))),
+                def!(c = isub(b, y)),
+                def!(a1 = ishl(x, y)),
+                def!(a2 = ushr(x, c)),
+                def!(a = bor(a1, a2)),
+            ],
+        );
+
+        expand.legalize(
+            def!(a = rotr.ty(x, y)),
+            vec![
+                def!(b = iconst(Literal::constant(&imm.imm64, bitnum))),
+                def!(c = isub(b, y)),
+                def!(a1 = ushr(x, y)),
+                def!(a2 = ishl(x, c)),
+                def!(a = bor(a1, a2)),
+            ],
+        );
+    }
+
+    for &ty in &[F32, F64] {
+        expand.legalize(
+            def!(a = fcmp.ty(Literal::enumerator_for(&imm.floatcc, "ueq"), x, y)),
+            vec![
+                def!(a1 = fcmp.ty(Literal::enumerator_for(&imm.floatcc, "eq"), x, y)),
+                def!(a2 = fcmp.ty(Literal::enumerator_for(&imm.floatcc, "uno"), x, y)),
+                def!(a = bor(a1, a2)),
+            ],
+        );
+
+        expand.legalize(
+            def!(a = fcmp.ty(Literal::enumerator_for(&imm.floatcc, "one"), x, y)),
+            vec![
+                def!(a1 = fcmp.ty(Literal::enumerator_for(&imm.floatcc, "lt"), x, y)),
+                def!(a2 = fcmp.ty(Literal::enumerator_for(&imm.floatcc, "gt"), x, y)),
+                def!(a = bor(a1, a2)),
+            ],
+        );
+    }
+
     expand.custom_legalize(br_icmp, "expand_br_icmp");
 
     let mut groups = TransformGroups::new();
@@ -1011,6 +1313,31 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
         ],
     );
 
+    for &(ty_w, ty_n) in &[(I64, I32), (I128, I64)] {
+        narrow_flags.legalize(
+            def!(a = umulhi.ty_w(x, y)),
+            vec![
+                def!((xl, xh) = isplit(x)),
+                def!((yl, yh) = isplit(y)),
+                def!(z = iconst.ty_n(Literal::constant(&imm.imm64, 0))),
+                def!(a1 = umulhi.ty_n(xl, yl)),
+                def!(a2 = imul.ty_n(yh, xl)),
+                def!(a3 = imul.ty_n(xh, yl)),
+                def!(b1 = imul.ty_n(xh, yh)),
+                def!(b2 = umulhi.ty_n(yh, xl)),
+                def!(b3 = umulhi.ty_n(xh, yl)),
+                def!(c = umulhi.ty_n(xh, yh)),
+                def!((c1, d1) = iadd_ifcout.ty_n(a1, a2)),
+                def!((c2, d2) = iadd_ifcarry.ty_n(b1, b2, d1)),
+                def!(f = iadd_ifcin.ty_n(c, z, d2)),
+                def!((c3, d3) = iadd_ifcout.ty_n(c1, a3)),
+                def!((al, d4) = iadd_ifcarry.ty_n(c2, b3, d3)),
+                def!(ah = iadd_ifcin.ty_n(f, z, d4)),
+                def!(a = iconcat(al, ah)),
+            ],
+        );
+    }
+
     narrow_flags.build_and_add_to(&mut groups);
 
     // TODO(ryzokuken): figure out a way to legalize iadd_c* to iadd_ifc* (and
@@ -1049,6 +1376,30 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
             def!(a = iconcat(al, ah)),
         ],
     );
+
+    for &(ty_w, ty_n) in &[(I64, I32), (I128, I64)] {
+        narrow_no_flags.legalize(
+            def!(a = umulhi.ty_w(x, y)),
+            vec![
+                def!((xl, xh) = isplit(x)),
+                def!((yl, yh) = isplit(y)),
+                def!(a1 = umulhi.ty_n(xl, yl)),
+                def!(a2 = imul.ty_n(yh, xl)),
+                def!(a3 = imul.ty_n(xh, yl)),
+                def!(b1 = imul.ty_n(xh, yh)),
+                def!(b2 = umulhi.ty_n(yh, xl)),
+                def!(b3 = umulhi.ty_n(xh, yl)),
+                def!(e = umulhi.ty_n(xh, yh)),
+                def!((c1, d1) = iadd_cout.ty_n(a1, a2)),
+                def!((c2, d2) = iadd_cout.ty_n(c1, a3)),
+                def!((c3, d3) = iadd_carry.ty_n(b1, b2, d1)),
+                def!((al, d4) = iadd_carry.ty_n(c3, b3, d2)),
+                def!(f = bint.ty_n(d3)),
+                def!(ah = iadd_cin.ty_n(e, f, d4)),
+                def!(a = iconcat(al, ah)),
+            ],
+        );
+    }
 
     narrow_no_flags.build_and_add_to(&mut groups);
 
