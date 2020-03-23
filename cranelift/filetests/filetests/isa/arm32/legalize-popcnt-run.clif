@@ -1,0 +1,61 @@
+test run
+
+function %popcnt_i32() -> b1 {
+block0:
+    v0 = iconst.i32 0
+    v100 = popcnt v0
+    v200 = icmp_imm eq v100, 0
+
+    v1 = iconst.i32 0x86012048
+    v101 = popcnt v1
+    v201 = icmp_imm eq v101, 7
+    v300 = band v200, v201
+
+    v2 = iconst.i32 0xea8adb39
+    v102 = popcnt v2
+    v202 = icmp_imm eq v102, 18
+    v301 = band v300, v202
+
+    v3 = iconst.i32 0xefdfd7af
+    v103 = popcnt v3
+    v203 = icmp_imm eq v103, 26
+    v302 = band v301, v203
+
+    v4 = iconst.i32 0xffffffff
+    v104 = popcnt v4
+    v204 = icmp_imm eq v104, 32
+    v303 = band v302, v204
+
+    return v303
+}
+; run
+
+function %popcnt_i64() -> b1 {
+block0:
+    v0 = iconst.i64 0
+    v100 = popcnt v0
+    v200 = icmp_imm eq v100, 0
+
+    v1 = iconst.i64 0x2e0e18d0_d12440e9
+    v101 = popcnt v1
+    v201 = icmp_imm eq v101, 24
+    v300 = band v200, v201
+
+    v2 = iconst.i64 0x00000001_00000000
+    v102 = popcnt v2
+    v202 = icmp_imm eq v102, 1
+    v301 = band v300, v202
+
+    v3 = iconst.i64 0xb75c4f3e_cd68dbbf
+    v103 = popcnt v3
+    v203 = icmp_imm eq v103, 41
+    v302 = band v301, v203
+
+    v4 = iconst.i64 0xffffffff_ffffffff
+    v104 = popcnt v4
+    v204 = icmp_imm eq v104, 64
+    v303 = band v302, v204
+
+    return v303
+}
+; run

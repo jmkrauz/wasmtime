@@ -342,16 +342,18 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
         ],
     );
 
-    narrow.legalize(
-        def!(a = popcnt.I128(x)),
-        vec![
-            def!((xl, xh) = isplit(x)),
-            def!(e1 = popcnt(xl)),
-            def!(e2 = popcnt(xh)),
-            def!(e3 = iadd(e1, e2)),
-            def!(a = uextend(e3)),
-        ],
-    );
+    for &ty in &[I64, I128] {
+        narrow.legalize(
+            def!(a = popcnt.ty(x)),
+            vec![
+                def!((xl, xh) = isplit(x)),
+                def!(e1 = popcnt(xl)),
+                def!(e2 = popcnt(xh)),
+                def!(e3 = iadd(e1, e2)),
+                def!(a = uextend(e3)),
+            ],
+        );
+    }
 
     // TODO(ryzokuken): benchmark this and decide if branching is a faster
     // approach than evaluating boolean expressions.
@@ -1235,6 +1237,27 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
             ],
         );
     }
+
+    // Third algorithm from https://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation
+    // Adapted for 32 bits.
+    expand.legalize(
+        def!(a = popcnt.I32(x)),
+        vec![
+            def!(a1 = ushr_imm(x, &Literal::constant(&imm.imm64, 1))),
+            def!(a2 = band_imm(a1, &Literal::constant(&imm.imm64, 0x55555555))),
+            def!(a3 = isub(x, a2)),
+            def!(a4 = iconst(&Literal::constant(&imm.imm64, 0x33333333))),
+            def!(b1 = band(a3, a4)),
+            def!(b2 = ushr_imm(a3, &Literal::constant(&imm.imm64, 2))),
+            def!(b3 = band(b2, a4)),
+            def!(b4 = iadd(b1, b3)),
+            def!(c1 = ushr_imm(b4, &Literal::constant(&imm.imm64, 4))),
+            def!(c2 = iadd(b4, c1)),
+            def!(c3 = band_imm(c2, &Literal::constant(&imm.imm64, 0x0F0F0F0F))),
+            def!(c4 = imul_imm(c3, &Literal::constant(&imm.imm64, 0x01010101))),
+            def!(a = ushr_imm(c4, &Literal::constant(&imm.imm64, 24))),
+        ],
+    );
 
     expand.custom_legalize(br_icmp, "expand_br_icmp");
 
