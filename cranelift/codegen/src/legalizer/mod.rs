@@ -607,14 +607,16 @@ fn narrow_load(
     let off_step = small_ty.bytes();
 
     let al = pos.ins().load(small_ty, flags, ptr, offset);
-    let ah = pos.ins().load(
-        small_ty,
-        flags,
-        ptr,
-        offset
-            .try_add_i64(off_step.into())
-            .expect("load offset overflow"),
-    );
+
+    let ah = match offset.try_add_i64(off_step.into()) {
+        Some(offset) => pos.ins().load(small_ty, flags, ptr, offset),
+        None => {
+            let off_step = pos.ins().iconst(small_ty, off_step as i64);
+            let (new_ptr, ovf) = pos.ins().iadd_cout(ptr, off_step);
+            pos.ins().trapnz(ovf, ir::TrapCode::HeapOutOfBounds);
+            pos.ins().load(small_ty, flags, new_ptr, offset)
+        }
+    };
     pos.func.dfg.replace(inst).iconcat(al, ah);
 }
 
@@ -644,14 +646,18 @@ fn narrow_store(
 
     let (al, ah) = pos.ins().isplit(val);
     pos.ins().store(flags, al, ptr, offset);
-    pos.ins().store(
-        flags,
-        ah,
-        ptr,
-        offset
-            .try_add_i64(off_step.into())
-            .expect("store offset overflow"),
-    );
+
+    match offset.try_add_i64(off_step.into()) {
+        Some(offset) => {
+            pos.ins().store(flags, ah, ptr, offset);
+        }
+        None => {
+            let off_step = pos.ins().iconst(small_ty, off_step as i64);
+            let (new_ptr, ovf) = pos.ins().iadd_cout(ptr, off_step);
+            pos.ins().trapnz(ovf, ir::TrapCode::HeapOutOfBounds);
+            pos.ins().store(flags, ah, new_ptr, offset);
+        }
+    }
     pos.remove_inst();
 }
 
