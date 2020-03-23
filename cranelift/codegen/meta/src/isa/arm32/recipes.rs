@@ -636,6 +636,9 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             ))
             .emit(
                 r#"
+                    if !flags.notrap() {
+                        sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
+                    }
                     let offset: i32 = offset.into();
                     put_mem_transfer_i(bits | 0x100, in_reg0, (offset & 0xff) as u8, out_reg0, sink);
                 "#,
@@ -664,6 +667,9 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             )
             .emit(
                 r#"
+                    if !flags.notrap() {
+                        sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
+                    }
                     put_mov32_i(offset.into(), TEMP_REG, sink);
                     put_mem_transfer_r(bits | 0x10, in_reg0, TEMP_REG, out_reg0, sink);
                 "#,
@@ -1376,6 +1382,9 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             ))
             .emit(
                 r#"
+                    if !flags.notrap() {
+                        sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
+                    }
                     let offset: i32 = offset.into();
                     put_vfp_mem_transfer(bits, out_reg0, in_reg0, (offset & 0xff) as u8, sink);
                 "#,
@@ -1395,6 +1404,9 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             ))
             .emit(
                 r#"
+                    if !flags.notrap() {
+                        sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
+                    }
                     let offset: i32 = offset.into();
                     put_vfp_mem_transfer(bits, out_reg0, in_reg0, (offset & 0xff) as u8, sink);
                 "#,
@@ -1413,6 +1425,9 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             ))
             .emit(
                 r#"
+                    if !flags.notrap() {
+                        sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
+                    }
                     let offset: i32 = offset.into();
                     put_vfp_mem_transfer(bits, in_reg0, in_reg1, (offset & 0xff) as u8, sink);
                 "#,
@@ -1431,6 +1446,9 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             ))
             .emit(
                 r#"
+                    if !flags.notrap() {
+                        sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
+                    }
                     let offset: i32 = offset.into();
                     put_vfp_mem_transfer(bits, in_reg0, in_reg1, (offset & 0xff) as u8, sink);
                 "#,
@@ -1480,7 +1498,6 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             .clobbers_flags(false)
             .emit(
                 r#"
-                    sink.trap(TrapCode::StackOverflow, func.srclocs[inst]);
                     let base = stk_base(in_stk0.base);
                     put_mov32_i(in_stk0.offset as i64, TEMP_REG, sink);
                     put_dp_rr(AL | ADD, base, TEMP_REG, base, sink);
@@ -1497,7 +1514,6 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
             .clobbers_flags(false)
             .emit(
                 r#"
-                    sink.trap(TrapCode::StackOverflow, func.srclocs[inst]);
                     let base = stk_base(in_stk0.base);
                     put_mov32_i(in_stk0.offset as i64, TEMP_REG, sink);
                     put_dp_rr(AL | ADD, base, TEMP_REG, base, sink);
