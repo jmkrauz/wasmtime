@@ -1,4 +1,4 @@
-use crate::cdsl::ast::{var, ExprBuilder};
+use crate::cdsl::ast::{var, ExprBuilder, Literal};
 use crate::cdsl::instructions::{Bindable, InstructionGroup};
 use crate::cdsl::xform::TransformGroupBuilder;
 use crate::shared::types::Float::{F32, F64};
@@ -19,10 +19,15 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     // List of instructions.
     let insts = &shared.instructions;
     let bitcast = insts.by_name("bitcast");
+    let f32const = insts.by_name("f32const");
+    let f64const = insts.by_name("f64const");
     let fcvt_from_sint = insts.by_name("fcvt_from_sint");
     let fcvt_from_uint = insts.by_name("fcvt_from_uint");
     let fcvt_to_sint = insts.by_name("fcvt_to_sint");
     let fcvt_to_uint = insts.by_name("fcvt_to_uint");
+    let fdiv = insts.by_name("fdiv");
+    let fma = insts.by_name("fma");
+    let fsub = insts.by_name("fsub");
     let iconcat = insts.by_name("iconcat");
     let isplit = insts.by_name("isplit");
     let load = insts.by_name("load");
@@ -60,24 +65,50 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     }
 
     expand.legalize(
-        def!(x = fcvt_to_uint(y)),
+        def!(x = fcvt_to_uint.I32(y)),
         vec![def!(z = arm32_vcvt_f2uint(y)), def!(x = bitcast(z))],
     );
 
     expand.legalize(
-        def!(x = fcvt_to_sint(y)),
+        def!(x = fcvt_to_sint.I32(y)),
         vec![def!(z = arm32_vcvt_f2sint(y)), def!(x = bitcast(z))],
     );
 
-    expand.legalize(
-        def!(x = fcvt_from_uint(y)),
-        vec![def!(z = bitcast(y)), def!(x = arm32_vcvt_uint2f(z))],
-    );
+    for &ty in &[F32, F64] {
+        expand.legalize(
+            def!(x = fcvt_from_uint.ty.I32(y)),
+            vec![def!(z = bitcast(y)), def!(x = arm32_vcvt_uint2f(z))],
+        );
 
-    expand.legalize(
-        def!(x = fcvt_from_sint(y)),
-        vec![def!(z = bitcast(y)), def!(x = arm32_vcvt_sint2f(z))],
-    );
+        expand.legalize(
+            def!(x = fcvt_from_sint.ty.I32(y)),
+            vec![def!(z = bitcast(y)), def!(x = arm32_vcvt_sint2f(z))],
+        );
+    }
+
+    for &op in &[fcvt_from_uint, fcvt_from_sint] {
+        expand.legalize(
+            def!(x = op.F32.I64(y)),
+            vec![
+                def!((yl, yh) = isplit(y)),
+                def!(xl = fcvt_from_uint.F32(yl)),
+                def!(xh = op.F32(yh)),
+                def!(z = f32const(&Literal::bits(&_imm.ieee32, 0x4f80_0000))),
+                def!(x = fma(xh, z, xl)),
+            ],
+        );
+
+        expand.legalize(
+            def!(x = op.F64.I64(y)),
+            vec![
+                def!((yl, yh) = isplit(y)),
+                def!(xl = fcvt_from_uint.F64(yl)),
+                def!(xh = op.F64(yh)),
+                def!(z = f64const(&Literal::bits(&_imm.ieee64, 0x41F00_000_0000_0000))),
+                def!(x = fma(xh, z, xl)),
+            ],
+        );
+    }
 
     // In expand not narrow because F64 controlling type variable uses expand legalization.
     expand.legalize(
@@ -107,6 +138,32 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
             def!(x = iconcat(xl, xh)),
         ],
     );
+
+    for &op in &[fcvt_to_uint, fcvt_to_sint] {
+        narrow.legalize(
+            def!(x = op.I64.F32(y)),
+            vec![
+                def!(z = f32const(&Literal::bits(&_imm.ieee32, 0x4f80_0000))),
+                def!(yh = fdiv(y, z)),
+                def!(yl = fsub(y, yh)),
+                def!(xl = fcvt_to_uint.I32(yl)),
+                def!(xh = op.I32(yh)),
+                def!(x = iconcat(xl, xh)),
+            ],
+        );
+
+        narrow.legalize(
+            def!(x = op.I64.F64(y)),
+            vec![
+                def!(z = f64const(&Literal::bits(&_imm.ieee64, 0x41F00_000_0000_0000))),
+                def!(yh = fdiv(y, z)),
+                def!(yl = fsub(y, yh)),
+                def!(xl = fcvt_to_uint.I32(yl)),
+                def!(xh = op.I32(yh)),
+                def!(x = iconcat(xl, xh)),
+            ],
+        );
+    }
 
     narrow.build_and_add_to(&mut shared.transform_groups);
 }
