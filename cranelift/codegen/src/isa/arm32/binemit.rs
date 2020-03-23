@@ -778,7 +778,7 @@ fn put_vfp_mem_transfer<CS: CodeSink + ?Sized>(
     let l = bits & 0x1;
     let sz = (bits >> 1) & 0x1;
     let rn = u32::from(rn) & 0xf;
-    let offset = u32::from(offset >> 2);
+    let offset = u32::from(offset);
     let double = sz != 0;
 
     let mut i = vfp_regs_enc(double, &[NULL_REG, NULL_REG, vd], &[double; 3]);

@@ -1378,7 +1378,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                 &formats.load,
                 "offset",
                 10,
-                0,
+                2,
             ))
             .emit(
                 r#"
@@ -1386,7 +1386,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                         sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
                     }
                     let offset: i32 = offset.into();
-                    put_vfp_mem_transfer(bits, out_reg0, in_reg0, (offset & 0xff) as u8, sink);
+                    put_vfp_mem_transfer(bits, out_reg0, in_reg0, ((offset >> 2) & 0xff) as u8, sink);
                 "#,
             ),
     );
@@ -1400,7 +1400,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                 &formats.load,
                 "offset",
                 10,
-                0,
+                2,
             ))
             .emit(
                 r#"
@@ -1408,7 +1408,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                         sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
                     }
                     let offset: i32 = offset.into();
-                    put_vfp_mem_transfer(bits, out_reg0, in_reg0, (offset & 0xff) as u8, sink);
+                    put_vfp_mem_transfer(bits, out_reg0, in_reg0, ((offset >> 2) & 0xff) as u8, sink);
                 "#,
             ),
     );
@@ -1421,7 +1421,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                 &formats.store,
                 "offset",
                 10,
-                0,
+                2,
             ))
             .emit(
                 r#"
@@ -1429,7 +1429,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                         sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
                     }
                     let offset: i32 = offset.into();
-                    put_vfp_mem_transfer(bits, in_reg0, in_reg1, (offset & 0xff) as u8, sink);
+                    put_vfp_mem_transfer(bits, in_reg0, in_reg1, ((offset >> 2) & 0xff) as u8, sink);
                 "#,
             ),
     );
@@ -1442,7 +1442,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                 &formats.store,
                 "offset",
                 10,
-                0,
+                2,
             ))
             .emit(
                 r#"
@@ -1450,7 +1450,7 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                         sink.trap(TrapCode::HeapOutOfBounds, func.srclocs[inst]);
                     }
                     let offset: i32 = offset.into();
-                    put_vfp_mem_transfer(bits, in_reg0, in_reg1, (offset & 0xff) as u8, sink);
+                    put_vfp_mem_transfer(bits, in_reg0, in_reg1, ((offset >> 2) & 0xff) as u8, sink);
                 "#,
             ),
     );
