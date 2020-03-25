@@ -18,7 +18,11 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
 
     // List of instructions.
     let insts = &shared.instructions;
+    let band = insts.by_name("band");
     let bitcast = insts.by_name("bitcast");
+    let bnot = insts.by_name("bnot");
+    let bor = insts.by_name("bor");
+    let bxor = insts.by_name("bxor");
     let f32const = insts.by_name("f32const");
     let f64const = insts.by_name("f64const");
     let fcvt_from_sint = insts.by_name("fcvt_from_sint");
@@ -43,6 +47,8 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     let _imm = &shared.imm;
 
     let a = var("a");
+    let b = var("b");
+    let c = var("c");
     let m = var("m");
     let x = var("x");
     let xl = var("xl");
@@ -52,7 +58,30 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     let yh = var("yh");
     let z = var("z");
 
-    for &(ity, fty) in &[(I32, F32), (I64, F64)] {
+    for &(fty, ity) in &[(F32, I32), (F64, I64)] {
+        expand.legalize(
+            def!(x = bnot.fty(y)),
+            vec![
+                def!(a = bitcast.ity(y)),
+                def!(b = bnot(a)),
+                def!(x = bitcast.fty(b)),
+            ],
+        );
+
+        for &op in &[band, bor, bxor] {
+            expand.legalize(
+                def!(x = op.fty(y, z)),
+                vec![
+                    def!(a = bitcast.ity(y)),
+                    def!(b = bitcast.ity(z)),
+                    def!(c = op(a, b)),
+                    def!(x = bitcast.fty(c)),
+                ],
+            );
+        }
+    }
+
+    for &(fty, ity) in &[(F32, I32), (F64, I64)] {
         expand.legalize(
             def!(x = load.fty(m, y, z)),
             vec![def!(a = load.ity(m, y, z)), def!(x = bitcast.fty(a))],
