@@ -68,6 +68,8 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let fcmp = insts.by_name("fcmp");
     let fcopysign = insts.by_name("fcopysign");
     let fcvt_from_sint = insts.by_name("fcvt_from_sint");
+    let fmax = insts.by_name("fmax");
+    let fmin = insts.by_name("fmin");
     let fneg = insts.by_name("fneg");
     let iadd = insts.by_name("iadd");
     let iadd_cin = insts.by_name("iadd_cin");
@@ -171,6 +173,9 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     expand.custom_legalize(urem, "expand_udiv_urem");
     expand.custom_legalize(sdiv, "expand_sdiv_srem");
     expand.custom_legalize(srem, "expand_sdiv_srem");
+
+    expand.custom_legalize(fmin, "expand_fmin_fmax");
+    expand.custom_legalize(fmax, "expand_fmin_fmax");
 
     narrow.custom_legalize(udiv, "expand_udiv_urem");
     narrow.custom_legalize(urem, "expand_udiv_urem");

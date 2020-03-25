@@ -17,7 +17,7 @@ use crate::bitset::BitSet;
 use crate::cursor::{Cursor, FuncCursor};
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::entities::{Block, Value};
-use crate::ir::types::{Type, I32, I64};
+use crate::ir::types::{Type, F32, F64, I32, I64};
 use crate::ir::{self, InstBuilder, MemFlags};
 use crate::isa::TargetIsa;
 use crate::predicates;
@@ -941,6 +941,102 @@ fn expand_sdiv_srem(
 
     let _block = pos.func.layout.pp_block(inst);
     cfg.recompute_block(pos.func, _block);
+}
+
+ fn expand_fmin_fmax(
+    inst: ir::Inst,
+    func: &mut ir::Function,
+    cfg: &mut ControlFlowGraph,
+    _isa: &dyn TargetIsa,
+) {
+    use crate::ir::condcodes::{FloatCC, IntCC};
+    use crate::ir::immediates::{Ieee32, Ieee64};
+
+    let (x, y, fmin) = match func.dfg[inst] {
+        ir::InstructionData::Binary {
+            opcode: ir::Opcode::Fmin,
+            args,
+        } => (args[0], args[1], true),
+        ir::InstructionData::Binary {
+            opcode: ir::Opcode::Fmax,
+            args,
+        } => (args[0], args[1], false),
+        _ => panic!("Expected fmin/fmax: {}", func.dfg.display_inst(inst, None)),
+    };
+
+    // Replace `result = fmin/fmax x, y` with:
+    //
+    //   potential_nan = fadd x, y
+    //   v0 = fcmp uno x, y
+    //   brnz v0 result_block(v0)
+    //   jump no_nans_block
+    // zeros_block():           // fmin and fmax operators treat -0.0 as being less than 0.0.
+    //   zero = f32/64const -0/+0
+    //   v1 = fcmp eq x, y
+    //   x_i = bitcast.I32/I64(x)
+    //   y_i = bitcast.I32.I64(y)
+    //   v2 = icmp ne x_i, y_i  // x and y are -0 and 0
+    //   v3 = band v1, v2
+    //   brnz v3 result_block(zero)
+    //   jump comparison_block
+    // comparison_block():
+    //   v4 = fcmp le/ge x, y
+    //   brnz v4 result_block(x)
+    //   jump result_block(y)
+    // result_block(result):
+
+    let old_block = func.layout.pp_block(inst);
+    let zeros_block = func.dfg.make_block();
+    let comparison_block = func.dfg.make_block();
+    let result_block = func.dfg.make_block();
+
+    let result = func.dfg.first_result(inst);
+    func.dfg.clear_results(inst);
+    func.dfg.attach_block_param(result_block, result);
+
+    let potential_nan = func.dfg.replace(inst).fadd(x, y);
+    let mut pos = FuncCursor::new(func).after_inst(inst);
+    pos.use_srcloc(inst);
+
+    let v0 = pos.ins().fcmp(FloatCC::Unordered, x, y);
+    pos.ins().brnz(v0, result_block, &[potential_nan]);
+    pos.ins().jump(zeros_block, &[]);
+
+    pos.insert_block(zeros_block);
+    let zero_str = if fmin {
+        "-0x0.0p+0"
+    } else {
+        "0x0.0p+0"
+    };
+    let ty = pos.func.dfg.ctrl_typevar(inst);
+    let (zero, int_ty) = match ty {
+        F32 => (pos.ins().f32const(zero_str.parse::<Ieee32>().unwrap()), I32),
+        F64 => (pos.ins().f64const(zero_str.parse::<Ieee64>().unwrap()), I64),
+        _ => panic!("expected F32/F64, got {}", ty)
+    };
+    let v1 = pos.ins().fcmp(FloatCC::Equal, x, y);
+    let x_i = pos.ins().bitcast(int_ty, x);
+    let y_i = pos.ins().bitcast(int_ty, y);
+    let v2 = pos.ins().icmp(IntCC::NotEqual, x_i, y_i);
+    let v3 = pos.ins().band(v1, v2);
+    pos.ins().brnz(v3, result_block, &[zero]);
+    pos.ins().jump(comparison_block, &[]);
+
+    pos.insert_block(comparison_block);
+    let cc = if fmin {
+        FloatCC::LessThanOrEqual
+    } else {
+        FloatCC::GreaterThanOrEqual
+    };
+    let v4 = pos.ins().fcmp(cc, x, y);
+    pos.ins().brnz(v4, result_block, &[x]);
+    pos.ins().jump(result_block, &[y]);
+    pos.insert_block(result_block);
+
+    cfg.recompute_block(pos.func, result_block);
+    cfg.recompute_block(pos.func, zeros_block);
+    cfg.recompute_block(pos.func, comparison_block);
+    cfg.recompute_block(pos.func, old_block);
 }
 
 // The common part of narrowing ishl, ushr and sshr.
