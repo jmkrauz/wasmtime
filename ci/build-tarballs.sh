@@ -33,8 +33,8 @@ mktarball() {
 bin_pkgname=wasmtime-$TAG-$platform
 mkdir tmp/$bin_pkgname
 cp LICENSE README.md tmp/$bin_pkgname
-mv bins-$src/{wasmtime,wasm2obj}$exe tmp/$bin_pkgname
-chmod +x tmp/$bin_pkgname/{wasmtime,wasm2obj}$exe
+mv bins-$src/wasmtime$exe tmp/$bin_pkgname
+chmod +x tmp/$bin_pkgname/wasmtime$exe
 mktarball $bin_pkgname
 
 if [ "$exe" = ".exe" ]; then
@@ -48,7 +48,7 @@ mkdir tmp/$api_pkgname/lib
 mkdir tmp/$api_pkgname/include
 cp LICENSE README.md tmp/$api_pkgname
 mv bins-$src/* tmp/$api_pkgname/lib
-cp crates/c-api/examples/wasm-c-api/include/wasm.h tmp/$api_pkgname/include
+cp crates/c-api/wasm-c-api/include/wasm.h tmp/$api_pkgname/include
 cp crates/c-api/include/{wasmtime,wasi}.h tmp/$api_pkgname/include
 mktarball $api_pkgname
 

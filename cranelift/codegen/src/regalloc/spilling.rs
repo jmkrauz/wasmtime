@@ -267,27 +267,11 @@ impl<'a> Context<'a> {
         // If inst is a call, spill all register values that are live across the call.
         // This means that we don't currently take advantage of callee-saved registers.
         // TODO: Be more sophisticated.
-        #[cfg(not(target_arch = "arm"))]
-        {
-            let opcode = self.cur.func.dfg[inst].opcode();
-            if call_sig.is_some()
-                || opcode == crate::ir::Opcode::X86ElfTlsGetAddr
-                || opcode == crate::ir::Opcode::X86MachoTlsGetAddr
-            {
-                for lv in throughs {
-                    if lv.affinity.is_reg() && !self.spills.contains(&lv.value) {
-                        self.spill_reg(lv.value);
-                    }
-                }
-            }
-        }
-        #[cfg(target_arch = "arm")]
-        {
-            if call_sig.is_some() {
-                for lv in throughs {
-                    if lv.affinity.is_reg() && !self.spills.contains(&lv.value) {
-                        self.spill_reg(lv.value);
-                    }
+        let opcode = self.cur.func.dfg[inst].opcode();
+        if call_sig.is_some() || opcode.clobbers_all_regs() {
+            for lv in throughs {
+                if lv.affinity.is_reg() && !self.spills.contains(&lv.value) {
+                    self.spill_reg(lv.value);
                 }
             }
         }
