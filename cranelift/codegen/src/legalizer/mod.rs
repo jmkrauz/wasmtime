@@ -943,7 +943,7 @@ fn expand_sdiv_srem(
     cfg.recompute_block(pos.func, _block);
 }
 
- fn expand_fmin_fmax(
+fn expand_fmin_fmax(
     inst: ir::Inst,
     func: &mut ir::Function,
     cfg: &mut ControlFlowGraph,
@@ -1003,16 +1003,12 @@ fn expand_sdiv_srem(
     pos.ins().jump(zeros_block, &[]);
 
     pos.insert_block(zeros_block);
-    let zero_str = if fmin {
-        "-0x0.0p+0"
-    } else {
-        "0x0.0p+0"
-    };
+    let zero_str = if fmin { "-0x0.0p+0" } else { "0x0.0p+0" };
     let ty = pos.func.dfg.ctrl_typevar(inst);
     let (zero, int_ty) = match ty {
         F32 => (pos.ins().f32const(zero_str.parse::<Ieee32>().unwrap()), I32),
         F64 => (pos.ins().f64const(zero_str.parse::<Ieee64>().unwrap()), I64),
-        _ => panic!("expected F32/F64, got {}", ty)
+        _ => panic!("expected F32/F64, got {}", ty),
     };
     let v1 = pos.ins().fcmp(FloatCC::Equal, x, y);
     let x_i = pos.ins().bitcast(int_ty, x);

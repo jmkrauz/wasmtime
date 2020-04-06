@@ -1414,6 +1414,46 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
     );
 
     recipes.push(
+        EncodingRecipeBuilder::new("vfp_s_stack_load", &formats.stack_load, 4)
+            .operands_out(vec![s_reg])
+            .clobbers_flags(false)
+            .inst_predicate(InstructionPredicate::new_is_unsigned_int(
+                &formats.stack_load,
+                "offset",
+                10,
+                2,
+            ))
+            .emit(
+                r#"
+                    let sp = StackRef::sp(stack_slot, &func.stack_slots);
+                    let base = stk_base(sp.base);
+                    let offset: i32 = offset.into();
+                    put_vfp_mem_transfer(bits, out_reg0, base, ((offset >> 2) & 0xff) as u8, sink);
+                "#,
+            ),
+    );
+
+    recipes.push(
+        EncodingRecipeBuilder::new("vfp_d_stack_load", &formats.stack_load, 4)
+            .operands_out(vec![d_reg])
+            .clobbers_flags(false)
+            .inst_predicate(InstructionPredicate::new_is_unsigned_int(
+                &formats.stack_load,
+                "offset",
+                10,
+                2,
+            ))
+            .emit(
+                r#"
+                    let sp = StackRef::sp(stack_slot, &func.stack_slots);
+                    let base = stk_base(sp.base);
+                    let offset: i32 = offset.into();
+                    put_vfp_mem_transfer(bits, out_reg0, base, ((offset >> 2) & 0xff) as u8, sink);
+                "#,
+            ),
+    );
+
+    recipes.push(
         EncodingRecipeBuilder::new("vfp_s_store", &formats.store, 4)
             .operands_in(vec![s_reg, gpr])
             .clobbers_flags(false)
@@ -1451,6 +1491,46 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
                     }
                     let offset: i32 = offset.into();
                     put_vfp_mem_transfer(bits, in_reg0, in_reg1, ((offset >> 2) & 0xff) as u8, sink);
+                "#,
+            ),
+    );
+
+    recipes.push(
+        EncodingRecipeBuilder::new("vfp_s_stack_store", &formats.stack_store, 4)
+            .operands_in(vec![s_reg])
+            .clobbers_flags(false)
+            .inst_predicate(InstructionPredicate::new_is_unsigned_int(
+                &formats.stack_store,
+                "offset",
+                10,
+                2,
+            ))
+            .emit(
+                r#"
+                    let sp = StackRef::sp(stack_slot, &func.stack_slots);
+                    let base = stk_base(sp.base);
+                    let offset: i32 = offset.into();
+                    put_vfp_mem_transfer(bits, in_reg0, base, ((offset >> 2) & 0xff) as u8, sink);
+                "#,
+            ),
+    );
+
+    recipes.push(
+        EncodingRecipeBuilder::new("vfp_d_stack_store", &formats.stack_store, 4)
+            .operands_in(vec![d_reg])
+            .clobbers_flags(false)
+            .inst_predicate(InstructionPredicate::new_is_unsigned_int(
+                &formats.stack_store,
+                "offset",
+                10,
+                2,
+            ))
+            .emit(
+                r#"
+                    let sp = StackRef::sp(stack_slot, &func.stack_slots);
+                    let base = stk_base(sp.base);
+                    let offset: i32 = offset.into();
+                    put_vfp_mem_transfer(bits, in_reg0, base, ((offset >> 2) & 0xff) as u8, sink);
                 "#,
             ),
     );

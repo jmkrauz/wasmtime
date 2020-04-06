@@ -5,7 +5,7 @@ use super::registers::{D, GPR, Q, RU, S};
 use crate::abi::{legalize_args, ArgAction, ArgAssigner, ValueConversion};
 use crate::cursor::{Cursor, CursorPosition, EncCursor};
 use crate::ir::immediates::{Imm64, Offset32};
-use crate::ir::types::{F32, F64};
+use crate::ir::types::{F32, F64, I32};
 use crate::ir::{
     self, AbiParam, ArgumentExtension, ArgumentLoc, ArgumentPurpose, InstBuilder, StackSlot, Type,
     ValueLoc,
@@ -260,8 +260,6 @@ fn default_prologue_epilogue(func: &mut ir::Function, isa: &dyn TargetIsa) -> Co
     let stack_align = 8;
     let pointer_width = isa.triple().pointer_width().unwrap();
     let word_size = pointer_width.bytes() as usize;
-    let reg_type = ir::Type::int(u16::from(pointer_width.bits())).unwrap();
-
     let csrs = callee_saved_regs_used(isa, func);
 
     // The reserved stack area is composed of LR and callee-saved registers.
@@ -278,15 +276,11 @@ fn default_prologue_epilogue(func: &mut ir::Function, isa: &dyn TargetIsa) -> Co
     let local_stack_size = i64::from(total_stack_size - csr_stack_size);
 
     // Add CSRs (including LR) to function signature
-    let lr_arg = ir::AbiParam::special_reg(
-        reg_type,
-        ir::ArgumentPurpose::FramePointer,
-        RU::r14 as RegUnit,
-    );
+    let lr_arg = ir::AbiParam::special_reg(I32, ir::ArgumentPurpose::Link, RU::r14 as RegUnit);
     func.signature.params.push(lr_arg);
     func.signature.returns.push(lr_arg);
 
-    for regclass in &[GPR, S] {
+    for &(regclass, reg_type) in &[(GPR, I32), (S, F32)] {
         for csr in csrs.iter(regclass) {
             let csr_arg =
                 ir::AbiParam::special_reg(reg_type, ir::ArgumentPurpose::CalleeSaved, csr);
@@ -298,11 +292,11 @@ fn default_prologue_epilogue(func: &mut ir::Function, isa: &dyn TargetIsa) -> Co
     // Set up the cursor and insert the prologue
     let entry_block = func.layout.entry_block().expect("missing entry block");
     let mut pos = EncCursor::new(func, isa).at_first_insertion_point(entry_block);
-    insert_default_prologue(&mut pos, local_stack_size, reg_type, &csrs, isa, &csr_ss);
+    insert_default_prologue(&mut pos, local_stack_size, &csrs, isa, &csr_ss);
 
     // Reset the cursor and insert the epilogue
     let mut pos = pos.at_position(CursorPosition::Nowhere);
-    insert_default_epilogues(&mut pos, local_stack_size, reg_type, &csrs, &csr_ss);
+    insert_default_epilogues(&mut pos, local_stack_size, &csrs, &csr_ss);
 
     Ok(())
 }
@@ -311,7 +305,6 @@ fn default_prologue_epilogue(func: &mut ir::Function, isa: &dyn TargetIsa) -> Co
 fn insert_default_prologue(
     pos: &mut EncCursor,
     stack_size: i64,
-    reg_type: ir::types::Type,
     csrs: &RegisterSet,
     isa: &dyn TargetIsa,
     csr_ss: &StackSlot,
@@ -325,7 +318,7 @@ fn insert_default_prologue(
 
     // Append param to entry EBB
     let block = pos.current_block().expect("missing block under cursor");
-    let lr = pos.func.dfg.append_block_param(block, reg_type);
+    let lr = pos.func.dfg.append_block_param(block, I32);
     pos.func.locations[lr] = ir::ValueLoc::Reg(RU::r14 as RegUnit);
 
     let word_size: i32 = isa.pointer_bytes().into();
@@ -336,7 +329,7 @@ fn insert_default_prologue(
     pos.ins().stack_store(lr, csr_ss.clone(), Offset32::new(0));
 
     let mut regs_pushed = 1;
-    for &regclass in &[GPR, S] {
+    for &(regclass, reg_type) in &[(GPR, I32), (S, F32)] {
         for reg in csrs.iter(regclass) {
             // Append param to entry EBB
             let csr_arg = pos.func.dfg.append_block_param(block, reg_type);
@@ -370,7 +363,6 @@ fn insert_default_prologue(
 fn insert_default_epilogues(
     pos: &mut EncCursor,
     stack_size: i64,
-    reg_type: ir::types::Type,
     csrs: &RegisterSet,
     csr_ss: &StackSlot,
 ) {
@@ -378,7 +370,7 @@ fn insert_default_epilogues(
         pos.goto_last_inst(block);
         if let Some(inst) = pos.current_inst() {
             if pos.func.dfg[inst].opcode().is_return() {
-                insert_default_epilogue(inst, stack_size, pos, reg_type, csrs, csr_ss);
+                insert_default_epilogue(inst, stack_size, pos, csrs, csr_ss);
             }
         }
     }
@@ -389,7 +381,6 @@ fn insert_default_epilogue(
     inst: ir::Inst,
     stack_size: i64,
     pos: &mut EncCursor,
-    reg_type: ir::types::Type,
     csrs: &RegisterSet,
     csr_ss: &StackSlot,
 ) {
@@ -404,16 +395,14 @@ fn insert_default_epilogue(
     // preserve the correct order.
     pos.ins().adjust_sp_up_imm(Imm64::new(csr_stack_size));
     pos.prev_inst();
-    let lr_ret = pos
-        .ins()
-        .stack_load(reg_type, csr_ss.clone(), Offset32::new(0));
+    let lr_ret = pos.ins().stack_load(I32, csr_ss.clone(), Offset32::new(0));
     pos.prev_inst();
 
     pos.func.locations[lr_ret] = ir::ValueLoc::Reg(RU::r14 as RegUnit);
     pos.func.dfg.append_inst_arg(inst, lr_ret);
 
     let mut regs_popped = 1;
-    for &regclass in &[GPR, S] {
+    for &(regclass, reg_type) in &[(GPR, I32), (S, F32)] {
         for reg in csrs.iter(regclass) {
             let csr_ret = pos.ins().stack_load(
                 reg_type,

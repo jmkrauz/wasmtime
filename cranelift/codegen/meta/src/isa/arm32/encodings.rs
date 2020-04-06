@@ -239,6 +239,8 @@ pub(crate) fn define<'defs>(
     let r_vfp_d_load = recipes.by_name("vfp_d_load");
     let r_vfp_d_regmove = recipes.by_name("vfp_d_regmove");
     let r_vfp_d_spill = recipes.by_name("vfp_d_spill");
+    let r_vfp_d_stack_load = recipes.by_name("vfp_d_stack_load");
+    let r_vfp_d_stack_store = recipes.by_name("vfp_d_stack_store");
     let r_vfp_d_store = recipes.by_name("vfp_d_store");
     let r_vfp_d_vmov = recipes.by_name("vfp_d_vmov");
     let r_vfp_d2int_convert = recipes.by_name("vfp_d2int_convert");
@@ -255,6 +257,8 @@ pub(crate) fn define<'defs>(
     let r_vfp_s_load = recipes.by_name("vfp_s_load");
     let r_vfp_s_regmove = recipes.by_name("vfp_s_regmove");
     let r_vfp_s_spill = recipes.by_name("vfp_s_spill");
+    let r_vfp_s_stack_load = recipes.by_name("vfp_s_stack_load");
+    let r_vfp_s_stack_store = recipes.by_name("vfp_s_stack_store");
     let r_vfp_s_store = recipes.by_name("vfp_s_store");
     let r_vfp_s_vmov = recipes.by_name("vfp_s_vmov");
     let r_vfp_s2d_convert = recipes.by_name("vfp_s2d_convert");
@@ -535,6 +539,12 @@ pub(crate) fn define<'defs>(
 
     e.add_a32(e.enc(copy_to_ssa.bind(F32), r_copy_to_ssa_s, 0x10b0));
     e.add_a32(e.enc(copy_to_ssa.bind(F64), r_copy_to_ssa_d, 0x10bb));
+
+    e.add_a32(e.enc(stack_load.bind(F32), r_vfp_s_stack_load, 0x1));
+    e.add_a32(e.enc(stack_load.bind(F64), r_vfp_d_stack_load, 0x3));
+
+    e.add_a32(e.enc(stack_store.bind(F32), r_vfp_s_stack_store, 0x0));
+    e.add_a32(e.enc(stack_store.bind(F64), r_vfp_d_stack_store, 0x2));
 
     e
 }
