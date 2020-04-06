@@ -18,11 +18,19 @@ void Unwind(void *JmpBuf) {
   longjmp(*buf, 1);
 }
 
-
 #ifdef __APPLE__
 #include <sys/ucontext.h>
 
 void* GetPcFromUContext(ucontext_t *cx) {
   return (void*) cx->uc_mcontext->__ss.__rip;
 }
+#endif
+
+#if defined(__linux__) && defined(__arm__)
+#include <sys/ucontext.h>
+
+void* GetPcFromUContext(ucontext_t *cx) {
+    return (void*) cx->uc_mcontext.arm_pc;
+}
+
 #endif
