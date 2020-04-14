@@ -154,6 +154,7 @@ impl Immediates {
                 trapcode_values.insert("heap_oob", "HeapOutOfBounds");
                 trapcode_values.insert("int_ovf", "IntegerOverflow");
                 trapcode_values.insert("int_divz", "IntegerDivisionByZero");
+                trapcode_values.insert("bcvt_int", "BadConversionToInteger");
                 new_enum("code", "ir::TrapCode", trapcode_values).with_doc("A trap reason code.")
             },
         }

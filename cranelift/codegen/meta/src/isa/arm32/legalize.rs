@@ -43,7 +43,6 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     let fcvt_to_sint = insts.by_name("fcvt_to_sint");
     let fcvt_to_uint = insts.by_name("fcvt_to_uint");
     let fdiv = insts.by_name("fdiv");
-    let fma = insts.by_name("fma");
     let fmul = insts.by_name("fmul");
     let fsub = insts.by_name("fsub");
     let iadd_imm = insts.by_name("iadd_imm");
@@ -57,11 +56,11 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     let stack_load = insts.by_name("stack_load");
     let stack_store = insts.by_name("stack_store");
     let store = insts.by_name("store");
+    let trapnz = insts.by_name("trapnz");
     let trunc = insts.by_name("trunc");
 
     let arm32_vcvt_f2uint = arm32_insts.by_name("arm32_vcvt_f2uint");
     let arm32_vcvt_f2sint = arm32_insts.by_name("arm32_vcvt_f2sint");
-    let arm32_vcvt_uint2f = arm32_insts.by_name("arm32_vcvt_uint2f");
     let arm32_vcvt_sint2f = arm32_insts.by_name("arm32_vcvt_sint2f");
     let arm32_vmov_d2ints = arm32_insts.by_name("arm32_vmov_d2ints");
     let arm32_vmov_ints2d = arm32_insts.by_name("arm32_vmov_ints2d");
@@ -76,7 +75,11 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     let b = var("b");
     let b1 = var("b1");
     let b2 = var("b2");
+    let b3 = var("b3");
+    let b4 = var("b4");
     let c = var("c");
+    let c1 = var("c1");
+    let c2 = var("c2");
     let m = var("m");
     let x = var("x");
     let xl = var("xl");
@@ -86,10 +89,18 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
     let yh = var("yh");
     let z = var("z");
 
-    let f32_two_pow_32 = 0x4f80_0000;
-    let f64_two_pow_32 = 0x41F0_0000_0000_0000;
-    let f32_zero = 0x0000_0000;
-    let f64_zero = 0x0000_0000_0000_0000;
+    let f32_2_pow32: u64 = 0x4f80_0000;
+    let f32_u64_max: u64 = 0x5f80_0000;
+    let f32_u64_min: u64 = 0xbf80_0000;
+    let f32_i64_max: u64 = 0x5f00_0000;
+    let f32_i64_min: u64 = 0xdf00_0000;
+    let f64_2_pow32: u64 = 0x41F0_0000_0000_0000;
+    let f64_u64_max: u64 = 0x43f0_0000_0000_0000;
+    let f64_u64_min: u64 = 0xbff0_0000_0000_0000;
+    let f64_i64_max: u64 = 0x43e0_0000_0000_0000;
+    let f64_i64_min: u64 = 0xc3e0_0000_0000_0000;
+
+    expand.custom_legalize(fcvt_from_uint, "expand_fcvt_from_uint");
 
     for &(fty, ity) in &[(F32, I32), (F64, I64)] {
         expand.legalize(
@@ -138,60 +149,30 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
 
     expand.legalize(
         def!(x = fcvt_to_uint.I32(y)),
-        vec![def!(z = arm32_vcvt_f2uint(y)), def!(x = bitcast(z))],
+        vec![
+            def!(a = fcmp(Literal::enumerator_for(&_imm.floatcc, "uno"), y, y)),
+            def!(trapnz(a, Literal::enumerator_for(&_imm.trapcode, "bcvt_int"))),
+            def!(z = arm32_vcvt_f2uint(y)),
+            def!(x = bitcast(z))
+        ],
     );
 
     expand.legalize(
         def!(x = fcvt_to_sint.I32(y)),
-        vec![def!(z = arm32_vcvt_f2sint(y)), def!(x = bitcast(z))],
+        vec![
+            def!(a = fcmp(Literal::enumerator_for(&_imm.floatcc, "uno"), y, y)),
+            def!(trapnz(a, Literal::enumerator_for(&_imm.trapcode, "bcvt_int"))),
+            def!(z = arm32_vcvt_f2sint(y)),
+            def!(x = bitcast(z))
+        ],
     );
 
     for &ty in &[F32, F64] {
         expand.legalize(
-            def!(x = fcvt_from_uint.ty.I32(y)),
-            vec![def!(z = bitcast(y)), def!(x = arm32_vcvt_uint2f(z))],
-        );
-
-        expand.legalize(
             def!(x = fcvt_from_sint.ty.I32(y)),
             vec![def!(z = bitcast(y)), def!(x = arm32_vcvt_sint2f(z))],
         );
-    }
 
-    for &(ty, const_op, literal) in &[
-        (F32, f32const, &Literal::bits(&_imm.ieee32, f32_two_pow_32)),
-        (F64, f64const, &Literal::bits(&_imm.ieee64, f64_two_pow_32)),
-    ] {
-        expand.legalize(
-            def!(x = fcvt_from_uint.ty.I64(y)),
-            vec![
-                def!((yl, yh) = isplit(y)),
-                def!(xl = fcvt_from_uint.ty(yl)),
-                def!(xh = fcvt_from_uint.ty(yh)),
-                def!(z = const_op(literal)),
-                def!(x = fma(xh, z, xl)),
-            ],
-        );
-
-        narrow.legalize(
-            def!(x = fcvt_to_uint.I64.ty(y)),
-            vec![
-                def!(z = const_op(literal)),
-                def!(a = fdiv(y, z)),
-                def!(yh = trunc(a)),
-                def!(b = fmul(yh, z)),
-                def!(yl = fsub(y, b)),
-                def!(xl = fcvt_to_uint.I32(yl)),
-                def!(xh = fcvt_to_uint.I32(yh)),
-                def!(x = iconcat(xl, xh)),
-            ],
-        );
-    }
-
-    for &(ty, const_op, literal) in &[
-        (F32, f32const, &Literal::bits(&_imm.ieee32, f32_zero)),
-        (F64, f64const, &Literal::bits(&_imm.ieee64, f64_zero)),
-    ] {
         expand.legalize(
             def!(x = fcvt_from_sint.ty.I64(y)),
             vec![
@@ -212,19 +193,59 @@ pub(crate) fn define(shared: &mut SharedDefinitions, arm32_insts: &InstructionGr
                 def!(x = fmul(b1, b2)),
             ],
         );
+    }
 
+    for &(ty, const_op, imm_type, two_pow_32, u64_max, u64_min) in &[
+        (F32, f32const, &_imm.ieee32, f32_2_pow32, f32_u64_max, f32_u64_min),
+        (F64, f64const, &_imm.ieee64, f64_2_pow32, f64_u64_max, f64_u64_min),
+    ] {
+        narrow.legalize(
+            def!(x = fcvt_to_uint.I64.ty(y)),
+            vec![
+                def!(b1 = fcmp(Literal::enumerator_for(&_imm.floatcc, "uno"), y, y)),
+                def!(trapnz(b1, Literal::enumerator_for(&_imm.trapcode, "bcvt_int"))),
+                def!(a1 = const_op(&Literal::bits(imm_type, u64_max))),
+                def!(b2 = fcmp(Literal::enumerator_for(&_imm.floatcc, "ge"), y, a1)),
+                def!(a2 = const_op(&Literal::bits(imm_type, u64_min))),
+                def!(b3 = fcmp(Literal::enumerator_for(&_imm.floatcc, "le"), y, a2)),
+                def!(b4 = bor(b2, b3)),
+                def!(trapnz(b4, Literal::enumerator_for(&_imm.trapcode, "int_ovf"))),
+                def!(a3 = const_op(&Literal::bits(imm_type, two_pow_32))),
+                def!(a4 = fdiv(y, a3)),
+                def!(yh = trunc(a4)),
+                def!(a = fmul(yh, a3)),
+                def!(yl = fsub(y, a)),
+                def!(xl = fcvt_to_uint.I32(yl)),
+                def!(xh = fcvt_to_uint.I32(yh)),
+                def!(x = iconcat(xl, xh)),
+            ],
+        );
+    }
+
+    for &(ty, const_op, imm_type, i64_max, i64_min) in &[
+        (F32, f32const, &_imm.ieee32, f32_i64_max, f32_i64_min),
+        (F64, f64const, &_imm.ieee64, f64_i64_max, f64_i64_min),
+    ] {
         narrow.legalize(
             def!(x = fcvt_to_sint.I64.ty(y)),
             vec![
-                def!(a = const_op(literal)),
-                def!(a1 = fcmp(Literal::enumerator_for(&_imm.floatcc, "ge"), y, a)),
-                def!(a2 = bint.I32(a1)),
-                def!(a3 = imul_imm(a2, Literal::constant(&_imm.imm64, 2))),
-                def!(a4 = iadd_imm(a3, Literal::constant(&_imm.imm64, -1))),
-                def!(b = sextend.I64(a4)),
-                def!(b1 = fabs(y)),
-                def!(b2 = fcvt_to_uint.I64(b1)),
-                def!(x = imul(b2, b)),
+                def!(b1 = fcmp(Literal::enumerator_for(&_imm.floatcc, "uno"), y, y)),
+                def!(trapnz(b1, Literal::enumerator_for(&_imm.trapcode, "bcvt_int"))),
+                def!(a1 = const_op(&Literal::bits(imm_type, i64_max))),
+                def!(b2 = fcmp(Literal::enumerator_for(&_imm.floatcc, "ge"), y, a1)),
+                def!(a2 = const_op(&Literal::bits(imm_type, i64_min))),
+                def!(b3 = fcmp(Literal::enumerator_for(&_imm.floatcc, "lt"), y, a2)),
+                def!(b4 = bor(b2, b3)),
+                def!(trapnz(b4, Literal::enumerator_for(&_imm.trapcode, "int_ovf"))),
+                def!(a3 = const_op(&Literal::bits(imm_type, 0x0))),
+                def!(b = fcmp(Literal::enumerator_for(&_imm.floatcc, "ge"), y, a3)),
+                def!(a4 = bint.I32(b)),
+                def!(a = imul_imm(a4, Literal::constant(&_imm.imm64, 2))),
+                def!(z = iadd_imm(a, Literal::constant(&_imm.imm64, -1))),
+                def!(c = sextend.I64(z)),
+                def!(c1 = fabs(y)),
+                def!(c2 = fcvt_to_uint.I64(c1)),
+                def!(x = imul(c2, c)),
             ],
         );
     }

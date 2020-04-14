@@ -52,8 +52,8 @@ pub(crate) fn define(
         Floating-point to unsigned integer conversion.
 
         Converts `vm` to an unsigned integer rounding towards zero.
-        If `vm` is NaN or if the unsigned integral value cannot be
-        represented in arm core register, this instruction traps.
+        If the unsigned integral value cannot be represented
+        in arm core register, this instruction traps.
 
         Result is stored in S floating-point register.
         "#,
@@ -71,8 +71,8 @@ pub(crate) fn define(
         Floating-point to signed integer conversion.
 
         Converts `vm` to an signed integer rounding towards zero.
-        If `vm` is NaN or if the unsigned integral value cannot be
-        represented in arm core register, this instruction traps.
+        If if the signed integral value cannot be represented
+        in arm core register, this instruction traps.
 
         Result is stored in S floating-point register.
         "#,

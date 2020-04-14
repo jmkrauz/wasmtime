@@ -1306,19 +1306,57 @@ pub(crate) fn define(shared_defs: &SharedDefinitions, regs: &IsaRegs) -> RecipeG
     );
 
     recipes.push(
-        EncodingRecipeBuilder::new("vfp_s2int_convert", &formats.unary, 4)
+        EncodingRecipeBuilder::new("vfp_s2int_convert", &formats.unary, 4 * 10)
             .operands_in(vec![s_reg])
             .operands_out(vec![s_reg])
             .clobbers_flags(false)
-            .emit("put_vfp_dp(bits, NULL_REG, in_reg0, out_reg0, sink);"),
+            .emit(
+                r#"
+                    // clear flags
+                    put_vfp_transfer(0x0f, 0x2, TEMP_REG, sink);
+                    put_dp_i(AL | 0xf0, 0x1, 14, sink);
+                    put_dp_rr(AL | AND, TEMP_REG, 14, TEMP_REG, sink);
+                    put_vfp_transfer(0x0e, 0x2, TEMP_REG, sink);
+
+                    // do conversion
+                    put_vfp_dp(bits, NULL_REG, in_reg0, out_reg0, sink);
+
+                    // read flags and trap if IOC flag is on
+                    put_vfp_transfer(0x0f, 0x2, TEMP_REG, sink);
+                    put_dp_ri(AL | AND, TEMP_REG, 0x1, TEMP_REG, sink);
+                    put_dp_ri(CMP | AL | 0x1000, TEMP_REG, 0x1, NULL_REG, sink);
+                    put_b(NE, 0, sink);
+                    sink.trap(crate::ir::TrapCode::IntegerOverflow, func.srclocs[inst]);
+                    put_udf(sink);
+                "#
+            ),
     );
 
     recipes.push(
-        EncodingRecipeBuilder::new("vfp_d2int_convert", &formats.unary, 4)
+        EncodingRecipeBuilder::new("vfp_d2int_convert", &formats.unary, 4 * 10)
             .operands_in(vec![d_reg])
             .operands_out(vec![s_reg])
             .clobbers_flags(false)
-            .emit("put_vfp_dp(bits, NULL_REG, in_reg0, out_reg0, sink);"),
+            .emit(
+                r#"
+                    // clear flags
+                    put_vfp_transfer(0x0f, 0x2, TEMP_REG, sink);
+                    put_dp_i(AL | 0xf0, 0x1, 14, sink);
+                    put_dp_rr(AL | AND, TEMP_REG, 14, TEMP_REG, sink);
+                    put_vfp_transfer(0x0e, 0x2, TEMP_REG, sink);
+
+                    // do conversion
+                    put_vfp_dp(bits, NULL_REG, in_reg0, out_reg0, sink);
+
+                    // read flags and trap if IOC flag is on
+                    put_vfp_transfer(0x0f, 0x2, TEMP_REG, sink);
+                    put_dp_ri(AL | AND, TEMP_REG, 0x1, TEMP_REG, sink);
+                    put_dp_ri(CMP | AL | 0x1000, TEMP_REG, 0x1, NULL_REG, sink);
+                    put_b(NE, 0, sink);
+                    sink.trap(crate::ir::TrapCode::IntegerOverflow, func.srclocs[inst]);
+                    put_udf(sink);
+                "#
+            ),
     );
 
     recipes.push(
