@@ -35,3 +35,12 @@ void* GetPcFromUContext(ucontext_t *cx) {
 }
 
 #endif  // __linux__ && __aarch64__
+
+#if defined(__linux__) && defined(__arm__)
+#include <sys/ucontext.h>
+
+void* GetPcFromUContext(ucontext_t *cx) {
+    return (void*) cx->uc_mcontext.arm_pc;
+}
+
+#endif // __linux__ && __arm__

@@ -1,108 +1,254 @@
-//! ARM ABI implementation.
-//! This is from the RISC-V target and will need to be updated for ARM32.
+//! Implementation of the 32-bit ARM ABI.
 
-use super::registers::{D, GPR, Q, S};
-use crate::abi::{legalize_args, ArgAction, ArgAssigner, ValueConversion};
-use crate::ir::{self, AbiParam, ArgumentExtension, ArgumentLoc, Type};
-use crate::isa::RegClass;
-use crate::regalloc::RegisterSet;
-use alloc::borrow::Cow;
-use core::i32;
-use target_lexicon::Triple;
+use crate::ir;
+use crate::ir::types;
+use crate::ir::types::*;
+use crate::ir::StackSlot;
+use crate::isa;
+use crate::isa::arm32::inst::*;
+use crate::machinst::*;
+use crate::settings;
 
-struct Args {
-    pointer_bits: u8,
-    pointer_bytes: u8,
-    pointer_type: Type,
-    regs: u32,
-    reg_limit: u32,
-    offset: u32,
+use alloc::vec::Vec;
+
+use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
+
+use log::debug;
+
+/// A location for an argument or return value.
+#[derive(Clone, Copy, Debug)]
+enum ABIArg {
+    /// In a real register.
+    Reg(RealReg, ir::Type),
+    /// Arguments only: on stack, at given offset from SP at entry.
+    Stack(i64, ir::Type),
 }
 
-impl Args {
-    fn new(bits: u8) -> Self {
-        Self {
-            pointer_bits: bits,
-            pointer_bytes: bits / 8,
-            pointer_type: Type::int(u16::from(bits)).unwrap(),
-            regs: 0,
-            reg_limit: 8,
-            offset: 0,
+/// Arm ABI information shared between body (callee) and caller.
+struct ABISig {
+    args: Vec<ABIArg>,
+    rets: Vec<ABIArg>,
+    stack_arg_space: i64,
+    call_conv: isa::CallConv,
+}
+
+/// Process a list of parameters or return values and allocate them to R-regs, S-regs, D-regs
+/// and stack slots.
+///
+/// Returns the list of argument locations, and the stack-space used (rounded up
+/// to a 16-byte-aligned boundary).
+#[allow(unused)]
+fn compute_arg_locs(call_conv: isa::CallConv, params: &[ir::AbiParam]) -> (Vec<ABIArg>, i64) {
+    // See AAPCS ABI
+    // http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ihi0042f/index.html
+    
+    unimplemented!()
+}
+
+impl ABISig {
+    fn from_func_sig(sig: &ir::Signature) -> ABISig {
+        // Compute args and retvals from signature.
+        // TODO: pass in arg-mode or ret-mode. (Does not matter
+        // for the types of arguments/return values that we support.)
+        let (args, stack_arg_space) = compute_arg_locs(sig.call_conv, &sig.params);
+        let (rets, _) = compute_arg_locs(sig.call_conv, &sig.returns);
+
+        // Verify that there are no return values on the stack.
+        assert!(rets.iter().all(|a| match a {
+            &ABIArg::Stack(..) => false,
+            _ => true,
+        }));
+
+        ABISig {
+            args,
+            rets,
+            stack_arg_space,
+            call_conv: sig.call_conv,
         }
     }
 }
 
-impl ArgAssigner for Args {
-    fn assign(&mut self, arg: &AbiParam) -> ArgAction {
-        fn align(value: u32, to: u32) -> u32 {
-            (value + to - 1) & !(to - 1)
+/// ARM ABI object for a function body.
+pub struct ArmABIBody {
+    /// signature: arg and retval regs
+    sig: ABISig,
+    /// offsets to each stackslot
+    stackslots: Vec<u32>,
+    /// total stack size of all stackslots
+    stackslots_size: u32,
+    /// clobbered registers, from regalloc.
+    clobbered: Set<Writable<RealReg>>,
+    /// total number of spillslots, from regalloc.
+    spillslots: Option<usize>,
+    /// Total frame size.
+    frame_size: Option<u32>,
+    /// Calling convention this function expects.
+    call_conv: isa::CallConv,
+}
+
+fn in_int_reg(ty: ir::Type) -> bool {
+    match ty {
+        types::I8 | types::I16 | types::I32 | types::I64 => true,
+        types::B1 | types::B8 | types::B16 | types::B32 | types::B64 => true,
+        _ => false,
+    }
+}
+
+fn in_float_reg(ty: ir::Type) -> bool {
+    match ty {
+        types::F32 | types::F64 => true,
+        _ => false,
+    }
+}
+
+impl ArmABIBody {
+    /// Create a new body ABI instance.
+    pub fn new(f: &ir::Function) -> Self {
+        debug!("AArch64 ABI: func signature {:?}", f.signature);
+
+        let sig = ABISig::from_func_sig(&f.signature);
+
+        let call_conv = f.signature.call_conv;
+        // Only these calling conventions are supported.
+        assert!(
+            call_conv == isa::CallConv::SystemV,
+            "Unsupported calling convention: {:?}",
+            call_conv
+        );
+
+        // Compute stackslot locations and total stackslot size.
+        let mut stack_offset: u32 = 0;
+        let mut stackslots = vec![];
+        for (stackslot, data) in f.stack_slots.iter() {
+            let off = stack_offset;
+            stack_offset += data.size;
+            stack_offset = (stack_offset + 3) & !3;
+            assert_eq!(stackslot.as_u32() as usize, stackslots.len());
+            stackslots.push(off);
         }
 
-        let ty = arg.value_type;
-
-        // Check for a legal type.
-        // SIMD instructions are currently no implemented, so break down vectors
-        if ty.is_vector() {
-            return ValueConversion::VectorSplit.into();
+        Self {
+            sig,
+            stackslots,
+            stackslots_size: stack_offset,
+            clobbered: Set::empty(),
+            spillslots: None,
+            frame_size: None,
+            call_conv,
         }
+    }
+}
 
-        // Large integers and booleans are broken down to fit in a register.
-        if !ty.is_float() && ty.bits() > u16::from(self.pointer_bits) {
-            // Align registers and stack to a multiple of two pointers.
-            self.regs = align(self.regs, 2);
-            self.offset = align(self.offset, 2 * u32::from(self.pointer_bytes));
-            return ValueConversion::IntSplit.into();
-        }
+#[allow(unused)]
+impl ABIBody for ArmABIBody {
+    type I = Inst;
 
-        // Small integers are extended to the size of a pointer register.
-        if ty.is_int() && ty.bits() < u16::from(self.pointer_bits) {
-            match arg.extension {
-                ArgumentExtension::None => {}
-                ArgumentExtension::Uext => return ValueConversion::Uext(self.pointer_type).into(),
-                ArgumentExtension::Sext => return ValueConversion::Sext(self.pointer_type).into(),
+    fn liveins(&self) -> Set<RealReg> {
+        let mut set: Set<RealReg> = Set::empty();
+        for &arg in &self.sig.args {
+            if let ABIArg::Reg(r, _) = arg {
+                set.insert(r);
             }
         }
+        set
+    }
 
-        if self.regs < self.reg_limit {
-            // Assign to a register.
-            let reg = GPR.unit(10 + self.regs as usize);
-            self.regs += 1;
-            ArgumentLoc::Reg(reg).into()
-        } else {
-            // Assign a stack location.
-            let loc = ArgumentLoc::Stack(self.offset as i32);
-            self.offset += u32::from(self.pointer_bytes);
-            debug_assert!(self.offset <= i32::MAX as u32);
-            loc.into()
+    fn liveouts(&self) -> Set<RealReg> {
+        let mut set: Set<RealReg> = Set::empty();
+        for &ret in &self.sig.rets {
+            if let ABIArg::Reg(r, _) = ret {
+                set.insert(r);
+            }
         }
+        set
     }
-}
 
-/// Legalize `sig`.
-pub fn legalize_signature(sig: &mut Cow<ir::Signature>, triple: &Triple, _current: bool) {
-    let bits = triple.pointer_width().unwrap().bits();
-
-    let mut args = Args::new(bits);
-    if let Some(new_params) = legalize_args(&sig.params, &mut args) {
-        sig.to_mut().params = new_params;
+    fn num_args(&self) -> usize {
+        self.sig.args.len()
     }
-}
 
-/// Get register class for a type appearing in a legalized signature.
-pub fn regclass_for_abi_type(ty: ir::Type) -> RegClass {
-    if ty.is_int() {
-        GPR
-    } else {
-        match ty.bits() {
-            32 => S,
-            64 => D,
-            128 => Q,
-            _ => panic!("Unexpected {} ABI type for arm32", ty),
-        }
+    fn num_retvals(&self) -> usize {
+        self.sig.rets.len()
     }
-}
 
-/// Get the set of allocatable registers for `func`.
-pub fn allocatable_registers(_func: &ir::Function) -> RegisterSet {
-    unimplemented!()
+    fn num_stackslots(&self) -> usize {
+        self.stackslots.len()
+    }
+
+    fn gen_copy_arg_to_reg(&self, idx: usize, into_reg: Writable<Reg>) -> Inst {
+        unimplemented!()
+    }
+
+    fn gen_copy_reg_to_retval(&self, idx: usize, from_reg: Reg) -> Inst {
+        unimplemented!()
+    }
+
+    fn gen_ret(&self) -> Inst {
+        unimplemented!()
+    }
+
+    fn gen_epilogue_placeholder(&self) -> Inst {
+        unimplemented!()
+    }
+
+    fn set_num_spillslots(&mut self, slots: usize) {
+        self.spillslots = Some(slots);
+    }
+
+    fn set_clobbered(&mut self, clobbered: Set<Writable<RealReg>>) {
+        self.clobbered = clobbered;
+    }
+
+    fn load_stackslot(
+        &self,
+        slot: StackSlot,
+        offset: u32,
+        ty: Type,
+        into_reg: Writable<Reg>,
+    ) -> Inst {
+        unimplemented!()
+    }
+
+    fn store_stackslot(&self, slot: StackSlot, offset: u32, ty: Type, from_reg: Reg) -> Inst {
+        unimplemented!()
+    }
+
+    fn stackslot_addr(&self, slot: StackSlot, offset: u32, into_reg: Writable<Reg>) -> Inst {
+        unimplemented!()
+    }
+
+    // Load from a spillslot.
+    fn load_spillslot(&self, slot: SpillSlot, ty: Type, into_reg: Writable<Reg>) -> Inst {
+        unimplemented!()
+    }
+
+    // Store to a spillslot.
+    fn store_spillslot(&self, slot: SpillSlot, ty: Type, from_reg: Reg) -> Inst {
+        unimplemented!()
+    }
+
+    fn gen_prologue(&mut self, flags: &settings::Flags) -> Vec<Inst> {
+        unimplemented!()
+    }
+
+    fn gen_epilogue(&self, _flags: &settings::Flags) -> Vec<Inst> {
+        unimplemented!()
+    }
+
+    fn frame_size(&self) -> u32 {
+        self.frame_size
+            .expect("frame size not computed before prologue generation")
+    }
+
+    fn get_spillslot_size(&self, rc: RegClass, ty: Type) -> u32 {
+        unimplemented!()
+    }
+
+    fn gen_spill(&self, to_slot: SpillSlot, from_reg: RealReg, ty: Type) -> Inst {
+        self.store_spillslot(to_slot, ty, from_reg.to_reg())
+    }
+
+    fn gen_reload(&self, to_reg: Writable<RealReg>, from_slot: SpillSlot, ty: Type) -> Inst {
+        self.load_spillslot(from_slot, ty, to_reg.map(|r| r.to_reg()))
+    }
 }

@@ -60,7 +60,10 @@ pub(crate) fn define(shared_defs: &mut SharedDefinitions) -> TargetIsa {
     let mut t32 = CpuMode::new("T32");
 
     // TODO refine these.
+    let expand_flags = shared_defs.transform_groups.by_name("expand_flags");
     let narrow_flags = shared_defs.transform_groups.by_name("narrow_flags");
+    a32.legalize_monomorphic(expand_flags);
+    t32.legalize_monomorphic(expand_flags);
     a32.legalize_default(narrow_flags);
     t32.legalize_default(narrow_flags);
 
