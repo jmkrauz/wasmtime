@@ -29,29 +29,68 @@ struct ABISig {
     args: Vec<ABIArg>,
     rets: Vec<ABIArg>,
     stack_arg_space: i64,
-    call_conv: isa::CallConv,
 }
 
-/// Process a list of parameters or return values and allocate them to R-regs, S-regs, D-regs
-/// and stack slots.
+#[rustfmt::skip]
+static CALLEE_SAVED_GPR: &[bool] = &[
+    /* r0 - r3 */
+    false, false, false, false,
+    /* r4 - r11*/
+    true, true, true, true, true, true, true, true,
+    /* ip, sp, lr, pc*/
+    false, false, false, false
+];
+
+/// Process a list of parameters or return values and allocate them to R-regs and stack slots.
 ///
 /// Returns the list of argument locations, and the stack-space used (rounded up
-/// to a 16-byte-aligned boundary).
-#[allow(unused)]
-fn compute_arg_locs(call_conv: isa::CallConv, params: &[ir::AbiParam]) -> (Vec<ABIArg>, i64) {
-    // See AAPCS ABI
-    // http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ihi0042f/index.html
-    
-    unimplemented!()
+/// to a 8-byte-aligned boundary).
+fn compute_arg_locs(params: &[ir::AbiParam], arg_mode: bool) -> (Vec<ABIArg>, i64) {
+    // See AAPCS ABI https://developer.arm.com/docs/ihi0042/latest
+    // r9 is an additional callee-saved variable register.
+    let mut next_rreg = 0;
+    let mut next_stack: u64 = 0;
+    let mut ret = vec![];
+
+    let max_rreg = if arg_mode {
+        3 // use r0-r3 for arguments
+    } else {
+        1 // use r0-r1 for returns
+    };
+
+    for param in params {
+        // Validate "purpose".
+        match &param.purpose {
+            &ir::ArgumentPurpose::VMContext | &ir::ArgumentPurpose::Normal => {}
+            _ => panic!(
+                "Unsupported argument purpose {:?} in signature: {:?}",
+                param.purpose, params
+            ),
+        }
+
+        if in_int_reg(param.value_type) {
+            if next_rreg <= max_rreg {
+                ret.push(ABIArg::Reg(rreg(next_rreg).to_real_reg(), param.value_type));
+                next_rreg += 1;
+            } else {
+                ret.push(ABIArg::Stack(next_stack as i64, param.value_type));
+                next_stack += 4;
+            }
+        } else {
+            unimplemented!("param value type {}", param.value_type)
+        }
+    }
+
+    next_stack = (next_stack + 7) & !7;
+
+    (ret, next_stack as i64)
 }
 
 impl ABISig {
     fn from_func_sig(sig: &ir::Signature) -> ABISig {
         // Compute args and retvals from signature.
-        // TODO: pass in arg-mode or ret-mode. (Does not matter
-        // for the types of arguments/return values that we support.)
-        let (args, stack_arg_space) = compute_arg_locs(sig.call_conv, &sig.params);
-        let (rets, _) = compute_arg_locs(sig.call_conv, &sig.returns);
+        let (args, stack_arg_space) = compute_arg_locs(&sig.params, true);
+        let (rets, _) = compute_arg_locs(&sig.returns, false);
 
         // Verify that there are no return values on the stack.
         assert!(rets.iter().all(|a| match a {
@@ -63,13 +102,12 @@ impl ABISig {
             args,
             rets,
             stack_arg_space,
-            call_conv: sig.call_conv,
         }
     }
 }
 
-/// ARM ABI object for a function body.
-pub struct ArmABIBody {
+/// ARM32 ABI object for a function body.
+pub struct Arm32ABIBody {
     /// signature: arg and retval regs
     sig: ABISig,
     /// offsets to each stackslot
@@ -82,14 +120,12 @@ pub struct ArmABIBody {
     spillslots: Option<usize>,
     /// Total frame size.
     frame_size: Option<u32>,
-    /// Calling convention this function expects.
-    call_conv: isa::CallConv,
 }
 
 fn in_int_reg(ty: ir::Type) -> bool {
     match ty {
-        types::I8 | types::I16 | types::I32 | types::I64 => true,
-        types::B1 | types::B8 | types::B16 | types::B32 | types::B64 => true,
+        types::I8 | types::I16 | types::I32 => true,
+        types::B1 | types::B8 | types::B16 | types::B32 => true,
         _ => false,
     }
 }
@@ -101,19 +137,18 @@ fn in_float_reg(ty: ir::Type) -> bool {
     }
 }
 
-impl ArmABIBody {
+impl Arm32ABIBody {
     /// Create a new body ABI instance.
     pub fn new(f: &ir::Function) -> Self {
-        debug!("AArch64 ABI: func signature {:?}", f.signature);
+        debug!("Arm32 ABI: func signature {:?}", f.signature);
 
         let sig = ABISig::from_func_sig(&f.signature);
 
-        let call_conv = f.signature.call_conv;
-        // Only these calling conventions are supported.
+        // Only this calling conventions are supported.
         assert!(
-            call_conv == isa::CallConv::SystemV,
+            f.signature.call_conv == isa::CallConv::SystemV,
             "Unsupported calling convention: {:?}",
-            call_conv
+            f.signature.call_conv
         );
 
         // Compute stackslot locations and total stackslot size.
@@ -134,13 +169,12 @@ impl ArmABIBody {
             clobbered: Set::empty(),
             spillslots: None,
             frame_size: None,
-            call_conv,
         }
     }
 }
 
 #[allow(unused)]
-impl ABIBody for ArmABIBody {
+impl ABIBody for Arm32ABIBody {
     type I = Inst;
 
     fn liveins(&self) -> Set<RealReg> {
