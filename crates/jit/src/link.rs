@@ -101,6 +101,29 @@ fn apply_reloc(
         Reloc::X86PCRelRodata4 => {
             // ignore
         }
+        Reloc::Arm32Call => unsafe {
+            let reloc_address = body.add(r.offset as usize) as usize;
+            let reloc_addend = r.addend as isize;
+            let reloc_delta = (target_func_address as u32).wrapping_sub(reloc_address as u32);
+            let reloc_delta = reloc_delta.wrapping_add(reloc_addend as u32);
+            assert!((reloc_delta as i32) < (1 << 25));
+            assert!((reloc_delta as i32) >= -(1 << 25));
+            let delta_bits = reloc_delta >> 1;
+
+            let insn = read_unaligned(reloc_address as *const u32);
+            assert!(insn == 0b11110_0_0000000000_11_0_1_0_00000000000);
+
+            let imm11 = delta_bits & 0x7ff;
+            let imm10 = (delta_bits >> 11) & 0x3ff;
+            let s = delta_bits >> 23;
+            let i1 = delta_bits >> 22;
+            let i2 = delta_bits >> 21;
+            let j1 = (i1 ^ s) ^ 0x1;
+            let j2 = (i2 ^ s) ^ 0x1;
+
+            let new_insn = insn | imm11 | (imm10 << 16) | (s << 26) | (j1 << 13) | (j2 << 11);
+            write_unaligned(reloc_address as *mut u32, new_insn);
+        },
         Reloc::Arm64Call => unsafe {
             let reloc_address = body.add(r.offset as usize) as usize;
             let reloc_addend = r.addend as isize;

@@ -9,7 +9,6 @@ use crate::result::CodegenResult;
 use crate::settings;
 
 use alloc::boxed::Box;
-
 use regalloc::RealRegUniverse;
 use target_lexicon::{Architecture, ArmArchitecture, Triple};
 

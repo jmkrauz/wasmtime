@@ -18,6 +18,20 @@ void Unwind(void *JmpBuf) {
   longjmp(*buf, 1);
 }
 
+#ifdef __arm__
+
+void call_thumb(void *payload) {
+  register void *fun __asm__("r0") = payload;
+  
+  __asm__ volatile (
+    "orr %0, %0, #1\n\t"
+    "blx %0"
+    : "+g"(fun)
+    : "g"(fun)
+    : "r1", "r2", "r3", "ip", "lr", "cc", "memory");
+}
+
+#endif
 
 #ifdef __APPLE__
 #include <sys/ucontext.h>

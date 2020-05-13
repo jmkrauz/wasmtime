@@ -1,40 +1,102 @@
 //! 32-bit ARM ISA definitions: instruction arguments.
 
 use crate::binemit::CodeOffset;
-use crate::ir::Type;
 use crate::isa::arm32::inst::*;
 
-use regalloc::{RealRegUniverse, Reg, Writable};
+use regalloc::{RealRegUniverse, Reg};
 
-use core::convert::{Into, TryFrom};
+use core::convert::{TryFrom, TryInto};
 use std::string::String;
+
+/// A shift operator for a register or immediate.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum ShiftOp {
+    LSL = 0b00,
+    LSR = 0b01,
+    ASR = 0b10,
+    ROR = 0b11,
+}
+
+impl ShiftOp {
+    /// Get the encoding of this shift op.
+    pub fn bits(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A shift operator amount.
+#[derive(Clone, Copy, Debug)]
+pub struct ShiftOpShiftImm(u8);
+
+impl ShiftOpShiftImm {
+    /// Maximum shift for shifted-register operands.
+    pub const MAX_SHIFT: u32 = 31;
+
+    /// Create a new shiftop shift amount, if possible.
+    pub fn maybe_from_shift(shift: u32) -> Option<ShiftOpShiftImm> {
+        if shift <= Self::MAX_SHIFT {
+            Some(ShiftOpShiftImm(shift as u8))
+        } else {
+            None
+        }
+    }
+
+    /// Return the shift amount.
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+/// A shift operator with an amount, guaranteed to be within range.
+#[derive(Clone, Debug)]
+pub struct ShiftOpAndAmt {
+    op: ShiftOp,
+    shift: ShiftOpShiftImm,
+}
+
+impl ShiftOpAndAmt {
+    pub fn new(op: ShiftOp, shift: ShiftOpShiftImm) -> ShiftOpAndAmt {
+        ShiftOpAndAmt { op, shift }
+    }
+
+    /// Get the shift op.
+    pub fn op(&self) -> ShiftOp {
+        self.op
+    }
+
+    /// Get the shift amount.
+    pub fn amt(&self) -> ShiftOpShiftImm {
+        self.shift
+    }
+}
 
 /// A memory argument to load/store, encapsulating the possible addressing modes.
 #[derive(Clone, Debug)]
 pub enum MemArg {
-    /// Register plus register offset.
-    RegReg(Reg, Reg),
+    /// Register plus register offset, which can be shifted by imm2.
+    RegReg(Reg, Reg, u32),
 
-    /// Scaled (by size of a word) unsigned 5-bit immediate offset from reg.
-    Offset5(Reg, u8),
-
-    /// Scaled (by size of a word) unsigned 8-bit immediate offset from stack pointer.
-    SPOffset(u8),
+    /// Unsigned 12-bit immediate offset from reg.
+    Offset12(Reg, u32),
 }
 
 impl MemArg {
     /// Memory reference using an address in a register and an offset, if possible.
-    pub fn reg_maybe_offset(reg: Reg, offset: i64, value_type: Type) -> Option<MemArg> {
-        if (offset > 0x1f || offset < 0) {
+    pub fn reg_maybe_offset(reg: Reg, offset: i32) -> Option<MemArg> {
+        if offset >= (1 << 12) || offset < 0 {
             None
         } else {
-            Some(MemArg::Offset5(reg, offset as u8))
+            Some(MemArg::Offset12(reg, offset.try_into().unwrap()))
         }
     }
 
     /// Memory reference using the sum of two registers as an address.
-    pub fn reg_plus_reg(rn: Reg, rm: Reg) -> MemArg {
-        MemArg::RegReg(rn, rm)
+    pub fn reg_plus_reg(rn: Reg, rm: Reg, imm2: u32) -> MemArg {
+        if (imm2 & !0b11) != 0 {
+            panic!("Invalid shift amount {}", imm2);
+        }
+        MemArg::RegReg(rn, rm, imm2)
     }
 }
 
@@ -93,8 +155,8 @@ impl Cond {
     }
 
     /// Return the machine encoding of this condition.
-    pub fn bits(self) -> u32 {
-        self as u32
+    pub fn bits(self) -> u16 {
+        self as u16
     }
 }
 
@@ -162,8 +224,26 @@ impl BranchTarget {
     /// size and the offset doesn't matter).
     pub fn as_offset_halfwords(&self) -> isize {
         match self {
-            &BranchTarget::ResolvedOffset(off) => off << 1,
+            &BranchTarget::ResolvedOffset(off) => (off - 4) >> 1,
             _ => 0,
+        }
+    }
+
+    pub fn as_off24(&self) -> Option<u32> {
+        let off = self.as_offset_halfwords();
+        if (off < (1 << 24)) && (off >= -(1 << 24)) {
+            Some((off as u32) & ((1 << 24) - 1))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_off20(&self) -> Option<u32> {
+        let off = self.as_offset_halfwords();
+        if (off < (1 << 20)) && (off >= -(1 << 20)) {
+            Some((off as u32) & ((1 << 20) - 1))
+        } else {
+            None
         }
     }
 
@@ -172,6 +252,24 @@ impl BranchTarget {
         let off = self.as_offset_halfwords();
         if (off < (1 << 11)) && (off >= -(1 << 11)) {
             Some((off as u16) & ((1 << 11) - 1))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_off8(&self) -> Option<u16> {
+        let off = self.as_offset_halfwords();
+        if (off < (1 << 8)) && (off >= -(1 << 8)) {
+            Some((off as u16) & ((1 << 8) - 1))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_off6(&self) -> Option<u16> {
+        let off = self.as_offset_halfwords();
+        if (off < (1 << 6)) && (off >= 0) {
+            Some((off as u16) & ((1 << 6) - 1))
         } else {
             None
         }
@@ -189,14 +287,29 @@ impl BranchTarget {
     }
 }
 
+impl ShowWithRRU for ShiftOpAndAmt {
+    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+        format!("{:?} {}", self.op(), self.amt().value())
+    }
+}
+
 impl ShowWithRRU for MemArg {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
         match self {
-            &MemArg::RegReg(rn, rm) => {
-                format!("[{}, {}]", rn.show_rru(mb_rru), rm.show_rru(mb_rru),)
+            &MemArg::RegReg(rn, rm, imm2) => {
+                let shift = if imm2 != 0 {
+                    format!(", LSL #{}", imm2)
+                } else {
+                    "".to_string()
+                };
+                format!(
+                    "[{}, {}{}]",
+                    rn.show_rru(mb_rru),
+                    rm.show_rru(mb_rru),
+                    shift
+                )
             }
-            &MemArg::Offset5(rn, off) => format!("[{}, #{}]", rn.show_rru(mb_rru), off),
-            &MemArg::SPOffset(off) => format!("[sp, #{}]", off),
+            &MemArg::Offset12(rn, off) => format!("[{}, #{}]", rn.show_rru(mb_rru), off),
         }
     }
 }
