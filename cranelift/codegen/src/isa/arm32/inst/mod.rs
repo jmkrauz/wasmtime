@@ -336,10 +336,7 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
 //=============================================================================
 // Instructions: map_regs
 
-fn arm32_map_regs(
-    inst: &mut Inst,
-    mapper: &RegUsageMapper
-) {
+fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
     fn map(m: &RegallocMap<VirtualReg, RealReg>, r: &mut Reg) {
         if r.is_virtual() {
             let new = m.get(&r.to_virtual_reg()).cloned().unwrap().to_reg();

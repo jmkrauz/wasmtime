@@ -190,7 +190,11 @@ pub(crate) fn lower_address<C: LowerCtx<I = Inst>>(
     unimplemented!()
 }
 
-pub(crate) fn lower_constant_int<C: LowerCtx<I = Inst>>(ctx: &mut C, rd: Writable<Reg>, value: u64) {
+pub(crate) fn lower_constant_int<C: LowerCtx<I = Inst>>(
+    ctx: &mut C,
+    rd: Writable<Reg>,
+    value: u64,
+) {
     assert!((value >> 32) == 0x0 || (value >> 32) == (1 << 32) - 1);
 
     for inst in Inst::load_constant(rd, (value & ((1 << 32) - 1)) as u32) {

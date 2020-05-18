@@ -31,11 +31,18 @@ impl Arm32Backend {
     /// Create a new ARM32 backend with the given (shared) flags.
     pub fn new_with_flags(triple: Triple, flags: settings::Flags) -> Arm32Backend {
         let reg_universe = create_reg_universe();
-        Arm32Backend { triple, flags, reg_universe }
+        Arm32Backend {
+            triple,
+            flags,
+            reg_universe,
+        }
     }
 
-    fn compile_vcode(&self, func: &Function, flags: settings::Flags)
-            -> CodegenResult<VCode<inst::Inst>> {
+    fn compile_vcode(
+        &self,
+        func: &Function,
+        flags: settings::Flags,
+    ) -> CodegenResult<VCode<inst::Inst>> {
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
         let abi = Box::new(abi::Arm32ABIBody::new(func, flags));

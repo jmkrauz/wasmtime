@@ -160,37 +160,29 @@ fn in_float_reg(ty: ir::Type) -> bool {
 
 fn load_stack(mem: MemArg, into_reg: Writable<Reg>, ty: Type) -> Inst {
     match ty {
-        types::B1
-        | types::B8
-        | types::I8
-        | types::B16
-        | types::I16
-        | types::B32
-        | types::I32 => Inst::Load {
-            rt: into_reg,
-            mem,
-            srcloc: None,
-            bits: 32,
-            sign_extend: false,
-        },
+        types::B1 | types::B8 | types::I8 | types::B16 | types::I16 | types::B32 | types::I32 => {
+            Inst::Load {
+                rt: into_reg,
+                mem,
+                srcloc: None,
+                bits: 32,
+                sign_extend: false,
+            }
+        }
         _ => unimplemented!("load_stack({})", ty),
     }
 }
 
 fn store_stack(mem: MemArg, from_reg: Reg, ty: Type) -> Inst {
     match ty {
-        types::B1
-        | types::B8
-        | types::I8
-        | types::B16
-        | types::I16
-        | types::B32
-        | types::I32 => Inst::Store {
-            rt: from_reg,
-            mem,
-            srcloc: None,
-            bits: 32
-        },
+        types::B1 | types::B8 | types::I8 | types::B16 | types::I16 | types::B32 | types::I32 => {
+            Inst::Store {
+                rt: from_reg,
+                mem,
+                srcloc: None,
+                bits: 32,
+            }
+        }
         _ => unimplemented!("store_stack({})", ty),
     }
 }
@@ -245,8 +237,7 @@ fn gen_stack_limit(f: &ir::Function, abi: &ABISig, gv: ir::GlobalValue) -> (Reg,
                 let base = generate_gv(f, abi, base, insts);
                 let into_reg = writable_ip_reg();
                 let offset: i32 = offset.into();
-                let mem = if let Some(mem) = MemArg::reg_maybe_offset(base, offset)
-                {
+                let mem = if let Some(mem) = MemArg::reg_maybe_offset(base, offset) {
                     mem
                 } else {
                     insts.extend(Inst::load_constant(into_reg, offset as u32));
@@ -598,16 +589,16 @@ fn adjust_stack<C: LowerCtx<I = Inst>>(ctx: &mut C, amount: u32, is_sub: bool) {
         return;
     }
     let alu_op = if is_sub { ALUOp::Sub } else { ALUOp::Add };
-        for inst in Inst::load_constant(writable_ip_reg(), amount).into_vec() {
-            ctx.emit(inst);
-        }
-        ctx.emit(Inst::AluRRRShift {
-            alu_op,
-            rd: writable_sp_reg(),
-            rn: sp_reg(),
-            rm: ip_reg(),
-            shift: None,
-        });
+    for inst in Inst::load_constant(writable_ip_reg(), amount).into_vec() {
+        ctx.emit(inst);
+    }
+    ctx.emit(Inst::AluRRRShift {
+        alu_op,
+        rd: writable_sp_reg(),
+        rn: sp_reg(),
+        rm: ip_reg(),
+        shift: None,
+    });
 }
 
 impl ABICall for Arm32ABICall {
@@ -618,19 +609,11 @@ impl ABICall for Arm32ABICall {
     }
 
     fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
-        adjust_stack(
-            ctx,
-            self.sig.stack_arg_space,
-            /* is_sub = */ true,
-        )
+        adjust_stack(ctx, self.sig.stack_arg_space, /* is_sub = */ true)
     }
 
     fn emit_stack_post_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
-        adjust_stack(
-            ctx,
-            self.sig.stack_arg_space,
-            /* is_sub = */ false,
-        )
+        adjust_stack(ctx, self.sig.stack_arg_space, /* is_sub = */ false)
     }
 
     fn emit_copy_reg_to_arg<C: LowerCtx<I = Self::I>>(
@@ -655,7 +638,6 @@ impl ABICall for Arm32ABICall {
                     let mem = MemArg::reg_plus_reg(sp_reg(), ip_reg(), 0);
                     ctx.emit(store_stack(mem, from_reg, ty));
                 }
-                
             }
         }
     }
@@ -685,9 +667,7 @@ impl ABICall for Arm32ABICall {
                 loc: self.loc,
                 opcode: self.opcode,
             }),
-            &CallDest::ExtName(ref _name, RelocDistance::Far) => {
-                unimplemented!()
-            }
+            &CallDest::ExtName(ref _name, RelocDistance::Far) => unimplemented!(),
             &CallDest::Reg(reg) => ctx.emit(Inst::CallInd {
                 rm: reg,
                 uses,

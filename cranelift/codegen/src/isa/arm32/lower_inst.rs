@@ -253,7 +253,10 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
                     let sig = ctx.call_sig(insn).unwrap();
                     assert!(inputs.len() == sig.params.len());
                     assert!(outputs.len() == sig.returns.len());
-                    (Arm32ABICall::from_func(sig, &extname, dist, loc), &inputs[..])
+                    (
+                        Arm32ABICall::from_func(sig, &extname, dist, loc),
+                        &inputs[..],
+                    )
                 }
                 Opcode::CallIndirect => {
                     let ptr = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
@@ -289,80 +292,80 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
     fallthrough: Option<BlockIndex>,
 ) {
     // A block should end with at most two branches. The first may be a
-        // conditional branch; a conditional branch can be followed only by an
-        // unconditional branch or fallthrough. Otherwise, if only one branch,
-        // it may be an unconditional branch, a fallthrough, a return, or a
-        // trap. These conditions are verified by `is_ebb_basic()` during the
-        // verifier pass.
-        assert!(branches.len() <= 2);
+    // conditional branch; a conditional branch can be followed only by an
+    // unconditional branch or fallthrough. Otherwise, if only one branch,
+    // it may be an unconditional branch, a fallthrough, a return, or a
+    // trap. These conditions are verified by `is_ebb_basic()` during the
+    // verifier pass.
+    assert!(branches.len() <= 2);
 
-        if branches.len() == 2 {
-            // Must be a conditional branch followed by an unconditional branch.
-            let op0 = ctx.data(branches[0]).opcode();
-            let op1 = ctx.data(branches[1]).opcode();
+    if branches.len() == 2 {
+        // Must be a conditional branch followed by an unconditional branch.
+        let op0 = ctx.data(branches[0]).opcode();
+        let op1 = ctx.data(branches[1]).opcode();
 
-            assert!(op1 == Opcode::Jump || op1 == Opcode::Fallthrough);
-            let taken = BranchTarget::Block(targets[0]);
-            let not_taken = match op1 {
-                Opcode::Jump => BranchTarget::Block(targets[1]),
-                Opcode::Fallthrough => BranchTarget::Block(fallthrough.unwrap()),
-                _ => unreachable!(), // assert above.
-            };
-            match op0 {
-                Opcode::Brz | Opcode::Brnz => {
-                    let flag_input = InsnInput {
-                        insn: branches[0],
-                        input: 0,
+        assert!(op1 == Opcode::Jump || op1 == Opcode::Fallthrough);
+        let taken = BranchTarget::Block(targets[0]);
+        let not_taken = match op1 {
+            Opcode::Jump => BranchTarget::Block(targets[1]),
+            Opcode::Fallthrough => BranchTarget::Block(fallthrough.unwrap()),
+            _ => unreachable!(), // assert above.
+        };
+        match op0 {
+            Opcode::Brz | Opcode::Brnz => {
+                let flag_input = InsnInput {
+                    insn: branches[0],
+                    input: 0,
+                };
+                if let Some(_icmp_insn) =
+                    maybe_input_insn_via_conv(ctx, flag_input, Opcode::Icmp, Opcode::Bint)
+                {
+                    unimplemented!()
+                } else if let Some(_fcmp_insn) =
+                    maybe_input_insn_via_conv(ctx, flag_input, Opcode::Fcmp, Opcode::Bint)
+                {
+                    unimplemented!()
+                } else {
+                    let rt = input_to_reg(
+                        ctx,
+                        InsnInput {
+                            insn: branches[0],
+                            input: 0,
+                        },
+                        NarrowValueMode::ZeroExtend,
+                    );
+                    let kind = match op0 {
+                        Opcode::Brz => CondBrKind::Zero(rt),
+                        Opcode::Brnz => CondBrKind::NotZero(rt),
+                        _ => unreachable!(),
                     };
-                    if let Some(_icmp_insn) =
-                        maybe_input_insn_via_conv(ctx, flag_input, Opcode::Icmp, Opcode::Bint)
-                    {
-                        unimplemented!()
-                    } else if let Some(_fcmp_insn) =
-                        maybe_input_insn_via_conv(ctx, flag_input, Opcode::Fcmp, Opcode::Bint)
-                    {
-                        unimplemented!()
-                    } else {
-                        let rt = input_to_reg(
-                            ctx,
-                            InsnInput {
-                                insn: branches[0],
-                                input: 0,
-                            },
-                            NarrowValueMode::ZeroExtend,
-                        );
-                        let kind = match op0 {
-                            Opcode::Brz => CondBrKind::Zero(rt),
-                            Opcode::Brnz => CondBrKind::NotZero(rt),
-                            _ => unreachable!(),
-                        };
-                        ctx.emit(Inst::CondBr {
-                            taken,
-                            not_taken,
-                            kind,
-                        });
-                    }
-                }
-                Opcode::BrIcmp => unimplemented!(),
-                Opcode::Brif => unimplemented!(),
-                Opcode::Brff => unimplemented!(),
-                _ => unimplemented!(),
-            }
-        } else {
-            // Must be an unconditional branch or an indirect branch.
-            let op = ctx.data(branches[0]).opcode();
-            match op {
-                Opcode::Jump | Opcode::Fallthrough => {
-                    assert!(branches.len() == 1);
-                    // In the Fallthrough case, the machine-independent driver
-                    // fills in `targets[0]` with our fallthrough block, so this
-                    // is valid for both Jump and Fallthrough.
-                    ctx.emit(Inst::Jump {
-                        dest: BranchTarget::Block(targets[0]),
+                    ctx.emit(Inst::CondBr {
+                        taken,
+                        not_taken,
+                        kind,
                     });
                 }
-                Opcode::BrTable => unimplemented!(),
-                _ => panic!("Unknown branch type!"),
             }
+            Opcode::BrIcmp => unimplemented!(),
+            Opcode::Brif => unimplemented!(),
+            Opcode::Brff => unimplemented!(),
+            _ => unimplemented!(),
+        }
+    } else {
+        // Must be an unconditional branch or an indirect branch.
+        let op = ctx.data(branches[0]).opcode();
+        match op {
+            Opcode::Jump | Opcode::Fallthrough => {
+                assert!(branches.len() == 1);
+                // In the Fallthrough case, the machine-independent driver
+                // fills in `targets[0]` with our fallthrough block, so this
+                // is valid for both Jump and Fallthrough.
+                ctx.emit(Inst::Jump {
+                    dest: BranchTarget::Block(targets[0]),
+                });
+            }
+            Opcode::BrTable => unimplemented!(),
+            _ => panic!("Unknown branch type!"),
         }
     }
+}

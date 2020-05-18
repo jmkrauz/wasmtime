@@ -216,7 +216,7 @@ pub struct EmitState {
 
 impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
     type State = EmitState;
-    
+
     fn emit(&self, sink: &mut O, _flags: &settings::Flags, _state: &mut EmitState) {
         match self {
             &Inst::AluRR { .. }
@@ -292,7 +292,7 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
             } => {
                 if let Some(srcloc) = srcloc {
                     // Register the offset at which the store instruction starts.
-                    sink.add_trap(srcloc, TrapCode::OutOfBounds);
+                    sink.add_trap(srcloc, TrapCode::HeapOutOfBounds);
                 }
                 match mem {
                     &MemArg::RegReg(rn, rm, imm2) => {
@@ -324,7 +324,7 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
             } => {
                 if let Some(srcloc) = srcloc {
                     // Register the offset at which the load instruction starts.
-                    sink.add_trap(srcloc, TrapCode::OutOfBounds);
+                    sink.add_trap(srcloc, TrapCode::HeapOutOfBounds);
                 }
                 match mem {
                     &MemArg::RegReg(rn, rm, imm2) => {
