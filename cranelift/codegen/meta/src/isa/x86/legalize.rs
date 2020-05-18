@@ -37,6 +37,8 @@ pub(crate) fn define(shared: &mut SharedDefinitions, x86_instructions: &Instruct
     let imul = insts.by_name("imul");
     let ineg = insts.by_name("ineg");
     let isub = insts.by_name("isub");
+    let ishl = insts.by_name("ishl");
+    let ireduce = insts.by_name("ireduce");
     let popcnt = insts.by_name("popcnt");
     let sdiv = insts.by_name("sdiv");
     let selectif = insts.by_name("selectif");
@@ -45,6 +47,7 @@ pub(crate) fn define(shared: &mut SharedDefinitions, x86_instructions: &Instruct
     let tls_value = insts.by_name("tls_value");
     let udiv = insts.by_name("udiv");
     let umulhi = insts.by_name("umulhi");
+    let ushr = insts.by_name("ushr");
     let ushr_imm = insts.by_name("ushr_imm");
     let urem = insts.by_name("urem");
 
@@ -54,6 +57,32 @@ pub(crate) fn define(shared: &mut SharedDefinitions, x86_instructions: &Instruct
     let x86_smulx = x86_instructions.by_name("x86_smulx");
 
     let imm = &shared.imm;
+
+    // Shift by a 64-bit amount is equivalent to a shift by that amount mod 32, so we can reduce
+    // the size of the shift amount. This is useful for x86_32, where an I64 shift amount is
+    // not encodable.
+    let a = var("a");
+    let x = var("x");
+    let y = var("y");
+    let z = var("z");
+
+    for &ty in &[I8, I16, I32] {
+        let ishl_by_i64 = ishl.bind(ty).bind(I64);
+        let ireduce = ireduce.bind(I32);
+        group.legalize(
+            def!(a = ishl_by_i64(x, y)),
+            vec![def!(z = ireduce(y)), def!(a = ishl(x, z))],
+        );
+    }
+
+    for &ty in &[I8, I16, I32] {
+        let ushr_by_i64 = ushr.bind(ty).bind(I64);
+        let ireduce = ireduce.bind(I32);
+        group.legalize(
+            def!(a = ushr_by_i64(x, y)),
+            vec![def!(z = ireduce(y)), def!(a = ishl(x, z))],
+        );
+    }
 
     // Division and remainder.
     //
@@ -326,6 +355,7 @@ fn define_simd(shared: &mut SharedDefinitions, x86_instructions: &InstructionGro
     let fcmp = insts.by_name("fcmp");
     let fabs = insts.by_name("fabs");
     let fneg = insts.by_name("fneg");
+    let iadd_imm = insts.by_name("iadd_imm");
     let icmp = insts.by_name("icmp");
     let imax = insts.by_name("imax");
     let imin = insts.by_name("imin");
@@ -349,15 +379,17 @@ fn define_simd(shared: &mut SharedDefinitions, x86_instructions: &InstructionGro
     let vall_true = insts.by_name("vall_true");
     let vany_true = insts.by_name("vany_true");
 
+    let x86_packss = x86_instructions.by_name("x86_packss");
     let x86_pmaxs = x86_instructions.by_name("x86_pmaxs");
     let x86_pmaxu = x86_instructions.by_name("x86_pmaxu");
     let x86_pmins = x86_instructions.by_name("x86_pmins");
     let x86_pminu = x86_instructions.by_name("x86_pminu");
     let x86_pshufb = x86_instructions.by_name("x86_pshufb");
     let x86_pshufd = x86_instructions.by_name("x86_pshufd");
-    let x86_psll = x86_instructions.by_name("x86_psll");
     let x86_psra = x86_instructions.by_name("x86_psra");
     let x86_ptest = x86_instructions.by_name("x86_ptest");
+    let x86_punpckh = x86_instructions.by_name("x86_punpckh");
+    let x86_punpckl = x86_instructions.by_name("x86_punpckl");
 
     let imm = &shared.imm;
 
@@ -374,6 +406,7 @@ fn define_simd(shared: &mut SharedDefinitions, x86_instructions: &InstructionGro
     // Set up variables and immediates.
     let uimm8_zero = Literal::constant(&imm.uimm8, 0x00);
     let uimm8_one = Literal::constant(&imm.uimm8, 0x01);
+    let uimm8_eight = Literal::constant(&imm.uimm8, 8);
     let u128_zeroes = constant(vec![0x00; 16]);
     let u128_ones = constant(vec![0xff; 16]);
     let u128_seventies = constant(vec![0x70; 16]);
@@ -382,8 +415,12 @@ fn define_simd(shared: &mut SharedDefinitions, x86_instructions: &InstructionGro
     let c = var("c");
     let d = var("d");
     let e = var("e");
+    let f = var("f");
+    let g = var("g");
+    let h = var("h");
     let x = var("x");
     let y = var("y");
+    let z = var("z");
 
     // Limit the SIMD vector size: eventually multiple vector sizes may be supported
     // but for now only SSE-sized vectors are available.
@@ -485,23 +522,57 @@ fn define_simd(shared: &mut SharedDefinitions, x86_instructions: &InstructionGro
         );
     }
 
-    // SIMD shift left (logical)
-    for ty in &[I16, I32, I64] {
-        let ishl = ishl.bind(vector(*ty, sse_vector_size));
-        let bitcast = bitcast.bind(vector(I64, sse_vector_size));
-        narrow.legalize(
-            def!(a = ishl(x, y)),
-            vec![def!(b = bitcast(y)), def!(a = x86_psll(x, b))],
-        );
-    }
-
-    // SIMD shift left (arithmetic)
-    for ty in &[I16, I32, I64] {
+    // SIMD shift right (arithmetic, i16x8 and i32x4)
+    for ty in &[I16, I32] {
         let sshr = sshr.bind(vector(*ty, sse_vector_size));
-        let bitcast = bitcast.bind(vector(I64, sse_vector_size));
+        let bitcast_i64x2 = bitcast.bind(vector(I64, sse_vector_size));
         narrow.legalize(
             def!(a = sshr(x, y)),
-            vec![def!(b = bitcast(y)), def!(a = x86_psra(x, b))],
+            vec![def!(b = bitcast_i64x2(y)), def!(a = x86_psra(x, b))],
+        );
+    }
+    // SIMD shift right (arithmetic, i8x16)
+    {
+        let sshr = sshr.bind(vector(I8, sse_vector_size));
+        let bitcast_i64x2 = bitcast.bind(vector(I64, sse_vector_size));
+        let raw_bitcast_i16x8 = raw_bitcast.bind(vector(I16, sse_vector_size));
+        let raw_bitcast_i16x8_again = raw_bitcast.bind(vector(I16, sse_vector_size));
+        narrow.legalize(
+            def!(z = sshr(x, y)),
+            vec![
+                // Since we will use the high byte of each 16x8 lane, shift an extra 8 bits.
+                def!(a = iadd_imm(y, uimm8_eight)),
+                def!(b = bitcast_i64x2(a)),
+                // Take the low 8 bytes of x, duplicate them in 16x8 lanes, then shift right.
+                def!(c = x86_punpckl(x, x)),
+                def!(d = raw_bitcast_i16x8(c)),
+                def!(e = x86_psra(d, b)),
+                // Take the high 8 bytes of x, duplicate them in 16x8 lanes, then shift right.
+                def!(f = x86_punpckh(x, x)),
+                def!(g = raw_bitcast_i16x8_again(f)),
+                def!(h = x86_psra(g, b)),
+                // Re-pack the vector.
+                def!(z = x86_packss(e, h)),
+            ],
+        );
+    }
+    // SIMD shift right (arithmetic, i64x2)
+    {
+        let sshr_vector = sshr.bind(vector(I64, sse_vector_size));
+        let sshr_scalar_lane0 = sshr.bind(I64);
+        let sshr_scalar_lane1 = sshr.bind(I64);
+        narrow.legalize(
+            def!(z = sshr_vector(x, y)),
+            vec![
+                // Use scalar operations to shift the first lane.
+                def!(a = extractlane(x, uimm8_zero)),
+                def!(b = sshr_scalar_lane0(a, y)),
+                def!(c = insertlane(x, uimm8_zero, b)),
+                // Do the same for the second lane.
+                def!(d = extractlane(x, uimm8_one)),
+                def!(e = sshr_scalar_lane1(d, y)),
+                def!(z = insertlane(c, uimm8_one, e)),
+            ],
         );
     }
 
@@ -685,6 +756,7 @@ fn define_simd(shared: &mut SharedDefinitions, x86_instructions: &InstructionGro
     narrow.custom_legalize(insertlane, "convert_insertlane");
     narrow.custom_legalize(ineg, "convert_ineg");
     narrow.custom_legalize(ushr, "convert_ushr");
+    narrow.custom_legalize(ishl, "convert_ishl");
 
     narrow.build_and_add_to(&mut shared.transform_groups);
 }

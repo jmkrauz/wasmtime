@@ -1,3 +1,5 @@
+use crate::runtime::StoreInner;
+use crate::trampoline::StoreInstanceHandle;
 use crate::{Extern, FuncType, Memory, Store, Trap, Val, ValType};
 use anyhow::{bail, ensure, Context as _, Result};
 use std::cmp::max;
@@ -5,6 +7,7 @@ use std::fmt;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
+use std::rc::Weak;
 use wasmtime_runtime::{Export, InstanceHandle, VMContext, VMFunctionBody};
 use wasmtime_runtime::{ExportFunction, VMTrampoline};
 
@@ -135,8 +138,7 @@ use wasmtime_runtime::{ExportFunction, VMTrampoline};
 /// ```
 #[derive(Clone)]
 pub struct Func {
-    store: Store,
-    instance: InstanceHandle,
+    instance: StoreInstanceHandle,
     export: ExportFunction,
     trampoline: VMTrampoline,
 }
@@ -191,13 +193,9 @@ macro_rules! getters {
                     >(export.address);
                     let mut ret = None;
                     $(let $args = $args.into_abi();)*
-                    wasmtime_runtime::catch_traps(export.vmctx, || {
+                    catch_traps(export.vmctx, &instance.store, || {
                         ret = Some(fnptr(export.vmctx, ptr::null_mut(), $($args,)*));
-                    }).map_err(Trap::from_jit)?;
-
-                    // We're holding this handle just to ensure that the instance stays
-                    // live while we call into it.
-                    drop(&instance);
+                    })?;
 
                     Ok(ret.unwrap())
                 }
@@ -235,7 +233,7 @@ impl Func {
         ty: FuncType,
         func: impl Fn(Caller<'_>, &[Val], &mut [Val]) -> Result<(), Trap> + 'static,
     ) -> Self {
-        let store_clone = store.clone();
+        let store_weak = store.weak();
         let ty_clone = ty.clone();
 
         // Create our actual trampoline function which translates from a bunch
@@ -254,7 +252,7 @@ impl Func {
             let mut returns = vec![Val::null(); ty_clone.results().len()];
             func(
                 Caller {
-                    store: &store_clone,
+                    store: &store_weak,
                     caller_vmctx,
                 },
                 &args,
@@ -280,7 +278,6 @@ impl Func {
         let (instance, export, trampoline) =
             crate::trampoline::generate_func_export(&ty, func, store).expect("generated func");
         Func {
-            store: store.clone(),
             instance,
             export,
             trampoline,
@@ -482,6 +479,7 @@ impl Func {
         // Signatures should always be registered in the store's registry of
         // shared signatures, so we should be able to unwrap safely here.
         let sig = self
+            .instance
             .store
             .compiler()
             .signatures()
@@ -497,17 +495,19 @@ impl Func {
     /// Returns the number of parameters that this function takes.
     pub fn param_arity(&self) -> usize {
         let sig = self
+            .instance
             .store
             .compiler()
             .signatures()
             .lookup(self.export.signature)
             .expect("failed to lookup signature");
-        sig.params.len()
+        sig.params.len() - 2 // skip the two vmctx leading parameters
     }
 
     /// Returns the number of results this function produces.
     pub fn result_arity(&self) -> usize {
         let sig = self
+            .instance
             .store
             .compiler()
             .signatures()
@@ -548,7 +548,7 @@ impl Func {
             if arg.ty() != *ty {
                 bail!("argument type mismatch");
             }
-            if !arg.comes_from_same_store(&self.store) {
+            if !arg.comes_from_same_store(&self.instance.store) {
                 bail!("cross-`Store` values are not currently supported");
             }
             unsafe {
@@ -557,18 +557,14 @@ impl Func {
         }
 
         // Call the trampoline.
-        if let Err(error) = unsafe {
-            wasmtime_runtime::catch_traps(self.export.vmctx, || {
-                (self.trampoline)(
-                    self.export.vmctx,
-                    ptr::null_mut(),
-                    self.export.address,
-                    values_vec.as_mut_ptr(),
-                )
-            })
-        } {
-            return Err(Trap::from_jit(error).into());
-        }
+        catch_traps(self.export.vmctx, &self.instance.store, || unsafe {
+            (self.trampoline)(
+                self.export.vmctx,
+                ptr::null_mut(),
+                self.export.address,
+                values_vec.as_mut_ptr(),
+            )
+        })?;
 
         // Load the return values out of `values_vec`.
         let mut results = Vec::with_capacity(my_ty.results().len());
@@ -588,8 +584,7 @@ impl Func {
 
     pub(crate) fn from_wasmtime_function(
         export: wasmtime_runtime::ExportFunction,
-        store: &Store,
-        instance: InstanceHandle,
+        instance: StoreInstanceHandle,
     ) -> Self {
         // Each function signature in a module should have a trampoline stored
         // on that module as well, so unwrap the result here since otherwise
@@ -602,7 +597,6 @@ impl Func {
             instance,
             export,
             trampoline,
-            store: store.clone(),
         }
     }
 
@@ -729,13 +723,31 @@ impl Func {
     }
 
     pub(crate) fn store(&self) -> &Store {
-        &self.store
+        &self.instance.store
     }
 }
 
 impl fmt::Debug for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Func")
+    }
+}
+
+pub(crate) fn catch_traps(
+    vmctx: *mut VMContext,
+    store: &Store,
+    closure: impl FnMut(),
+) -> Result<(), Trap> {
+    let signalhandler = store.signal_handler();
+    unsafe {
+        wasmtime_runtime::catch_traps(
+            vmctx,
+            store.engine().config().max_wasm_stack,
+            |addr| store.compiler().is_in_jit_code(addr),
+            signalhandler.as_deref(),
+            closure,
+        )
+        .map_err(Trap::from_jit)
     }
 }
 
@@ -965,7 +977,23 @@ pub trait IntoFunc<Params, Results> {
 /// the caller's memory until interface types has been fully standardized and
 /// implemented.
 pub struct Caller<'a> {
-    store: &'a Store,
+    // Note that this is a `Weak` pointer instead of a `&'a Store`,
+    // intentionally so. This allows us to break an `Rc` cycle which would
+    // otherwise look like this:
+    //
+    // * A `Store` object ...
+    // * ... owns all `InstanceHandle` objects ...
+    // * ... which are created in `Func::wrap` with custom host data ...
+    // * ... where the custom host data needs to point to `Store` to be stored
+    //   here
+    //
+    // This `Rc` cycle means that we would never actually reclaim any memory or
+    // deallocate any instances. To break this cycle we use a weak pointer here
+    // which points back to `Store`. A `Caller` should only ever be usable
+    // when the original `Store` is alive, however, so this should always be an
+    // upgrade-able pointer. Alternative solutions or other ideas to break this
+    // cycle would be most welcome!
+    store: &'a Weak<StoreInner>,
     caller_vmctx: *mut VMContext,
 }
 
@@ -999,7 +1027,14 @@ impl Caller<'_> {
                 Some(Export::Memory(m)) => m,
                 _ => return None,
             };
-            let mem = Memory::from_wasmtime_memory(export, self.store, instance);
+            // Our `Weak` pointer is used only to break a cycle where `Store`
+            // stores instance handles which have this weak pointer as their
+            // custom host data. This function should only be invoke-able while
+            // the `Store` is active, so this upgrade should always succeed.
+            debug_assert!(self.store.upgrade().is_some());
+            let handle =
+                Store::from_inner(self.store.upgrade()?).existing_instance_handle(instance);
+            let mem = Memory::from_wasmtime_memory(export, handle);
             Some(Extern::Memory(mem))
         }
     }
@@ -1052,8 +1087,8 @@ macro_rules! impl_into_func {
                         // Double-check ourselves in debug mode, but we control
                         // the `Any` here so an unsafe downcast should also
                         // work.
-                        debug_assert!(state.is::<(F, Store)>());
-                        let (func, store) = &*(state as *const _ as *const (F, Store));
+                        debug_assert!(state.is::<(F, Weak<StoreInner>)>());
+                        let (func, store) = &*(state as *const _ as *const (F, Weak<StoreInner>));
                         panic::catch_unwind(AssertUnwindSafe(|| {
                             func(
                                 Caller { store, caller_vmctx },
@@ -1097,7 +1132,7 @@ macro_rules! impl_into_func {
                 let mut ret = Vec::new();
                 R::push(&mut ret);
                 let ty = FuncType::new(_args.into(), ret.into());
-                let store_clone = store.clone();
+                let store_weak = store.weak();
                 unsafe {
 					let trampoline = trampoline::<$($args,)* R>;
                     let (instance, export) = crate::trampoline::generate_raw_func_export(
@@ -1108,11 +1143,10 @@ macro_rules! impl_into_func {
                         ),
                         trampoline,
                         store,
-                        Box::new((self, store_clone)),
+                        Box::new((self, store_weak)),
                     )
                     .expect("failed to generate export");
                     Func {
-                        store: store.clone(),
                         instance,
                         export,
                         trampoline,

@@ -114,7 +114,7 @@ struct CommonOptions {
 
     /// Enable support for multi-value functions
     #[structopt(long)]
-    enable_multi_value: bool,
+    enable_multi_value: Option<bool>,
 
     /// Enable support for Wasm threads
     #[structopt(long)]
@@ -152,6 +152,19 @@ struct CommonOptions {
         default_value = "2",
     )]
     opt_level: wasmtime::OptLevel,
+
+    /// Maximum size in bytes of wasm memory before it becomes dynamically
+    /// relocatable instead of up-front-reserved.
+    #[structopt(long)]
+    static_memory_maximum_size: Option<u64>,
+
+    /// Byte size of the guard region after static memories are allocated.
+    #[structopt(long)]
+    static_memory_guard_size: Option<u64>,
+
+    /// Byte size of the guard region after dynamic memories are allocated.
+    #[structopt(long)]
+    dynamic_memory_guard_size: Option<u64>,
 }
 
 impl CommonOptions {
@@ -163,7 +176,7 @@ impl CommonOptions {
             .wasm_bulk_memory(self.enable_bulk_memory || self.enable_all)
             .wasm_simd(self.enable_simd || self.enable_all)
             .wasm_reference_types(self.enable_reference_types || self.enable_all)
-            .wasm_multi_value(self.enable_multi_value || self.enable_all)
+            .wasm_multi_value(self.enable_multi_value.unwrap_or(true) || self.enable_all)
             .wasm_threads(self.enable_threads || self.enable_all)
             .cranelift_opt_level(self.opt_level())
             .strategy(pick_compilation_strategy(self.cranelift, self.lightbeam)?)?
@@ -177,6 +190,15 @@ impl CommonOptions {
                     config.cache_config_load_default()?;
                 }
             }
+        }
+        if let Some(max) = self.static_memory_maximum_size {
+            config.static_memory_maximum_size(max);
+        }
+        if let Some(size) = self.static_memory_guard_size {
+            config.static_memory_guard_size(size);
+        }
+        if let Some(size) = self.dynamic_memory_guard_size {
+            config.dynamic_memory_guard_size(size);
         }
         Ok(config)
     }

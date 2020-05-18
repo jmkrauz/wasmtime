@@ -285,6 +285,11 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
                 config.as_mut().unwrap().debug_info(b);
             }
 
+            ApiCall::ConfigInterruptable(b) => {
+                log::trace!("enabling interruption");
+                config.as_mut().unwrap().interruptable(b);
+            }
+
             ApiCall::EngineNew => {
                 log::trace!("creating engine");
                 assert!(engine.is_none());
@@ -388,6 +393,8 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
 ///
 /// Ensures that spec tests pass regardless of the `Config`.
 pub fn spectest(config: crate::generators::Config, test: crate::generators::SpecTest) {
+    crate::init_fuzzing();
+    log::debug!("running {:?} with {:?}", test.file, config);
     let store = Store::new(&Engine::new(&config.to_wasmtime()));
     let mut wast_context = WastContext::new(store);
     wast_context.register_spectest().unwrap();

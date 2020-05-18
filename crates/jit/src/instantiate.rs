@@ -21,6 +21,7 @@ use wasmtime_environ::{
     ModuleEnvironment, Traps,
 };
 use wasmtime_profiling::ProfilingAgent;
+use wasmtime_runtime::VMInterrupts;
 use wasmtime_runtime::{
     GdbJitImageRegistration, InstanceHandle, InstantiationError, RuntimeMemoryCreator,
     SignatureRegistry, VMFunctionBody, VMSharedSignatureIndex, VMTrampoline,
@@ -138,6 +139,7 @@ pub struct CompiledModule {
     dbg_jit_registration: Option<Rc<GdbJitImageRegistration>>,
     traps: Traps,
     address_transform: ModuleAddressMap,
+    interrupts: Arc<VMInterrupts>,
 }
 
 impl CompiledModule {
@@ -162,6 +164,7 @@ impl CompiledModule {
             raw.dbg_jit_registration,
             raw.traps,
             raw.address_transform,
+            compiler.interrupts().clone(),
         ))
     }
 
@@ -175,6 +178,7 @@ impl CompiledModule {
         dbg_jit_registration: Option<GdbJitImageRegistration>,
         traps: Traps,
         address_transform: ModuleAddressMap,
+        interrupts: Arc<VMInterrupts>,
     ) -> Self {
         Self {
             module: Arc::new(module),
@@ -185,6 +189,7 @@ impl CompiledModule {
             dbg_jit_registration: dbg_jit_registration.map(Rc::new),
             traps,
             address_transform,
+            interrupts,
         }
     }
 
@@ -199,20 +204,11 @@ impl CompiledModule {
     /// See `InstanceHandle::new`
     pub unsafe fn instantiate(
         &self,
-        is_bulk_memory: bool,
         resolver: &mut dyn Resolver,
         sig_registry: &SignatureRegistry,
         mem_creator: Option<&dyn RuntimeMemoryCreator>,
         host_state: Box<dyn Any>,
     ) -> Result<InstanceHandle, InstantiationError> {
-        let data_initializers = self
-            .data_initializers
-            .iter()
-            .map(|init| DataInitializer {
-                location: init.location.clone(),
-                data: &*init.data,
-            })
-            .collect::<Vec<_>>();
         let imports = resolve_imports(&self.module, &sig_registry, resolver)?;
         InstanceHandle::new(
             Arc::clone(&self.module),
@@ -220,12 +216,22 @@ impl CompiledModule {
             self.trampolines.clone(),
             imports,
             mem_creator,
-            &data_initializers,
             self.signatures.clone(),
             self.dbg_jit_registration.as_ref().map(|r| Rc::clone(&r)),
-            is_bulk_memory,
             host_state,
+            self.interrupts.clone(),
         )
+    }
+
+    /// Returns data initializers to pass to `InstanceHandle::initialize`
+    pub fn data_initializers(&self) -> Vec<DataInitializer<'_>> {
+        self.data_initializers
+            .iter()
+            .map(|init| DataInitializer {
+                location: init.location.clone(),
+                data: &*init.data,
+            })
+            .collect()
     }
 
     /// Return a reference-counting pointer to a module.

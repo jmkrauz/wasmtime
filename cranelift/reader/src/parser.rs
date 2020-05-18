@@ -23,6 +23,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::{self, CallConv, Encoding, RegUnit, TargetIsa};
 use cranelift_codegen::packed_option::ReservedValue;
 use cranelift_codegen::{settings, timing};
+use smallvec::SmallVec;
 use std::mem;
 use std::str::FromStr;
 use std::{u16, u32};
@@ -114,11 +115,25 @@ pub fn parse_test<'a>(text: &'a str, options: ParseOptions<'a>) -> ParseResult<T
     })
 }
 
-/// Parse the entire `text` as a run command.
-pub fn parse_run_command<'a>(text: &str, signature: &Signature) -> ParseResult<RunCommand> {
+/// Parse a CLIF comment `text` as a run command.
+///
+/// Return:
+///  - `Ok(None)` if the comment is not intended to be a `RunCommand` (i.e. does not start with `run`
+///    or `print`
+///  - `Ok(Some(command))` if the comment is intended as a `RunCommand` and can be parsed to one
+///  - `Err` otherwise.
+pub fn parse_run_command<'a>(text: &str, signature: &Signature) -> ParseResult<Option<RunCommand>> {
     let _tt = timing::parse_text();
-    let mut parser = Parser::new(text);
-    parser.parse_run_command(signature)
+    // We remove leading spaces and semi-colons for convenience here instead of at the call sites
+    // since this function will be attempting to parse a RunCommand from a CLIF comment.
+    let trimmed_text = text.trim_start_matches(|c| c == ' ' || c == ';');
+    let mut parser = Parser::new(trimmed_text);
+    match parser.token() {
+        Some(Token::Identifier("run")) | Some(Token::Identifier("print")) => {
+            parser.parse_run_command(signature).map(|c| Some(c))
+        }
+        Some(_) | None => Ok(None),
+    }
 }
 
 pub struct Parser<'a> {
@@ -355,6 +370,15 @@ impl<'a> Context<'a> {
     ) -> ParseResult<()> {
         self.map.def_constant(constant, loc)?;
         self.function.dfg.constants.set(constant, data);
+        Ok(())
+    }
+
+    // Configure the stack limit of the current function.
+    fn add_stack_limit(&mut self, limit: GlobalValue, loc: Location) -> ParseResult<()> {
+        if self.function.stack_limit.is_some() {
+            return err!(loc, "stack limit defined twice");
+        }
+        self.function.stack_limit = Some(limit);
         Ok(())
     }
 
@@ -596,6 +620,15 @@ impl<'a> Parser<'a> {
             }
         }
         err!(self.loc, "expected constant number: const«n»")
+    }
+
+    // Match and consume a stack limit token
+    fn match_stack_limit(&mut self) -> ParseResult<()> {
+        if let Some(Token::Identifier("stack_limit")) = self.token() {
+            self.consume();
+            return Ok(());
+        }
+        err!(self.loc, "expected identifier: stack_limit")
     }
 
     // Match and consume a block reference.
@@ -1146,7 +1179,8 @@ impl<'a> Parser<'a> {
                         self.consume_line().trim().split_whitespace(),
                         &mut flag_builder,
                         self.loc,
-                    )?;
+                    )
+                    .map_err(|err| ParseError::from(err))?;
                 }
                 "target" => {
                     let loc = self.loc;
@@ -1455,6 +1489,7 @@ impl<'a> Parser<'a> {
     //                   * function-decl
     //                   * signature-decl
     //                   * jump-table-decl
+    //                   * stack-limit-decl
     //
     // The parsed decls are added to `ctx` rather than returned.
     fn parse_preamble(&mut self, ctx: &mut Context) -> ParseResult<()> {
@@ -1502,6 +1537,11 @@ impl<'a> Parser<'a> {
                     self.start_gathering_comments();
                     self.parse_constant_decl()
                         .and_then(|(c, v)| ctx.add_constant(c, v, self.loc))
+                }
+                Some(Token::Identifier("stack_limit")) => {
+                    self.start_gathering_comments();
+                    self.parse_stack_limit_decl()
+                        .and_then(|gv| ctx.add_stack_limit(gv, self.loc))
                 }
                 // More to come..
                 _ => return Ok(()),
@@ -1907,6 +1947,28 @@ impl<'a> Parser<'a> {
         Ok((name, data))
     }
 
+    // Parse a stack limit decl
+    //
+    // stack-limit-decl ::= * StackLimit "=" GlobalValue(gv)
+    fn parse_stack_limit_decl(&mut self) -> ParseResult<GlobalValue> {
+        self.match_stack_limit()?;
+        self.match_token(Token::Equal, "expected '=' in stack limit decl")?;
+        let limit = match self.token() {
+            Some(Token::GlobalValue(base_num)) => match GlobalValue::with_number(base_num) {
+                Some(gv) => gv,
+                None => return err!(self.loc, "invalid global value number for stack limit"),
+            },
+            _ => return err!(self.loc, "expected global value"),
+        };
+        self.consume();
+
+        // Collect any trailing comments.
+        self.token();
+        self.claim_gathered_comments(AnyEntity::StackLimit);
+
+        Ok(limit)
+    }
+
     // Parse a function body, add contents to `ctx`.
     //
     // function-body ::= * { extended-basic-block }
@@ -2162,9 +2224,9 @@ impl<'a> Parser<'a> {
     //
     // inst-results ::= Value(v) { "," Value(v) }
     //
-    fn parse_inst_results(&mut self) -> ParseResult<Vec<Value>> {
+    fn parse_inst_results(&mut self) -> ParseResult<SmallVec<[Value; 1]>> {
         // Result value numbers.
-        let mut results = Vec::new();
+        let mut results = SmallVec::new();
 
         // instruction  ::=  * [inst-results "="] Opcode(opc) ["." Type] ...
         // inst-results ::= * Value(v) { "," Value(v) }

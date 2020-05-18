@@ -6,11 +6,11 @@ use crate::entity::SecondaryMap;
 use crate::inst_predicates::has_side_effect;
 use crate::ir::instructions::BranchInfo;
 use crate::ir::{
-    Block, ExternalName, Function, GlobalValueData, Inst, InstructionData, MemFlags, Opcode,
-    Signature, SourceLoc, Type, Value, ValueDef,
+    ArgumentExtension, Block, ExternalName, Function, GlobalValueData, Inst, InstructionData,
+    MemFlags, Opcode, Signature, SourceLoc, Type, Value, ValueDef,
 };
 use crate::machinst::{ABIBody, BlockIndex, VCode, VCodeBuilder, VCodeInst};
-use crate::num_uses::NumUses;
+use crate::{num_uses::NumUses, CodegenResult};
 
 use regalloc::{Reg, RegClass, Set, VirtualReg, Writable};
 
@@ -67,12 +67,15 @@ pub trait LowerCtx {
     fn bb_param(&self, bb: Block, idx: usize) -> Reg;
     /// Get the register for a return value.
     fn retval(&self, idx: usize) -> Writable<Reg>;
-    /// Get the target for a call instruction, as an `ExternalName`.
-    fn call_target<'b>(&'b self, ir_inst: Inst) -> Option<&'b ExternalName>;
+    /// Get the target for a call instruction, as an `ExternalName`. Returns a tuple
+    /// providing this name and the "relocation distance", i.e., whether the backend
+    /// can assume the target will be "nearby" (within some small offset) or an
+    /// arbitrary address. (This comes from the `colocated` bit in the CLIF.)
+    fn call_target<'b>(&'b self, ir_inst: Inst) -> Option<(&'b ExternalName, RelocDistance)>;
     /// Get the signature for a call or call-indirect instruction.
     fn call_sig<'b>(&'b self, ir_inst: Inst) -> Option<&'b Signature>;
-    /// Get the symbol name and offset for a symbol_value instruction.
-    fn symbol_value<'b>(&'b self, ir_inst: Inst) -> Option<(&'b ExternalName, i64)>;
+    /// Get the symbol name, relocation distance estimate, and offset for a symbol_value instruction.
+    fn symbol_value<'b>(&'b self, ir_inst: Inst) -> Option<(&'b ExternalName, RelocDistance, i64)>;
     /// Returns the memory flags of a given memory access.
     fn memflags(&self, ir_inst: Inst) -> Option<MemFlags>;
     /// Get the source location for a given instruction.
@@ -102,9 +105,9 @@ pub trait LowerBackend {
 
 /// Machine-independent lowering driver / machine-instruction container. Maintains a correspondence
 /// from original Inst to MachInsts.
-pub struct Lower<'a, I: VCodeInst> {
+pub struct Lower<'func, I: VCodeInst> {
     /// The function to lower.
-    f: &'a Function,
+    f: &'func Function,
 
     /// Lowered machine instructions.
     vcode: VCodeBuilder<I>,
@@ -116,10 +119,22 @@ pub struct Lower<'a, I: VCodeInst> {
     value_regs: SecondaryMap<Value, Reg>,
 
     /// Return-value vregs.
-    retval_regs: Vec<Reg>,
+    retval_regs: Vec<(Reg, ArgumentExtension)>,
 
     /// Next virtual register number to allocate.
     next_vreg: u32,
+}
+
+/// Notion of "relocation distance". This gives an estimate of how far away a symbol will be from a
+/// reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocDistance {
+    /// Target of relocation is "nearby". The threshold for this is fuzzy but should be interpreted
+    /// as approximately "within the compiled output of one module"; e.g., within AArch64's +/-
+    /// 128MB offset. If unsure, use `Far` instead.
+    Near,
+    /// Target of relocation could be anywhere in the address space.
+    Far,
 }
 
 fn alloc_vreg(
@@ -142,9 +157,9 @@ enum GenerateReturn {
     No,
 }
 
-impl<'a, I: VCodeInst> Lower<'a, I> {
+impl<'func, I: VCodeInst> Lower<'func, I> {
     /// Prepare a new lowering context for the given IR function.
-    pub fn new(f: &'a Function, abi: Box<dyn ABIBody<I = I>>) -> Lower<'a, I> {
+    pub fn new(f: &'func Function, abi: Box<dyn ABIBody<I = I>>) -> CodegenResult<Lower<'func, I>> {
         let mut vcode = VCodeBuilder::new(abi);
 
         let num_uses = NumUses::compute(f).take_uses();
@@ -164,7 +179,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
             for param in f.dfg.block_params(bb) {
                 let vreg = alloc_vreg(
                     &mut value_regs,
-                    I::rc_for_type(f.dfg.value_type(*param)),
+                    I::rc_for_type(f.dfg.value_type(*param))?,
                     *param,
                     &mut next_vreg,
                 );
@@ -174,7 +189,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
                 for result in f.dfg.inst_results(inst) {
                     let vreg = alloc_vreg(
                         &mut value_regs,
-                        I::rc_for_type(f.dfg.value_type(*result)),
+                        I::rc_for_type(f.dfg.value_type(*result))?,
                         *result,
                         &mut next_vreg,
                     );
@@ -188,20 +203,20 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
         for ret in &f.signature.returns {
             let v = next_vreg;
             next_vreg += 1;
-            let regclass = I::rc_for_type(ret.value_type);
+            let regclass = I::rc_for_type(ret.value_type)?;
             let vreg = Reg::new_virtual(regclass, v);
-            retval_regs.push(vreg);
+            retval_regs.push((vreg, ret.extension));
             vcode.set_vreg_type(vreg.as_virtual_reg().unwrap(), ret.value_type);
         }
 
-        Lower {
+        Ok(Lower {
             f,
             vcode,
             num_uses,
             value_regs,
             retval_regs,
             next_vreg,
-        }
+        })
     }
 
     fn gen_arg_setup(&mut self) {
@@ -220,9 +235,12 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
     }
 
     fn gen_retval_setup(&mut self, gen_ret_inst: GenerateReturn) {
-        for (i, reg) in self.retval_regs.iter().enumerate() {
-            let insn = self.vcode.abi().gen_copy_reg_to_retval(i, *reg);
-            self.vcode.push(insn);
+        for (i, (reg, ext)) in self.retval_regs.iter().enumerate() {
+            let reg = Writable::from_reg(*reg);
+            let insns = self.vcode.abi().gen_copy_reg_to_retval(i, reg, *ext);
+            for insn in insns {
+                self.vcode.push(insn);
+            }
         }
         let inst = match gen_ret_inst {
             GenerateReturn::Yes => self.vcode.abi().gen_ret(),
@@ -242,7 +260,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
                 let b = queue.pop_front().unwrap();
                 ret.push(b);
                 let mut succs: SmallVec<[Block; 16]> = SmallVec::new();
-                for inst in self.f.layout.block_insts(b) {
+                for inst in self.f.layout.block_likely_branches(b) {
                     if self.f.dfg[inst].opcode().is_branch() {
                         visit_branch_targets(self.f, b, inst, |succ| {
                             succs.push(succ);
@@ -264,7 +282,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
     }
 
     /// Lower the function.
-    pub fn lower<B: LowerBackend<MInst = I>>(mut self, backend: &B) -> VCode<I> {
+    pub fn lower<B: LowerBackend<MInst = I>>(mut self, backend: &B) -> CodegenResult<VCode<I>> {
         // Find all reachable blocks.
         let bbs = self.find_reachable_bbs();
 
@@ -274,9 +292,18 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
         // Allocate a separate BlockIndex for each control-flow instruction so that we can create
         // the edge blocks later. Each entry for a control-flow inst is the edge block; the list
         // has (control flow inst, edge block, orig block) tuples.
-        let mut edge_blocks_by_inst: SecondaryMap<Inst, Vec<BlockIndex>> =
-            SecondaryMap::with_default(vec![]);
-        let mut edge_blocks: Vec<(Inst, BlockIndex, Block)> = vec![];
+        //
+        // In general, a given inst may have only one target, except for jump tables which have
+        // more. But SmallVec may store inline more than the spec'd number, so ask for slightly
+        // more.
+        let mut edge_blocks_by_inst: SecondaryMap<Inst, SmallVec<[BlockIndex; 2]>> =
+            SecondaryMap::with_default(SmallVec::new());
+
+        // Each basic block may at most have two edge blocks, since it may have a most two branch
+        // instructions. If we omit jump tables, we can model that 50% of branches are direct jumps
+        // (1 successor), and 50% are tests (2 successors). A distribution of edge_blocks per block
+        // matches this rough estimate that there are 1.5 edge block per block.
+        let mut edge_blocks: Vec<(Inst, BlockIndex, Block)> = Vec::with_capacity(bbs.len() * 3 / 2);
 
         debug!("about to lower function: {:?}", self.f);
         debug!("bb map: {:?}", self.vcode.blocks_by_bb());
@@ -284,9 +311,8 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
         // Work backward (reverse block order, reverse through each block), skipping insns with zero
         // uses.
         for bb in bbs.iter().rev() {
-            for inst in self.f.layout.block_insts(*bb) {
-                let op = self.f.dfg[inst].opcode();
-                if op.is_branch() {
+            for inst in self.f.layout.block_likely_branches(*bb) {
+                if self.f.dfg[inst].opcode().is_branch() {
                     // Find the original target.
                     let mut add_succ = |next_bb| {
                         let edge_block = next_bindex;
@@ -301,6 +327,10 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
             }
         }
 
+        // Temporary vectors whose memory is reused in the loop below.
+        let mut branches: SmallVec<[Inst; 2]> = SmallVec::new();
+        let mut targets: SmallVec<[BlockIndex; 2]> = SmallVec::new();
+
         for bb in bbs.iter() {
             debug!("lowering bb: {}", bb);
 
@@ -314,6 +344,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
                     GenerateReturn::Yes
                 } else {
                     debug_assert!(last_insn_opcode == Opcode::FallthroughReturn);
+                    self.vcode.set_fallthrough_return_block(*bb);
                     GenerateReturn::No
                 };
                 self.gen_retval_setup(gen_ret);
@@ -321,9 +352,6 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
             }
 
             // Find the branches at the end first, and process those, if any.
-            let mut branches: SmallVec<[Inst; 2]> = SmallVec::new();
-            let mut targets: SmallVec<[BlockIndex; 2]> = SmallVec::new();
-
             for inst in self.f.layout.block_insts(*bb).rev() {
                 debug!("lower: inst {}", inst);
                 if edge_blocks_by_inst[inst].len() > 0 {
@@ -342,6 +370,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
                             "lower_branch_group: targets = {:?} branches = {:?}",
                             targets, branches
                         );
+                        self.vcode.set_srcloc(self.srcloc(branches[0]));
                         backend.lower_branch_group(
                             &mut self,
                             &branches[..],
@@ -353,16 +382,14 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
                         targets.clear();
                     }
 
-                    // Only codegen an instruction if it either has a side
-                    // effect, or has at least one use of one of its results.
-                    let num_uses = self.num_uses[inst];
-                    let side_effect = has_side_effect(self.f, inst);
-                    if side_effect || num_uses > 0 {
+                    // Only codegen an instruction if it either has a side effect, or has at least
+                    // one use of one of its results.
+                    if self.num_uses[inst] > 0 || has_side_effect(self.f, inst) {
+                        self.vcode.set_srcloc(self.srcloc(inst));
                         backend.lower(&mut self, inst);
                         self.vcode.end_ir_inst();
                     } else {
-                        // If we're skipping the instruction, we need to dec-ref
-                        // its arguments.
+                        // If we're skipping the instruction, we need to dec-ref its arguments.
                         for arg in self.f.dfg.inst_args(inst) {
                             let val = self.f.dfg.resolve_aliases(*arg);
                             match self.f.dfg.value_def(val) {
@@ -386,6 +413,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
                     "lower_branch_group: targets = {:?} branches = {:?}",
                     targets, branches
                 );
+                self.vcode.set_srcloc(self.srcloc(branches[0]));
                 backend.lower_branch_group(&mut self, &branches[..], &targets[..], fallthrough);
                 self.vcode.end_ir_inst();
                 branches.clear();
@@ -407,6 +435,11 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
             }
         }
 
+        // Temporary vectors whose memory is reused in the loop below.
+        // TODO accomodate changes in regalloc.rs to use small vecs here?
+        let mut src_regs = Vec::new();
+        let mut dst_regs = Vec::new();
+
         // Now create the edge blocks, with phi lowering (block parameter copies).
         for (inst, edge_block, orig_block) in edge_blocks.into_iter() {
             debug!(
@@ -415,22 +448,18 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
             );
 
             // Create a temporary for each block parameter.
-            let phi_classes: Vec<(Type, RegClass)> = self
+            let phi_classes: Vec<Type> = self
                 .f
                 .dfg
                 .block_params(orig_block)
                 .iter()
                 .map(|p| self.f.dfg.value_type(*p))
-                .map(|ty| (ty, I::rc_for_type(ty)))
                 .collect();
 
-            // FIXME sewardj 2020Feb29: use SmallVec
-            let mut src_regs = vec![];
-            let mut dst_regs = vec![];
-
             // Create all of the phi uses (reads) from jump args to temps.
-
             // Round up all the source and destination regs
+            src_regs.clear();
+            dst_regs.clear();
             for (i, arg) in self.f.dfg.inst_variable_args(inst).iter().enumerate() {
                 let arg = self.f.dfg.resolve_aliases(*arg);
                 debug!("jump arg {} is {}", i, arg);
@@ -449,28 +478,27 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
             if !Set::<Reg>::from_vec(src_regs.clone()).intersects(&Set::<Reg>::from_vec(
                 dst_regs.iter().map(|r| r.to_reg()).collect(),
             )) {
-                for (dst_reg, (src_reg, (ty, _))) in
+                for (dst_reg, (src_reg, ty)) in
                     dst_regs.iter().zip(src_regs.iter().zip(phi_classes))
                 {
                     self.vcode.push(I::gen_move(*dst_reg, *src_reg, ty));
                 }
             } else {
                 // There's some overlap, so play safe and copy via temps.
-
-                let tmp_regs: Vec<Writable<Reg>> = phi_classes
-                    .iter()
-                    .map(|&(ty, rc)| self.tmp(rc, ty)) // borrows `self` mutably.
-                    .collect();
+                let mut tmp_regs = Vec::with_capacity(phi_classes.len());
+                for &ty in &phi_classes {
+                    tmp_regs.push(self.tmp(I::rc_for_type(ty)?, ty));
+                }
 
                 debug!("phi_temps = {:?}", tmp_regs);
                 debug_assert!(tmp_regs.len() == src_regs.len());
 
-                for (tmp_reg, (src_reg, &(ty, _))) in
+                for (tmp_reg, (src_reg, &ty)) in
                     tmp_regs.iter().zip(src_regs.iter().zip(phi_classes.iter()))
                 {
                     self.vcode.push(I::gen_move(*tmp_reg, *src_reg, ty));
                 }
-                for (dst_reg, (tmp_reg, &(ty, _))) in
+                for (dst_reg, (tmp_reg, &ty)) in
                     dst_regs.iter().zip(tmp_regs.iter().zip(phi_classes.iter()))
                 {
                     self.vcode.push(I::gen_move(*dst_reg, tmp_reg.to_reg(), ty));
@@ -489,7 +517,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
         }
 
         // Now that we've emitted all instructions into the VCodeBuilder, let's build the VCode.
-        self.vcode.build()
+        Ok(self.vcode.build())
     }
 
     /// Reduce the use-count of an IR instruction. Use this when, e.g., isel incorporates the
@@ -516,7 +544,7 @@ impl<'a, I: VCodeInst> Lower<'a, I> {
     }
 }
 
-impl<'a, I: VCodeInst> LowerCtx for Lower<'a, I> {
+impl<'func, I: VCodeInst> LowerCtx for Lower<'func, I> {
     type I = I;
 
     /// Get the instdata for a given IR instruction.
@@ -640,16 +668,20 @@ impl<'a, I: VCodeInst> LowerCtx for Lower<'a, I> {
 
     /// Get the register for a return value.
     fn retval(&self, idx: usize) -> Writable<Reg> {
-        Writable::from_reg(self.retval_regs[idx])
+        Writable::from_reg(self.retval_regs[idx].0)
     }
 
-    /// Get the target for a call instruction, as an `ExternalName`.
-    fn call_target<'b>(&'b self, ir_inst: Inst) -> Option<&'b ExternalName> {
+    /// Get the target for a call instruction, as an `ExternalName`. Returns a tuple
+    /// providing this name and the "relocation distance", i.e., whether the backend
+    /// can assume the target will be "nearby" (within some small offset) or an
+    /// arbitrary address. (This comes from the `colocated` bit in the CLIF.)
+    fn call_target<'b>(&'b self, ir_inst: Inst) -> Option<(&'b ExternalName, RelocDistance)> {
         match &self.f.dfg[ir_inst] {
             &InstructionData::Call { func_ref, .. }
             | &InstructionData::FuncAddr { func_ref, .. } => {
                 let funcdata = &self.f.dfg.ext_funcs[func_ref];
-                Some(&funcdata.name)
+                let dist = funcdata.reloc_distance();
+                Some((&funcdata.name, dist))
             }
             _ => None,
         }
@@ -666,8 +698,8 @@ impl<'a, I: VCodeInst> LowerCtx for Lower<'a, I> {
         }
     }
 
-    /// Get the symbol name and offset for a symbol_value instruction.
-    fn symbol_value<'b>(&'b self, ir_inst: Inst) -> Option<(&'b ExternalName, i64)> {
+    /// Get the symbol name, relocation distance estimate, and offset for a symbol_value instruction.
+    fn symbol_value<'b>(&'b self, ir_inst: Inst) -> Option<(&'b ExternalName, RelocDistance, i64)> {
         match &self.f.dfg[ir_inst] {
             &InstructionData::UnaryGlobalValue { global_value, .. } => {
                 let gvdata = &self.f.global_values[global_value];
@@ -678,7 +710,8 @@ impl<'a, I: VCodeInst> LowerCtx for Lower<'a, I> {
                         ..
                     } => {
                         let offset = offset.bits();
-                        Some((name, offset))
+                        let dist = gvdata.maybe_reloc_distance().unwrap();
+                        Some((name, dist, offset))
                     }
                     _ => None,
                 }

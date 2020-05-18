@@ -2,6 +2,7 @@
 
 use crate::isa::aarch64::inst::InstSize;
 use crate::machinst::*;
+use crate::settings;
 
 use regalloc::{RealRegUniverse, Reg, RegClass, RegClassInfo, Writable, NUM_REG_CLASSES};
 
@@ -10,23 +11,30 @@ use std::string::{String, ToString};
 //=============================================================================
 // Registers, the Universe thereof, and printing
 
+/// The pinned register on this architecture.
+/// It must be the same as Spidermonkey's HeapReg, as found in this file.
+/// https://searchfox.org/mozilla-central/source/js/src/jit/arm64/Assembler-arm64.h#103
+pub const PINNED_REG: u8 = 21;
+
 #[rustfmt::skip]
 const XREG_INDICES: [u8; 31] = [
     // X0 - X7
     32, 33, 34, 35, 36, 37, 38, 39,
-    // X8 - X14
-    40, 41, 42, 43, 44, 45, 46,
-    // X15
-    59,
+    // X8 - X15
+    40, 41, 42, 43, 44, 45, 46, 47,
     // X16, X17
-    47, 48,
+    58, 59,
     // X18
     60,
-    // X19 - X28
-    49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    // X29
+    // X19, X20
+    48, 49,
+    // X21, put aside because it's the pinned register.
+    57,
+    // X22 - X28
+    50, 51, 52, 53, 54, 55, 56,
+    // X29 (FP)
     61,
-    // X30
+    // X30 (LR)
     62,
 ];
 
@@ -115,14 +123,17 @@ pub fn writable_fp_reg() -> Writable<Reg> {
     Writable::from_reg(fp_reg())
 }
 
-/// Get a reference to the "spill temp" register. This register is used to
-/// compute the address of a spill slot when a direct offset addressing mode from
-/// FP is not sufficient (+/- 2^11 words). We exclude this register from regalloc
-/// and reserve it for this purpose for simplicity; otherwise we need a
-/// multi-stage analysis where we first determine how many spill slots we have,
-/// then perhaps remove the reg from the pool and recompute regalloc.
+/// Get a reference to the first temporary, sometimes "spill temporary", register. This register is
+/// used to compute the address of a spill slot when a direct offset addressing mode from FP is not
+/// sufficient (+/- 2^11 words). We exclude this register from regalloc and reserve it for this
+/// purpose for simplicity; otherwise we need a multi-stage analysis where we first determine how
+/// many spill slots we have, then perhaps remove the reg from the pool and recompute regalloc.
+///
+/// We use x16 for this (aka IP0 in the AArch64 ABI) because it's a scratch register but is
+/// slightly special (used for linker veneers). We're free to use it as long as we don't expect it
+/// to live through call instructions.
 pub fn spilltmp_reg() -> Reg {
-    xreg(15)
+    xreg(16)
 }
 
 /// Get a writable reference to the spilltmp reg.
@@ -130,15 +141,28 @@ pub fn writable_spilltmp_reg() -> Writable<Reg> {
     Writable::from_reg(spilltmp_reg())
 }
 
+/// Get a reference to the second temp register. We need this in some edge cases
+/// where we need both the spilltmp and another temporary.
+///
+/// We use x17 (aka IP1), the other "interprocedural"/linker-veneer scratch reg that is
+/// free to use otherwise.
+pub fn tmp2_reg() -> Reg {
+    xreg(17)
+}
+
+/// Get a writable reference to the tmp2 reg.
+pub fn writable_tmp2_reg() -> Writable<Reg> {
+    Writable::from_reg(tmp2_reg())
+}
+
 /// Create the register universe for AArch64.
-pub fn create_reg_universe() -> RealRegUniverse {
+pub fn create_reg_universe(flags: &settings::Flags) -> RealRegUniverse {
     let mut regs = vec![];
     let mut allocable_by_class = [None; NUM_REG_CLASSES];
 
-    // Numbering Scheme: we put V-regs first, then X-regs. The X-regs
-    // exclude several registers: x18 (globally reserved for platform-specific
-    // purposes), x29 (frame pointer), x30 (link register), x31 (stack pointer
-    // or zero register, depending on context).
+    // Numbering Scheme: we put V-regs first, then X-regs. The X-regs exclude several registers:
+    // x18 (globally reserved for platform-specific purposes), x29 (frame pointer), x30 (link
+    // register), x31 (stack pointer or zero register, depending on context).
 
     let v_reg_base = 0u8; // in contiguous real-register index space
     let v_reg_count = 32;
@@ -159,9 +183,12 @@ pub fn create_reg_universe() -> RealRegUniverse {
 
     let x_reg_base = 32u8; // in contiguous real-register index space
     let mut x_reg_count = 0;
+
+    let uses_pinned_reg = flags.enable_pinned_reg();
+
     for i in 0u8..32u8 {
         // See above for excluded registers.
-        if i == 15 || i == 18 || i == 29 || i == 30 || i == 31 {
+        if i == 16 || i == 17 || i == 18 || i == 29 || i == 30 || i == 31 || i == PINNED_REG {
             continue;
         }
         let reg = Reg::new_real(
@@ -179,7 +206,7 @@ pub fn create_reg_universe() -> RealRegUniverse {
     allocable_by_class[RegClass::I64.rc_to_usize()] = Some(RegClassInfo {
         first: x_reg_base as usize,
         last: x_reg_last as usize,
-        suggested_scratch: Some(XREG_INDICES[13] as usize),
+        suggested_scratch: Some(XREG_INDICES[19] as usize),
     });
     allocable_by_class[RegClass::V128.rc_to_usize()] = Some(RegClassInfo {
         first: v_reg_base as usize,
@@ -188,13 +215,25 @@ pub fn create_reg_universe() -> RealRegUniverse {
     });
 
     // Other regs, not available to the allocator.
-    let allocable = regs.len();
-    regs.push((xreg(15).to_real_reg(), "x15".to_string()));
+    let allocable = if uses_pinned_reg {
+        // The pinned register is not allocatable in this case, so record the length before adding
+        // it.
+        let len = regs.len();
+        regs.push((xreg(PINNED_REG).to_real_reg(), "x21/pinned_reg".to_string()));
+        len
+    } else {
+        regs.push((xreg(PINNED_REG).to_real_reg(), "x21".to_string()));
+        regs.len()
+    };
+
+    regs.push((xreg(16).to_real_reg(), "x16".to_string()));
+    regs.push((xreg(17).to_real_reg(), "x17".to_string()));
     regs.push((xreg(18).to_real_reg(), "x18".to_string()));
     regs.push((fp_reg().to_real_reg(), "fp".to_string()));
     regs.push((link_reg().to_real_reg(), "lr".to_string()));
     regs.push((zero_reg().to_real_reg(), "xzr".to_string()));
     regs.push((stack_reg().to_real_reg(), "sp".to_string()));
+
     // FIXME JRS 2020Feb06: unfortunately this pushes the number of real regs
     // to 65, which is potentially inconvenient from a compiler performance
     // standpoint.  We could possibly drop back to 64 by "losing" a vector

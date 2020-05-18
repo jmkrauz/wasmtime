@@ -24,7 +24,27 @@ fn segfault() -> ! {
     }
 }
 
+fn overrun_the_stack() -> usize {
+    let mut a = [0u8; 1024];
+    if a.as_mut_ptr() as usize == 1 {
+        return 1;
+    } else {
+        return a.as_mut_ptr() as usize + overrun_the_stack();
+    }
+}
+
 fn main() {
+    // Skip this tests if it looks like we're in a cross-compiled situation and
+    // we're emulating this test for a different platform. In that scenario
+    // emulators (like QEMU) tend to not report signals the same way and such.
+    if std::env::vars()
+        .filter(|(k, _v)| k.starts_with("CARGO_TARGET") && k.ends_with("RUNNER"))
+        .count()
+        > 0
+    {
+        return;
+    }
+
     let tests: &[(&str, fn())] = &[
         ("normal segfault", || segfault()),
         ("make instance then segfault", || {
@@ -32,6 +52,18 @@ fn main() {
             let module = Module::new(&store, "(module)").unwrap();
             let _instance = Instance::new(&module, &[]).unwrap();
             segfault();
+        }),
+        ("make instance then overrun the stack", || {
+            let store = Store::default();
+            let module = Module::new(&store, "(module)").unwrap();
+            let _instance = Instance::new(&module, &[]).unwrap();
+            println!("stack overrun: {}", overrun_the_stack());
+        }),
+        ("segfault in a host function", || {
+            let store = Store::default();
+            let module = Module::new(&store, r#"(import "" "" (func)) (start 0)"#).unwrap();
+            let segfault = Func::wrap(&store, || segfault());
+            Instance::new(&module, &[segfault.into()]).unwrap();
         }),
     ];
     match env::var(VAR_NAME) {
@@ -75,6 +107,12 @@ fn runtest(name: &str) {
             "failed to find confirmation in test `{}`\n{}",
             name,
             desc
+        );
+    } else if name.contains("overrun the stack") {
+        assert!(
+            stderr.contains("thread 'main' has overflowed its stack"),
+            "bad stderr: {}",
+            stderr
         );
     } else {
         panic!("\n\nexpected a segfault on `{}`\n{}\n\n", name, desc);

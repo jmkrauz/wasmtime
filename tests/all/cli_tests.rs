@@ -6,11 +6,29 @@ use tempfile::NamedTempFile;
 
 // Run the wasmtime CLI with the provided args and return the `Output`.
 fn run_wasmtime_for_output(args: &[&str]) -> Result<Output> {
+    let runner = std::env::vars()
+        .filter(|(k, _v)| k.starts_with("CARGO_TARGET") && k.ends_with("RUNNER"))
+        .next();
     let mut me = std::env::current_exe()?;
     me.pop(); // chop off the file name
     me.pop(); // chop off `deps`
     me.push("wasmtime");
-    Command::new(&me).args(args).output().map_err(Into::into)
+
+    // If we're running tests with a "runner" then we might be doing something
+    // like cross-emulation, so spin up the emulator rather than the tests
+    // itself, which may not be natively executable.
+    let mut cmd = if let Some((_, runner)) = runner {
+        let mut parts = runner.split_whitespace();
+        let mut cmd = Command::new(parts.next().unwrap());
+        for arg in parts {
+            cmd.arg(arg);
+        }
+        cmd.arg(&me);
+        cmd
+    } else {
+        Command::new(&me)
+    };
+    cmd.args(args).output().map_err(Into::into)
 }
 
 // Run the wasmtime CLI with the provided args and, if it succeeds, return
@@ -120,5 +138,47 @@ fn hello_wasi_snapshot1() -> Result<()> {
     let wasm = build_wasm("tests/wasm/hello_wasi_snapshot1.wat")?;
     let stdout = run_wasmtime(&[wasm.path().to_str().unwrap(), "--disable-cache"])?;
     assert_eq!(stdout, "Hello, world!\n");
+    Ok(())
+}
+
+#[test]
+fn timeout_in_start() -> Result<()> {
+    let wasm = build_wasm("tests/wasm/iloop-start.wat")?;
+    let output = run_wasmtime_for_output(&[
+        "run",
+        wasm.path().to_str().unwrap(),
+        "--wasm-timeout",
+        "1ms",
+        "--disable-cache",
+    ])?;
+    assert!(!output.status.success());
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("wasm trap: interrupt"),
+        "bad stderr: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn timeout_in_invoke() -> Result<()> {
+    let wasm = build_wasm("tests/wasm/iloop-invoke.wat")?;
+    let output = run_wasmtime_for_output(&[
+        "run",
+        wasm.path().to_str().unwrap(),
+        "--wasm-timeout",
+        "1ms",
+        "--disable-cache",
+    ])?;
+    assert!(!output.status.success());
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("wasm trap: interrupt"),
+        "bad stderr: {}",
+        stderr
+    );
     Ok(())
 }

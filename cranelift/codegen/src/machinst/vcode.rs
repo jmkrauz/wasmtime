@@ -17,16 +17,19 @@
 //! See the main module comment in `mod.rs` for more details on the VCode-based
 //! backend pipeline.
 
-use crate::ir;
+use crate::entity::SecondaryMap;
+use crate::ir::{self, Block, SourceLoc};
 use crate::machinst::*;
 use crate::settings;
 
 use regalloc::Function as RegallocFunction;
 use regalloc::Set as RegallocSet;
-use regalloc::{BlockIx, InstIx, Range, RegAllocResult, RegClass, RegUsageCollector};
+use regalloc::{
+    BlockIx, InstIx, Range, RegAllocResult, RegClass, RegUsageCollector, RegUsageMapper,
+};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use log::debug;
 use smallvec::SmallVec;
 use std::fmt;
@@ -59,6 +62,10 @@ pub struct VCode<I: VCodeInst> {
     /// Lowered machine instructions in order corresponding to the original IR.
     insts: Vec<I>,
 
+    /// Source locations for each instruction. (`SourceLoc` is a `u32`, so it is
+    /// reasonable to keep one of these per instruction.)
+    srclocs: Vec<SourceLoc>,
+
     /// Entry block.
     entry: BlockIndex,
 
@@ -71,7 +78,7 @@ pub struct VCode<I: VCodeInst> {
     /// Block successor lists, concatenated into one Vec. The `block_succ_range`
     /// list of tuples above gives (start, end) ranges within this list that
     /// correspond to each basic block's successors.
-    block_succs: Vec<BlockIndex>,
+    block_succs: Vec<BlockIx>,
 
     /// Block indices by IR block.
     block_by_bb: SecondaryMap<ir::Block, BlockIndex>,
@@ -93,6 +100,9 @@ pub struct VCode<I: VCodeInst> {
 
     /// ABI object.
     abi: Box<dyn ABIBody<I = I>>,
+
+    /// The block targeted by fallthrough_returns, if there's one.
+    pub fallthrough_return_block: Option<BlockIndex>,
 }
 
 /// A builder for a VCode function body. This builder is designed for the
@@ -115,13 +125,16 @@ pub struct VCodeBuilder<I: VCodeInst> {
 
     /// Current basic block instructions, in reverse order (because blocks are
     /// built bottom-to-top).
-    bb_insns: SmallVec<[I; 32]>,
+    bb_insns: SmallVec<[(I, SourceLoc); 32]>,
 
     /// Current IR-inst instructions, in forward order.
-    ir_inst_insns: SmallVec<[I; 4]>,
+    ir_inst_insns: SmallVec<[(I, SourceLoc); 4]>,
 
     /// Start of succs for the current block in the concatenated succs list.
     succ_start: usize,
+
+    /// Current source location.
+    cur_srcloc: SourceLoc,
 }
 
 impl<I: VCodeInst> VCodeBuilder<I> {
@@ -133,12 +146,23 @@ impl<I: VCodeInst> VCodeBuilder<I> {
             bb_insns: SmallVec::new(),
             ir_inst_insns: SmallVec::new(),
             succ_start: 0,
+            cur_srcloc: SourceLoc::default(),
         }
     }
 
     /// Access the ABI object.
     pub fn abi(&mut self) -> &mut dyn ABIBody<I = I> {
         &mut *self.vcode.abi
+    }
+
+    /// Set the fallthrough_return target block for this function. There must be at most once per
+    /// function.
+    pub fn set_fallthrough_return_block(&mut self, bb: Block) {
+        debug_assert!(
+            self.vcode.fallthrough_return_block.is_none(),
+            "a function must have at most one fallthrough-return instruction"
+        );
+        self.vcode.fallthrough_return_block = Some(self.bb_to_bindex(bb));
     }
 
     /// Set the type of a VReg.
@@ -179,8 +203,8 @@ impl<I: VCodeInst> VCodeBuilder<I> {
     /// End the current IR instruction. Must be called after pushing any
     /// instructions and prior to ending the basic block.
     pub fn end_ir_inst(&mut self) {
-        while let Some(i) = self.ir_inst_insns.pop() {
-            self.bb_insns.push(i);
+        while let Some(pair) = self.ir_inst_insns.pop() {
+            self.bb_insns.push(pair);
         }
     }
 
@@ -191,8 +215,9 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         let block_num = self.vcode.block_ranges.len() as BlockIndex;
         // Push the instructions.
         let start_idx = self.vcode.insts.len() as InsnIndex;
-        while let Some(i) = self.bb_insns.pop() {
+        while let Some((i, loc)) = self.bb_insns.pop() {
             self.vcode.insts.push(i);
+            self.vcode.srclocs.push(loc);
         }
         let end_idx = self.vcode.insts.len() as InsnIndex;
         // Add the instruction index range to the list of blocks.
@@ -212,19 +237,24 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         match insn.is_term() {
             MachTerminator::None | MachTerminator::Ret => {}
             MachTerminator::Uncond(target) => {
-                self.vcode.block_succs.push(target);
+                self.vcode.block_succs.push(BlockIx::new(target));
             }
             MachTerminator::Cond(true_branch, false_branch) => {
-                self.vcode.block_succs.push(true_branch);
-                self.vcode.block_succs.push(false_branch);
+                self.vcode.block_succs.push(BlockIx::new(true_branch));
+                self.vcode.block_succs.push(BlockIx::new(false_branch));
             }
             MachTerminator::Indirect(targets) => {
                 for target in targets {
-                    self.vcode.block_succs.push(*target);
+                    self.vcode.block_succs.push(BlockIx::new(*target));
                 }
             }
         }
-        self.ir_inst_insns.push(insn);
+        self.ir_inst_insns.push((insn, self.cur_srcloc));
+    }
+
+    /// Set the current source location.
+    pub fn set_srcloc(&mut self, srcloc: SourceLoc) {
+        self.cur_srcloc = srcloc;
     }
 
     /// Build the final VCode.
@@ -286,6 +316,7 @@ impl<I: VCodeInst> VCode<I> {
             liveouts: abi.liveouts(),
             vreg_types: vec![],
             insts: vec![],
+            srclocs: vec![],
             entry: 0,
             block_ranges: vec![],
             block_succ_range: vec![],
@@ -296,7 +327,13 @@ impl<I: VCodeInst> VCode<I> {
             final_block_offsets: vec![],
             code_size: 0,
             abi,
+            fallthrough_return_block: None,
         }
+    }
+
+    /// Returns the flags controlling this function's compilation.
+    pub fn flags(&self) -> &settings::Flags {
+        self.abi.flags()
     }
 
     /// Get the IR-level type of a VReg.
@@ -321,7 +358,7 @@ impl<I: VCodeInst> VCode<I> {
     }
 
     /// Get the successors for a block.
-    pub fn succs(&self, block: BlockIndex) -> &[BlockIndex] {
+    pub fn succs(&self, block: BlockIndex) -> &[BlockIx] {
         let (start, end) = self.block_succ_range[block as usize];
         &self.block_succs[start..end]
     }
@@ -329,11 +366,7 @@ impl<I: VCodeInst> VCode<I> {
     /// Take the results of register allocation, with a sequence of
     /// instructions including spliced fill/reload/move instructions, and replace
     /// the VCode with them.
-    pub fn replace_insns_from_regalloc(
-        &mut self,
-        result: RegAllocResult<Self>,
-        flags: &settings::Flags,
-    ) {
+    pub fn replace_insns_from_regalloc(&mut self, result: RegAllocResult<Self>) {
         self.final_block_order = compute_final_block_order(self);
 
         // Record the spillslot count and clobbered registers for the ABI/stack
@@ -348,6 +381,7 @@ impl<I: VCodeInst> VCode<I> {
             block_ranges(result.target_map.elems(), result.insns.len());
         let mut final_insns = vec![];
         let mut final_block_ranges = vec![(0, 0); self.num_blocks()];
+        let mut final_srclocs = vec![];
 
         for block in &self.final_block_order {
             let (start, end) = block_ranges[*block as usize];
@@ -355,7 +389,10 @@ impl<I: VCodeInst> VCode<I> {
 
             if *block == self.entry {
                 // Start with the prologue.
-                final_insns.extend(self.abi.gen_prologue(flags).into_iter());
+                let prologue = self.abi.gen_prologue();
+                let len = prologue.len();
+                final_insns.extend(prologue.into_iter());
+                final_srclocs.extend(iter::repeat(SourceLoc::default()).take(len));
             }
 
             for i in start..end {
@@ -367,13 +404,27 @@ impl<I: VCodeInst> VCode<I> {
                     continue;
                 }
 
+                // Is there a srcloc associated with this insn? Look it up based on original
+                // instruction index (if new insn corresponds to some original insn, i.e., is not
+                // an inserted load/spill/move).
+                let orig_iix = result.orig_insn_map[InstIx::new(i as u32)];
+                let srcloc = if orig_iix.is_invalid() {
+                    SourceLoc::default()
+                } else {
+                    self.srclocs[orig_iix.get() as usize]
+                };
+
                 // Whenever encountering a return instruction, replace it
                 // with the epilogue.
                 let is_ret = insn.is_term() == MachTerminator::Ret;
                 if is_ret {
-                    final_insns.extend(self.abi.gen_epilogue(flags).into_iter());
+                    let epilogue = self.abi.gen_epilogue();
+                    let len = epilogue.len();
+                    final_insns.extend(epilogue.into_iter());
+                    final_srclocs.extend(iter::repeat(srcloc).take(len));
                 } else {
                     final_insns.push(insn.clone());
+                    final_srclocs.push(srcloc);
                 }
             }
 
@@ -381,7 +432,10 @@ impl<I: VCodeInst> VCode<I> {
             final_block_ranges[*block as usize] = (final_start, final_end);
         }
 
+        debug_assert!(final_insns.len() == final_srclocs.len());
+
         self.insts = final_insns;
+        self.srclocs = final_srclocs;
         self.block_ranges = final_block_ranges;
     }
 
@@ -435,8 +489,8 @@ impl<I: VCodeInst> VCode<I> {
 
         // Rewrite successor information based on the block-rewrite map.
         for succ in &mut self.block_succs {
-            let new_succ = block_rewrites[*succ as usize];
-            *succ = new_succ;
+            let new_succ = block_rewrites[succ.get() as usize];
+            *succ = BlockIx::new(new_succ);
         }
     }
 
@@ -467,15 +521,18 @@ impl<I: VCodeInst> VCode<I> {
             }
         }
 
+        let flags = self.abi.flags();
+
         // Compute block offsets.
         let mut code_section = MachSectionSize::new(0);
         let mut block_offsets = vec![0; self.num_blocks()];
+        let mut state = Default::default();
         for &block in &self.final_block_order {
             code_section.offset = I::align_basic_block(code_section.offset);
             block_offsets[block as usize] = code_section.offset;
             let (start, end) = self.block_ranges[block as usize];
             for iix in start..end {
-                self.insts[iix as usize].emit(&mut code_section);
+                self.insts[iix as usize].emit(&mut code_section, flags, &mut state);
             }
         }
 
@@ -488,13 +545,14 @@ impl<I: VCodeInst> VCode<I> {
         // it (so forward references are now possible), and (ii) mutates the
         // instructions.
         let mut code_section = MachSectionSize::new(0);
+        let mut state = Default::default();
         for &block in &self.final_block_order {
             code_section.offset = I::align_basic_block(code_section.offset);
             let (start, end) = self.block_ranges[block as usize];
             for iix in start..end {
                 self.insts[iix as usize]
                     .with_block_offsets(code_section.offset, &self.final_block_offsets[..]);
-                self.insts[iix as usize].emit(&mut code_section);
+                self.insts[iix as usize].emit(&mut code_section, flags, &mut state);
             }
         }
     }
@@ -507,19 +565,36 @@ impl<I: VCodeInst> VCode<I> {
         let mut sections = MachSections::new();
         let code_idx = sections.add_section(0, self.code_size);
         let code_section = sections.get_section(code_idx);
+        let mut state = Default::default();
 
+        let flags = self.abi.flags();
+        let mut cur_srcloc = None;
         for &block in &self.final_block_order {
             let new_offset = I::align_basic_block(code_section.cur_offset_from_start());
             while new_offset > code_section.cur_offset_from_start() {
                 // Pad with NOPs up to the aligned block offset.
                 let nop = I::gen_nop((new_offset - code_section.cur_offset_from_start()) as usize);
-                nop.emit(code_section);
+                nop.emit(code_section, flags, &mut Default::default());
             }
             assert_eq!(code_section.cur_offset_from_start(), new_offset);
 
             let (start, end) = self.block_ranges[block as usize];
             for iix in start..end {
-                self.insts[iix as usize].emit(code_section);
+                let srcloc = self.srclocs[iix as usize];
+                if cur_srcloc != Some(srcloc) {
+                    if cur_srcloc.is_some() {
+                        code_section.end_srcloc();
+                    }
+                    code_section.start_srcloc(srcloc);
+                    cur_srcloc = Some(srcloc);
+                }
+
+                self.insts[iix as usize].emit(code_section, flags, &mut state);
+            }
+
+            if cur_srcloc.is_some() {
+                code_section.end_srcloc();
+                cur_srcloc = None;
             }
         }
 
@@ -568,13 +643,9 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
         Range::new(InstIx::new(start), (end - start) as usize)
     }
 
-    fn block_succs(&self, block: BlockIx) -> Vec<BlockIx> {
+    fn block_succs(&self, block: BlockIx) -> Cow<[BlockIx]> {
         let (start, end) = self.block_succ_range[block.get() as usize];
-        self.block_succs[start..end]
-            .iter()
-            .cloned()
-            .map(BlockIx::new)
-            .collect()
+        Cow::Borrowed(&self.block_succs[start..end])
     }
 
     fn is_ret(&self, insn: InstIx) -> bool {
@@ -588,16 +659,16 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
         insn.get_regs(collector)
     }
 
-    fn map_regs(
-        insn: &mut I,
-        pre_map: &RegallocMap<VirtualReg, RealReg>,
-        post_map: &RegallocMap<VirtualReg, RealReg>,
-    ) {
-        insn.map_regs(pre_map, post_map);
+    fn map_regs(insn: &mut I, mapper: &RegUsageMapper) {
+        insn.map_regs(mapper);
     }
 
     fn is_move(&self, insn: &I) -> Option<(Writable<Reg>, Reg)> {
         insn.is_move()
+    }
+
+    fn get_vreg_count_estimate(&self) -> Option<usize> {
+        Some(self.vreg_types.len())
     }
 
     fn get_spillslot_size(&self, regclass: RegClass, vreg: VirtualReg) -> u32 {
@@ -646,7 +717,7 @@ impl<I: VCodeInst> fmt::Debug for VCode<I> {
         for block in 0..self.num_blocks() {
             writeln!(f, "Block {}:", block,)?;
             for succ in self.succs(block as BlockIndex) {
-                writeln!(f, "  (successor: Block {})", succ)?;
+                writeln!(f, "  (successor: Block {})", succ.get())?;
             }
             let (start, end) = self.block_ranges[block];
             writeln!(f, "  (instruction range: {} .. {})", start, end)?;
@@ -708,7 +779,7 @@ impl<I: VCodeInst + ShowWithRRU> ShowWithRRU for VCode<I> {
                 write!(&mut s, "  (original IR block: {})\n", bb).unwrap();
             }
             for succ in self.succs(block as BlockIndex) {
-                write!(&mut s, "  (successor: Block {})\n", succ).unwrap();
+                write!(&mut s, "  (successor: Block {})\n", succ.get()).unwrap();
             }
             let (start, end) = self.block_ranges[block];
             write!(&mut s, "  (instruction range: {} .. {})\n", start, end).unwrap();

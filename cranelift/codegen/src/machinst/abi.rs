@@ -1,6 +1,6 @@
 //! ABI definitions.
 
-use crate::ir::StackSlot;
+use crate::ir::{ArgumentExtension, StackSlot};
 use crate::machinst::*;
 use crate::settings;
 
@@ -11,6 +11,9 @@ use regalloc::{Reg, Set, SpillSlot, Writable};
 pub trait ABIBody {
     /// The instruction type for the ISA associated with this ABI.
     type I: VCodeInst;
+
+    /// Get the settings controlling this function's compilation.
+    fn flags(&self) -> &settings::Flags;
 
     /// Get the liveins of the function.
     fn liveins(&self) -> Set<RealReg>;
@@ -31,9 +34,13 @@ pub trait ABIBody {
     /// register.
     fn gen_copy_arg_to_reg(&self, idx: usize, into_reg: Writable<Reg>) -> Self::I;
 
-    /// Generate an instruction which copies a source register to a return
-    /// value slot.
-    fn gen_copy_reg_to_retval(&self, idx: usize, from_reg: Reg) -> Self::I;
+    /// Generate an instruction which copies a source register to a return value slot.
+    fn gen_copy_reg_to_retval(
+        &self,
+        idx: usize,
+        from_reg: Writable<Reg>,
+        ext: ArgumentExtension,
+    ) -> Vec<Self::I>;
 
     /// Generate a return instruction.
     fn gen_ret(&self) -> Self::I;
@@ -82,16 +89,19 @@ pub trait ABIBody {
     /// `store_retval`, and spillslot accesses.)  `self` is mutable so that we
     /// can store information in it which will be useful when creating the
     /// epilogue.
-    fn gen_prologue(&mut self, flags: &settings::Flags) -> Vec<Self::I>;
+    fn gen_prologue(&mut self) -> Vec<Self::I>;
 
     /// Generate an epilogue, post-regalloc. Note that this must generate the
     /// actual return instruction (rather than emitting this in the lowering
     /// logic), because the epilogue code comes before the return and the two are
     /// likely closely related.
-    fn gen_epilogue(&self, flags: &settings::Flags) -> Vec<Self::I>;
+    fn gen_epilogue(&self) -> Vec<Self::I>;
 
     /// Returns the full frame size for the given function, after prologue emission has run. This
-    /// comprises the spill space, incoming argument space, alignment padding, etc.
+    /// comprises the spill slots and stack-storage slots (but not storage for clobbered callee-save
+    /// registers, arguments pushed at callsites within this function, or other ephemeral pushes).
+    /// This is used for ABI variants where the client generates prologue/epilogue code, as in
+    /// Baldrdash (SpiderMonkey integration).
     fn frame_size(&self) -> u32;
 
     /// Get the spill-slot size.
@@ -125,20 +135,29 @@ pub trait ABICall {
     /// Get the number of arguments expected.
     fn num_args(&self) -> usize;
 
-    /// Save the clobbered registers.
-    /// Copy an argument value from a source register, prior to the call.
-    fn gen_copy_reg_to_arg(&self, idx: usize, from_reg: Reg) -> Self::I;
+    /// Emit a copy of an argument value from a source register, prior to the call.
+    fn emit_copy_reg_to_arg<C: LowerCtx<I = Self::I>>(
+        &self,
+        ctx: &mut C,
+        idx: usize,
+        from_reg: Reg,
+    );
 
-    /// Copy a return value into a destination register, after the call returns.
-    fn gen_copy_retval_to_reg(&self, idx: usize, into_reg: Writable<Reg>) -> Self::I;
+    /// Emit a copy a return value into a destination register, after the call returns.
+    fn emit_copy_retval_to_reg<C: LowerCtx<I = Self::I>>(
+        &self,
+        ctx: &mut C,
+        idx: usize,
+        into_reg: Writable<Reg>,
+    );
 
-    /// Pre-adjust the stack, prior to argument copies and call.
-    fn gen_stack_pre_adjust(&self) -> Vec<Self::I>;
+    /// Emit code to pre-adjust the stack, prior to argument copies and call.
+    fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C);
 
-    /// Post-adjust the satck, after call return and return-value copies.
-    fn gen_stack_post_adjust(&self) -> Vec<Self::I>;
+    /// Emit code to post-adjust the satck, after call return and return-value copies.
+    fn emit_stack_post_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C);
 
-    /// Generate the call itself.
+    /// Emit the call itself.
     ///
     /// The returned instruction should have proper use- and def-sets according
     /// to the argument registers, return-value registers, and clobbered
@@ -148,5 +167,5 @@ pub trait ABICall {
     /// registers are also logically defs, but should never be read; their
     /// values are "defined" (to the regalloc) but "undefined" in every other
     /// sense.)
-    fn gen_call(&self) -> Vec<Self::I>;
+    fn emit_call<C: LowerCtx<I = Self::I>>(&mut self, ctx: &mut C);
 }

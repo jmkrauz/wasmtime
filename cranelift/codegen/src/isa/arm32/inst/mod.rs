@@ -8,10 +8,11 @@ use crate::binemit::CodeOffset;
 use crate::ir::types::{B1, B16, B32, B64, B8, F32, F64, FFLAGS, I16, I32, I64, I8, IFLAGS};
 use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode, Type};
 use crate::machinst::*;
+use crate::{settings, CodegenError, CodegenResult};
 
 use regalloc::Map as RegallocMap;
 use regalloc::{RealReg, RealRegUniverse, Reg, RegClass, SpillSlot, VirtualReg, Writable};
-use regalloc::{RegUsageCollector, Set};
+use regalloc::{RegUsageCollector, RegUsageMapper, Set};
 
 use alloc::vec::Vec;
 use smallvec::{smallvec, SmallVec};
@@ -337,8 +338,7 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
 
 fn arm32_map_regs(
     inst: &mut Inst,
-    pre_map: &RegallocMap<VirtualReg, RealReg>,
-    post_map: &RegallocMap<VirtualReg, RealReg>,
+    mapper: &RegUsageMapper
 ) {
     fn map(m: &RegallocMap<VirtualReg, RealReg>, r: &mut Reg) {
         if r.is_virtual() {
@@ -347,32 +347,37 @@ fn arm32_map_regs(
         }
     }
 
-    fn map_wr(m: &RegallocMap<VirtualReg, RealReg>, r: &mut Writable<Reg>) {
-        let mut reg = r.to_reg();
-        map(m, &mut reg);
-        *r = Writable::from_reg(reg);
+    fn map_use(m: &RegUsageMapper, r: &mut Reg) {
+        if r.is_virtual() {
+            let new = m.get_use(r.to_virtual_reg()).unwrap().to_reg();
+            *r = new;
+        }
     }
 
-    fn map_mem(u: &RegallocMap<VirtualReg, RealReg>, mem: &mut MemArg) {
+    fn map_def(m: &RegUsageMapper, r: &mut Writable<Reg>) {
+        if r.to_reg().is_virtual() {
+            let new = m.get_def(r.to_reg().to_virtual_reg()).unwrap().to_reg();
+            *r = Writable::from_reg(new);
+        }
+    }
+
+    fn map_mem(m: &RegUsageMapper, mem: &mut MemArg) {
         match mem {
             &mut MemArg::RegReg(ref mut rn, ref mut rm, ..) => {
-                map(u, rn);
-                map(u, rm);
+                map_use(m, rn);
+                map_use(m, rm);
             }
-            &mut MemArg::Offset12(ref mut rn, ..) => map(u, rn),
+            &mut MemArg::Offset12(ref mut rn, ..) => map_use(m, rn),
         };
     }
 
-    fn map_br(u: &RegallocMap<VirtualReg, RealReg>, br: &mut CondBrKind) {
+    fn map_br(m: &RegUsageMapper, br: &mut CondBrKind) {
         match br {
-            &mut CondBrKind::Zero(ref mut reg) => map(u, reg),
-            &mut CondBrKind::NotZero(ref mut reg) => map(u, reg),
+            &mut CondBrKind::Zero(ref mut reg) => map_use(m, reg),
+            &mut CondBrKind::NotZero(ref mut reg) => map_use(m, reg),
             &mut CondBrKind::Cond(..) => {}
         };
     }
-
-    let u = pre_map; // For brevity below.
-    let d = post_map;
 
     match inst {
         &mut Inst::Nop0
@@ -389,9 +394,9 @@ fn arm32_map_regs(
             ref mut rm,
             ..
         } => {
-            map_wr(d, rd);
-            map(u, rn);
-            map(u, rm);
+            map_def(mapper, rd);
+            map_use(mapper, rn);
+            map_use(mapper, rm);
         }
         &mut Inst::AluRRRShift {
             ref mut rd,
@@ -399,84 +404,84 @@ fn arm32_map_regs(
             ref mut rm,
             ..
         } => {
-            map_wr(d, rd);
-            map(u, rn);
-            map(u, rm);
+            map_def(mapper, rd);
+            map_use(mapper, rn);
+            map_use(mapper, rm);
         }
         &mut Inst::AluRR {
             ref mut rd,
             ref mut rm,
             ..
         } => {
-            map_wr(d, rd);
-            map(u, rm);
+            map_def(mapper, rd);
+            map_use(mapper, rm);
         }
         &mut Inst::AluRRImm5 {
             ref mut rd,
             ref mut rm,
             ..
         } => {
-            map_wr(d, rd);
-            map(u, rm);
+            map_def(mapper, rd);
+            map_use(mapper, rm);
         }
         &mut Inst::AluRImm8 { ref mut rd, .. } => {
-            map_wr(d, rd);
+            map_def(mapper, rd);
         }
         &mut Inst::Mov {
             ref mut rd,
             ref mut rm,
             ..
         } => {
-            map_wr(d, rd);
-            map(u, rm);
+            map_def(mapper, rd);
+            map_use(mapper, rm);
         }
         &mut Inst::MovImm8 { ref mut rd, .. } => {
-            map_wr(d, rd);
+            map_def(mapper, rd);
         }
         &mut Inst::MovImm16 { ref mut rd, .. } => {
-            map_wr(d, rd);
+            map_def(mapper, rd);
         }
         &mut Inst::Movt { ref mut rd, .. } => {
-            map_wr(d, rd);
+            map_def(mapper, rd);
         }
         &mut Inst::Cmp {
             ref mut rn,
             ref mut rm,
         } => {
-            map(u, rn);
-            map(u, rm);
+            map_use(mapper, rn);
+            map_use(mapper, rm);
         }
         &mut Inst::Store {
             ref mut rt,
             ref mut mem,
             ..
         } => {
-            map(u, rt);
-            map_mem(u, mem);
+            map_use(mapper, rt);
+            map_mem(mapper, mem);
         }
         &mut Inst::Load {
             ref mut rt,
             ref mut mem,
             ..
         } => {
-            map_wr(d, rt);
-            map_mem(u, mem);
+            map_def(mapper, rt);
+            map_mem(mapper, mem);
         }
         &mut Inst::Extend {
             ref mut rd,
             ref mut rm,
             ..
         } => {
-            map_wr(d, rd);
-            map(u, rm);
+            map_def(mapper, rd);
+            map_use(mapper, rm);
         }
         &mut Inst::CallInd { ref mut rm, .. } => {
-            map(u, rm);
+            map_use(mapper, rm);
         }
         &mut Inst::CondBr { ref mut kind, .. }
         | &mut Inst::CondBrLowered { ref mut kind, .. }
         | &mut Inst::CondBrLoweredCompound { ref mut kind, .. } => {
-            map_br(u, kind);
+            map_br(mapper, kind);
         }
     }
 }
@@ -490,12 +495,8 @@ impl MachInst for Inst {
         arm32_get_regs(self, collector)
     }
 
-    fn map_regs(
-        &mut self,
-        pre_map: &RegallocMap<VirtualReg, RealReg>,
-        post_map: &RegallocMap<VirtualReg, RealReg>,
-    ) {
-        arm32_map_regs(self, pre_map, post_map);
+    fn map_regs(&mut self, mapper: &RegUsageMapper) {
+        arm32_map_regs(self, mapper);
     }
 
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)> {
@@ -561,10 +562,13 @@ impl MachInst for Inst {
         None
     }
 
-    fn rc_for_type(ty: Type) -> RegClass {
+    fn rc_for_type(ty: Type) -> CodegenResult<RegClass> {
         match ty {
-            I8 | I16 | I32 | B1 | B8 | B16 | B32 => RegClass::I32,
-            _ => panic!("Unexpected SSA-value type: {}", ty),
+            I8 | I16 | I32 | B1 | B8 | B16 | B32 => Ok(RegClass::I32),
+            _ => Err(CodegenError::Unsupported(format!(
+                "Unexpected SSA-value type: {}",
+                ty
+            ))),
         }
     }
 
@@ -655,10 +659,6 @@ impl MachInst for Inst {
             }
             _ => {}
         }
-    }
-
-    fn reg_universe() -> RealRegUniverse {
-        create_reg_universe()
     }
 }
 

@@ -3,14 +3,15 @@
 use crate::ir;
 use crate::ir::types;
 use crate::ir::types::*;
-use crate::ir::StackSlot;
+use crate::ir::{ArgumentExtension, StackSlot};
 use crate::isa;
-use crate::isa::arm32::inst::*;
+use crate::isa::arm32::{self, inst::*};
 use crate::machinst::*;
 use crate::settings;
 
 use alloc::vec::Vec;
 use core::convert::TryInto;
+use core::mem;
 use log::debug;
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
 
@@ -121,7 +122,25 @@ pub struct Arm32ABIBody {
     /// total number of spillslots, from regalloc.
     spillslots: Option<usize>,
     /// Total frame size.
-    frame_size: Option<u32>,
+    total_frame_size: Option<u32>,
+    /// Calling convention this function expects.
+    call_conv: isa::CallConv,
+    /// The settings controlling this function's compilation.
+    flags: settings::Flags,
+    /// Whether or not this function is a "leaf", meaning it calls no other
+    /// functions
+    is_leaf: bool,
+    /// If this function has a stack limit specified, then `Reg` is where the
+    /// stack limit will be located after the instructions specified have been
+    /// executed.
+    ///
+    /// Note that this is intended for insertion into the prologue, if
+    /// present. Also note that because the instructions here execute in the
+    /// prologue this happens after legalization/register allocation/etc so we
+    /// need to be extremely careful with each instruction. The instructions are
+    /// manually register-allocated and carefully only use caller-saved
+    /// registers and keep nothing live after this sequence of instructions.
+    stack_limit: Option<(Reg, Vec<Inst>)>,
 }
 
 fn in_int_reg(ty: ir::Type) -> bool {
@@ -139,47 +158,39 @@ fn in_float_reg(ty: ir::Type) -> bool {
     }
 }
 
-fn load_stack(sp_offset: i32, into_reg: Writable<Reg>, ty: Type) -> Inst {
-    let sp_offset: i32 = sp_offset.try_into().unwrap();
-    let sp = sp_reg();
-    let mem = if let Some(mem) = MemArg::reg_maybe_offset(sp, sp_offset) {
-        mem
-    } else {
-        unimplemented!()
-    };
-
+fn load_stack(mem: MemArg, into_reg: Writable<Reg>, ty: Type) -> Inst {
     match ty {
-        types::B1 | types::B8 | types::I8 | types::B16 | types::I16 | types::B32 | types::I32 => {
-            Inst::Load {
-                rt: into_reg,
-                mem,
-                srcloc: None,
-                bits: 32,
-                sign_extend: false,
-            }
-        }
+        types::B1
+        | types::B8
+        | types::I8
+        | types::B16
+        | types::I16
+        | types::B32
+        | types::I32 => Inst::Load {
+            rt: into_reg,
+            mem,
+            srcloc: None,
+            bits: 32,
+            sign_extend: false,
+        },
         _ => unimplemented!("load_stack({})", ty),
     }
 }
 
-fn store_stack(sp_offset: i64, from_reg: Reg, ty: Type) -> Inst {
-    let sp_offset: i32 = sp_offset.try_into().unwrap();
-    let sp = sp_reg();
-    let mem = if let Some(mem) = MemArg::reg_maybe_offset(sp, sp_offset) {
-        mem
-    } else {
-        unimplemented!()
-    };
-
+fn store_stack(mem: MemArg, from_reg: Reg, ty: Type) -> Inst {
     match ty {
-        types::B1 | types::B8 | types::I8 | types::B16 | types::I16 | types::B32 | types::I32 => {
-            Inst::Store {
-                rt: from_reg,
-                mem,
-                srcloc: None,
-                bits: 32,
-            }
-        }
+        types::B1
+        | types::B8
+        | types::I8
+        | types::B16
+        | types::I16
+        | types::B32
+        | types::I32 => Inst::Store {
+            rt: from_reg,
+            mem,
+            srcloc: None,
+            bits: 32
+        },
         _ => unimplemented!("store_stack({})", ty),
     }
 }
@@ -206,18 +217,80 @@ fn get_caller_saves_set() -> Set<Writable<Reg>> {
     set
 }
 
+fn gen_stack_limit(f: &ir::Function, abi: &ABISig, gv: ir::GlobalValue) -> (Reg, Vec<Inst>) {
+    let mut insts = Vec::new();
+    let reg = generate_gv(f, abi, gv, &mut insts);
+    return (reg, insts);
+
+    fn generate_gv(
+        f: &ir::Function,
+        abi: &ABISig,
+        gv: ir::GlobalValue,
+        insts: &mut Vec<Inst>,
+    ) -> Reg {
+        match f.global_values[gv] {
+            // Return the direct register the vmcontext is in
+            ir::GlobalValueData::VMContext => {
+                get_special_purpose_param_register(f, abi, ir::ArgumentPurpose::VMContext)
+                    .expect("no vmcontext parameter found")
+            }
+            // Load our base value into a register, then load from that register
+            // in to a temporary register.
+            ir::GlobalValueData::Load {
+                base,
+                offset,
+                global_type: _,
+                readonly: _,
+            } => {
+                let base = generate_gv(f, abi, base, insts);
+                let into_reg = writable_ip_reg();
+                let offset: i32 = offset.into();
+                let mem = if let Some(mem) = MemArg::reg_maybe_offset(base, offset)
+                {
+                    mem
+                } else {
+                    insts.extend(Inst::load_constant(into_reg, offset as u32));
+                    MemArg::reg_plus_reg(base, into_reg.to_reg(), 0)
+                };
+                insts.push(Inst::Load {
+                    rt: into_reg,
+                    mem,
+                    srcloc: None,
+                    bits: 32,
+                    sign_extend: false,
+                });
+                return into_reg.to_reg();
+            }
+            ref other => panic!("global value for stack limit not supported: {}", other),
+        }
+    }
+}
+
+fn get_special_purpose_param_register(
+    f: &ir::Function,
+    abi: &ABISig,
+    purpose: ir::ArgumentPurpose,
+) -> Option<Reg> {
+    let idx = f.signature.special_param_index(purpose)?;
+    match abi.args[idx] {
+        ABIArg::Reg(reg, _) => Some(reg.to_reg()),
+        ABIArg::Stack(..) => None,
+    }
+}
+
 impl Arm32ABIBody {
     /// Create a new body ABI instance.
-    pub fn new(f: &ir::Function) -> Self {
+    pub fn new(f: &ir::Function, flags: settings::Flags) -> Self {
         debug!("Arm32 ABI: func signature {:?}", f.signature);
 
         let sig = ABISig::from_func_sig(&f.signature);
 
+        let call_conv = f.signature.call_conv;
         // Only this calling conventions are supported.
         assert!(
-            f.signature.call_conv == isa::CallConv::SystemV,
+            call_conv == isa::CallConv::SystemV,
             "Unsupported calling convention: {:?}",
-            f.signature.call_conv
+            call_conv
         );
 
         // Compute stackslot locations and total stackslot size.
@@ -231,19 +304,36 @@ impl Arm32ABIBody {
             stackslots.push(off);
         }
 
+        // Figure out what instructions, if any, will be needed to check the
+        // stack limit. This can either be specified as a special-purpose
+        // argument or as a global value which often calculates the stack limit
+        // from the arguments.
+        let stack_limit =
+            get_special_purpose_param_register(f, &sig, ir::ArgumentPurpose::StackLimit)
+                .map(|reg| (reg, Vec::new()))
+                .or_else(|| f.stack_limit.map(|gv| gen_stack_limit(f, &sig, gv)));
+
         Self {
             sig,
             stackslots,
             stackslots_size: stack_offset,
             clobbered: Set::empty(),
             spillslots: None,
-            frame_size: None,
+            total_frame_size: None,
+            call_conv,
+            flags,
+            is_leaf: f.is_leaf(),
+            stack_limit,
         }
     }
 }
 
 impl ABIBody for Arm32ABIBody {
     type I = Inst;
+
+    fn flags(&self) -> &settings::Flags {
+        &self.flags
+    }
 
     fn liveins(&self) -> Set<RealReg> {
         let mut set: Set<RealReg> = Set::empty();
@@ -280,15 +370,78 @@ impl ABIBody for Arm32ABIBody {
     fn gen_copy_arg_to_reg(&self, idx: usize, into_reg: Writable<Reg>) -> Inst {
         match &self.sig.args[idx] {
             &ABIArg::Reg(r, ty) => Inst::gen_move(into_reg, r.to_reg(), ty),
-            &ABIArg::Stack(off, ty) => load_stack(off.try_into().unwrap(), into_reg, ty),
+            &ABIArg::Stack(off, ty) => {
+                let mem = if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), off) {
+                    mem
+                } else {
+                    unimplemented!()
+                };
+                load_stack(mem, into_reg, ty)
+            }
         }
     }
 
-    fn gen_copy_reg_to_retval(&self, idx: usize, from_reg: Reg) -> Inst {
+    fn gen_copy_reg_to_retval(
+        &self,
+        idx: usize,
+        from_reg: Writable<Reg>,
+        ext: ArgumentExtension,
+    ) -> Vec<Inst> {
+        let mut ret = Vec::new();
         match &self.sig.rets[idx] {
-            &ABIArg::Reg(r, ty) => Inst::gen_move(Writable::from_reg(r.to_reg()), from_reg, ty),
-            &ABIArg::Stack(off, ty) => store_stack(off.try_into().unwrap(), from_reg, ty),
+            &ABIArg::Reg(r, ty) => {
+                let from_bits = arm32::lower::ty_bits(ty) as u8;
+                let dest_reg = Writable::from_reg(r.to_reg());
+                match (ext, from_bits) {
+                    (ArgumentExtension::Uext, n) if n < 32 => {
+                        ret.push(Inst::Extend {
+                            rd: dest_reg,
+                            rm: from_reg.to_reg(),
+                            from_bits,
+                            signed: false,
+                        });
+                    }
+                    (ArgumentExtension::Sext, n) if n < 32 => {
+                        ret.push(Inst::Extend {
+                            rd: dest_reg,
+                            rm: from_reg.to_reg(),
+                            from_bits,
+                            signed: true,
+                        });
+                    }
+                    _ => ret.push(Inst::gen_move(dest_reg, from_reg.to_reg(), ty)),
+                };
+            }
+            &ABIArg::Stack(off, ty) => {
+                let from_bits = arm32::lower::ty_bits(ty) as u8;
+                // Trash the from_reg; it should be its last use.
+                match (ext, from_bits) {
+                    (ArgumentExtension::Uext, n) if n < 32 => {
+                        ret.push(Inst::Extend {
+                            rd: from_reg,
+                            rm: from_reg.to_reg(),
+                            from_bits,
+                            signed: false,
+                        });
+                    }
+                    (ArgumentExtension::Sext, n) if n < 32 => {
+                        ret.push(Inst::Extend {
+                            rd: from_reg,
+                            rm: from_reg.to_reg(),
+                            from_bits,
+                            signed: true,
+                        });
+                    }
+                    _ => {}
+                };
+                ret.push(store_stack(
+                    MemArg::reg_maybe_offset(sp_reg(), off).unwrap(),
+                    from_reg.to_reg(),
+                    ty,
+                ));
+            }
         }
+        ret
     }
 
     fn gen_ret(&self) -> Inst {
@@ -335,17 +488,17 @@ impl ABIBody for Arm32ABIBody {
         unimplemented!()
     }
 
-    fn gen_prologue(&mut self, _flags: &settings::Flags) -> Vec<Inst> {
-        self.frame_size = Some(0);
+    fn gen_prologue(&mut self) -> Vec<Inst> {
+        self.total_frame_size = Some(0);
         vec![]
     }
 
-    fn gen_epilogue(&self, _flags: &settings::Flags) -> Vec<Inst> {
+    fn gen_epilogue(&self) -> Vec<Inst> {
         vec![Inst::Ret]
     }
 
     fn frame_size(&self) -> u32 {
-        self.frame_size
+        self.total_frame_size
             .expect("frame size not computed before prologue generation")
     }
 
@@ -363,7 +516,7 @@ impl ABIBody for Arm32ABIBody {
 }
 
 enum CallDest {
-    ExtName(ir::ExternalName),
+    ExtName(ir::ExternalName, RelocDistance),
     Reg(Reg),
 }
 
@@ -404,6 +557,7 @@ impl Arm32ABICall {
     pub fn from_func(
         sig: &ir::Signature,
         extname: &ir::ExternalName,
+        dist: RelocDistance,
         loc: ir::SourceLoc,
     ) -> Arm32ABICall {
         let sig = ABISig::from_func_sig(sig);
@@ -412,7 +566,7 @@ impl Arm32ABICall {
             sig,
             uses,
             defs,
-            dest: CallDest::ExtName(extname.clone()),
+            dest: CallDest::ExtName(extname.clone(), dist),
             loc,
             opcode: ir::Opcode::Call,
         }
@@ -439,21 +593,21 @@ impl Arm32ABICall {
     }
 }
 
-fn adjust_stack(amt: u32, is_sub: bool) -> Vec<Inst> {
-    if amt > 0 {
-        let alu_op = if is_sub { ALUOp::Sub } else { ALUOp::Add };
-        let mut insts = Inst::load_constant(writable_ip_reg(), amt).into_vec();
-        insts.push(Inst::AluRRRShift {
+fn adjust_stack<C: LowerCtx<I = Inst>>(ctx: &mut C, amount: u32, is_sub: bool) {
+    if amount == 0 {
+        return;
+    }
+    let alu_op = if is_sub { ALUOp::Sub } else { ALUOp::Add };
+        for inst in Inst::load_constant(writable_ip_reg(), amount).into_vec() {
+            ctx.emit(inst);
+        }
+        ctx.emit(Inst::AluRRRShift {
             alu_op,
             rd: writable_sp_reg(),
             rn: sp_reg(),
             rm: ip_reg(),
             shift: None,
         });
-        insts
-    } else {
-        vec![]
-    }
 }
 
 impl ABICall for Arm32ABICall {
@@ -463,50 +617,84 @@ impl ABICall for Arm32ABICall {
         self.sig.args.len()
     }
 
-    fn gen_stack_pre_adjust(&self) -> Vec<Inst> {
-        adjust_stack(self.sig.stack_arg_space, /* is_sub = */ true)
+    fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
+        adjust_stack(
+            ctx,
+            self.sig.stack_arg_space,
+            /* is_sub = */ true,
+        )
     }
 
-    fn gen_stack_post_adjust(&self) -> Vec<Inst> {
-        adjust_stack(self.sig.stack_arg_space, /* is_sub = */ false)
+    fn emit_stack_post_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
+        adjust_stack(
+            ctx,
+            self.sig.stack_arg_space,
+            /* is_sub = */ false,
+        )
     }
 
-    fn gen_copy_reg_to_arg(&self, idx: usize, from_reg: Reg) -> Inst {
+    fn emit_copy_reg_to_arg<C: LowerCtx<I = Self::I>>(
+        &self,
+        ctx: &mut C,
+        idx: usize,
+        from_reg: Reg,
+    ) {
         match &self.sig.args[idx] {
-            &ABIArg::Reg(reg, ty) => Inst::gen_move(Writable::from_reg(reg.to_reg()), from_reg, ty),
-            &ABIArg::Stack(off, _) => Inst::Store {
-                rt: from_reg,
-                mem: MemArg::reg_maybe_offset(sp_reg(), off.try_into().unwrap()).unwrap(),
-                srcloc: None,
-                bits: 32,
-            },
+            &ABIArg::Reg(reg, ty) => ctx.emit(Inst::gen_move(
+                Writable::from_reg(reg.to_reg()),
+                from_reg,
+                ty,
+            )),
+            &ABIArg::Stack(off, ty) => {
+                if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), off) {
+                    ctx.emit(store_stack(mem, from_reg, ty));
+                } else {
+                    for inst in Inst::load_constant(writable_ip_reg(), off as u32) {
+                        ctx.emit(inst);
+                    }
+                    let mem = MemArg::reg_plus_reg(sp_reg(), ip_reg(), 0);
+                    ctx.emit(store_stack(mem, from_reg, ty));
+                }
+                
+            }
         }
     }
 
-    fn gen_copy_retval_to_reg(&self, idx: usize, into_reg: Writable<Reg>) -> Inst {
+    fn emit_copy_retval_to_reg<C: LowerCtx<I = Self::I>>(
+        &self,
+        ctx: &mut C,
+        idx: usize,
+        into_reg: Writable<Reg>,
+    ) {
         match &self.sig.rets[idx] {
-            &ABIArg::Reg(reg, ty) => Inst::gen_move(into_reg, reg.to_reg(), ty),
+            &ABIArg::Reg(reg, ty) => ctx.emit(Inst::gen_move(into_reg, reg.to_reg(), ty)),
             _ => unimplemented!(),
         }
     }
 
-    fn gen_call(&self) -> Vec<Inst> {
-        let (uses, defs) = (self.uses.clone(), self.defs.clone());
+    fn emit_call<C: LowerCtx<I = Self::I>>(&mut self, ctx: &mut C) {
+        let (uses, defs) = (
+            mem::replace(&mut self.uses, Set::empty()),
+            mem::replace(&mut self.defs, Set::empty()),
+        );
         match &self.dest {
-            &CallDest::ExtName(ref name) => vec![Inst::Call {
+            &CallDest::ExtName(ref name, RelocDistance::Near) => ctx.emit(Inst::Call {
                 dest: name.clone(),
                 uses,
                 defs,
                 loc: self.loc,
                 opcode: self.opcode,
-            }],
-            &CallDest::Reg(reg) => vec![Inst::CallInd {
+            }),
+            &CallDest::ExtName(ref _name, RelocDistance::Far) => {
+                unimplemented!()
+            }
+            &CallDest::Reg(reg) => ctx.emit(Inst::CallInd {
                 rm: reg,
                 uses,
                 defs,
                 loc: self.loc,
                 opcode: self.opcode,
-            }],
+            }),
         }
     }
 }

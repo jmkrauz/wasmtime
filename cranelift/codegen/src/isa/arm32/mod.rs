@@ -16,6 +16,7 @@ use target_lexicon::{Architecture, ArmArchitecture, Triple};
 mod abi;
 mod inst;
 mod lower;
+mod lower_inst;
 
 use inst::create_reg_universe;
 
@@ -23,19 +24,22 @@ use inst::create_reg_universe;
 pub struct Arm32Backend {
     triple: Triple,
     flags: settings::Flags,
+    reg_universe: RealRegUniverse,
 }
 
 impl Arm32Backend {
     /// Create a new ARM32 backend with the given (shared) flags.
     pub fn new_with_flags(triple: Triple, flags: settings::Flags) -> Arm32Backend {
-        Arm32Backend { triple, flags }
+        let reg_universe = create_reg_universe();
+        Arm32Backend { triple, flags, reg_universe }
     }
 
-    fn compile_vcode(&self, func: &Function, flags: &settings::Flags) -> VCode<inst::Inst> {
+    fn compile_vcode(&self, func: &Function, flags: settings::Flags)
+            -> CodegenResult<VCode<inst::Inst>> {
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
-        let abi = Box::new(abi::Arm32ABIBody::new(func));
-        compile::compile::<Arm32Backend>(func, self, abi, flags)
+        let abi = Box::new(abi::Arm32ABIBody::new(func, flags));
+        compile::compile::<Arm32Backend>(func, self, abi)
     }
 }
 
@@ -46,7 +50,7 @@ impl MachBackend for Arm32Backend {
         want_disasm: bool,
     ) -> CodegenResult<MachCompileResult> {
         let flags = self.flags();
-        let vcode = self.compile_vcode(func, flags);
+        let vcode = self.compile_vcode(func, flags.clone())?;
         let sections = vcode.emit();
         let frame_size = vcode.frame_size();
 
@@ -75,8 +79,8 @@ impl MachBackend for Arm32Backend {
         &self.flags
     }
 
-    fn reg_universe(&self) -> RealRegUniverse {
-        create_reg_universe()
+    fn reg_universe(&self) -> &RealRegUniverse {
+        &self.reg_universe
     }
 }
 

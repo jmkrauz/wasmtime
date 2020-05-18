@@ -31,30 +31,13 @@ void call_thumb(void *payload) {
     : "r1", "r2", "r3", "ip", "lr", "cc", "memory");
 }
 
-#endif
-
-#ifdef __APPLE__
-#include <sys/ucontext.h>
-
-void* GetPcFromUContext(ucontext_t *cx) {
-  return (void*) cx->uc_mcontext->__ss.__rip;
-}
-#endif
-
-#if defined(__linux__) && defined(__aarch64__)
-#include <sys/ucontext.h>
-
-void* GetPcFromUContext(ucontext_t *cx) {
-    return (void*) cx->uc_mcontext.pc;
-}
-
-#endif  // __linux__ && __aarch64__
-
-#if defined(__linux__) && defined(__arm__)
+#ifdef __linux__
 #include <sys/ucontext.h>
 
 void* GetPcFromUContext(ucontext_t *cx) {
     return (void*) cx->uc_mcontext.arm_pc;
 }
 
-#endif // __linux__ && __arm__
+#endif // __linux__
+
+#endif // __arm__

@@ -208,8 +208,16 @@ fn emit_32<O: MachSectionOutput>(inst: u32, sink: &mut O) {
     sink.put2(inst_lo);
 }
 
+/// State carried between emissions of a sequence of instructions.
+#[derive(Default, Clone, Debug)]
+pub struct EmitState {
+    virtual_sp_offset: i64,
+}
+
 impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
-    fn emit(&self, sink: &mut O) {
+    type State = EmitState;
+    
+    fn emit(&self, sink: &mut O, _flags: &settings::Flags, _state: &mut EmitState) {
         match self {
             &Inst::AluRR { .. }
             | &Inst::AluRRImm5 { .. }

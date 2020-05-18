@@ -17,6 +17,7 @@ use target_lexicon::{Aarch64Architecture, Architecture, Triple};
 mod abi;
 mod inst;
 mod lower;
+mod lower_inst;
 
 use inst::create_reg_universe;
 
@@ -24,19 +25,29 @@ use inst::create_reg_universe;
 pub struct AArch64Backend {
     triple: Triple,
     flags: settings::Flags,
+    reg_universe: RealRegUniverse,
 }
 
 impl AArch64Backend {
     /// Create a new AArch64 backend with the given (shared) flags.
     pub fn new_with_flags(triple: Triple, flags: settings::Flags) -> AArch64Backend {
-        AArch64Backend { triple, flags }
+        let reg_universe = create_reg_universe(&flags);
+        AArch64Backend {
+            triple,
+            flags,
+            reg_universe,
+        }
     }
 
-    fn compile_vcode(&self, func: &Function, flags: &settings::Flags) -> VCode<inst::Inst> {
-        // This performs lowering to VCode, register-allocates the code, computes
-        // block layout and finalizes branches. The result is ready for binary emission.
-        let abi = Box::new(abi::AArch64ABIBody::new(func));
-        compile::compile::<AArch64Backend>(func, self, abi, flags)
+    /// This performs lowering to VCode, register-allocates the code, computes block layout and
+    /// finalizes branches. The result is ready for binary emission.
+    fn compile_vcode(
+        &self,
+        func: &Function,
+        flags: settings::Flags,
+    ) -> CodegenResult<VCode<inst::Inst>> {
+        let abi = Box::new(abi::AArch64ABIBody::new(func, flags));
+        compile::compile::<AArch64Backend>(func, self, abi)
     }
 }
 
@@ -47,12 +58,12 @@ impl MachBackend for AArch64Backend {
         want_disasm: bool,
     ) -> CodegenResult<MachCompileResult> {
         let flags = self.flags();
-        let vcode = self.compile_vcode(func, flags);
+        let vcode = self.compile_vcode(func, flags.clone())?;
         let sections = vcode.emit();
         let frame_size = vcode.frame_size();
 
         let disasm = if want_disasm {
-            Some(vcode.show_rru(Some(&create_reg_universe())))
+            Some(vcode.show_rru(Some(&create_reg_universe(flags))))
         } else {
             None
         };
@@ -76,8 +87,8 @@ impl MachBackend for AArch64Backend {
         &self.flags
     }
 
-    fn reg_universe(&self) -> RealRegUniverse {
-        create_reg_universe()
+    fn reg_universe(&self) -> &RealRegUniverse {
+        &self.reg_universe
     }
 }
 

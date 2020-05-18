@@ -49,6 +49,8 @@ enum wasmtime_profiling_strategy_t { // ProfilingStrategy
     WASM_API_EXTERN ret wasmtime_config_##name##_set(wasm_config_t*, ty);
 
 WASMTIME_CONFIG_PROP(void, debug_info, bool)
+WASMTIME_CONFIG_PROP(void, interruptable, bool)
+WASMTIME_CONFIG_PROP(void, max_wasm_stack, size_t)
 WASMTIME_CONFIG_PROP(void, wasm_threads, bool)
 WASMTIME_CONFIG_PROP(void, wasm_reference_types, bool)
 WASMTIME_CONFIG_PROP(void, wasm_simd, bool)
@@ -58,6 +60,11 @@ WASMTIME_CONFIG_PROP(wasmtime_error_t*, strategy, wasmtime_strategy_t)
 WASMTIME_CONFIG_PROP(void, cranelift_debug_verifier, bool)
 WASMTIME_CONFIG_PROP(void, cranelift_opt_level, wasmtime_opt_level_t)
 WASMTIME_CONFIG_PROP(wasmtime_error_t*, profiler, wasmtime_profiling_strategy_t)
+WASMTIME_CONFIG_PROP(void, static_memory_maximum_size, uint64_t)
+WASMTIME_CONFIG_PROP(void, static_memory_guard_size, uint64_t)
+WASMTIME_CONFIG_PROP(void, dynamic_memory_guard_size, uint64_t)
+
+WASM_API_EXTERN wasmtime_error_t* wasmtime_config_cache_config_load(wasm_config_t*, const char*);
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -130,6 +137,23 @@ WASM_API_EXTERN own wasm_func_t* wasmtime_func_new_with_env(
 );
 
 WASM_API_EXTERN own wasm_extern_t* wasmtime_caller_export_get(const wasmtime_caller_t* caller, const wasm_name_t* name);
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// wasmtime_interrupt_handle_t extension, allowing interruption of running wasm
+// modules.
+//
+// Note that `wasmtime_interrupt_handle_t` is safe to send to other threads and
+// interrupt/delete.
+//
+// Also note that `wasmtime_interrupt_handle_new` may return NULL if interrupts
+// are not enabled in `wasm_config_t`.
+
+WASMTIME_DECLARE_OWN(interrupt_handle)
+
+WASM_API_EXTERN own wasmtime_interrupt_handle_t *wasmtime_interrupt_handle_new(wasm_store_t *store);
+
+WASM_API_EXTERN void wasmtime_interrupt_handle_interrupt(wasmtime_interrupt_handle_t *handle);
 
 ///////////////////////////////////////////////////////////////////////////////
 //

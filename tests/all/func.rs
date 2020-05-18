@@ -39,6 +39,7 @@ fn dtor_runs() {
     Func::wrap(&store, move || {
         drop(&a);
     });
+    drop(store);
     assert_eq!(HITS.load(SeqCst), 1);
 }
 
@@ -63,7 +64,7 @@ fn dtor_delayed() -> Result<()> {
     let module = Module::new(&store, &wasm)?;
     let instance = Instance::new(&module, &[func.into()])?;
     assert_eq!(HITS.load(SeqCst), 0);
-    drop(instance);
+    drop((instance, module, store));
     assert_eq!(HITS.load(SeqCst), 1);
     Ok(())
 }
@@ -74,7 +75,9 @@ fn signatures_match() {
 
     let f = Func::wrap(&store, || {});
     assert_eq!(f.ty().params(), &[]);
+    assert_eq!(f.param_arity(), 0);
     assert_eq!(f.ty().results(), &[]);
+    assert_eq!(f.result_arity(), 0);
 
     let f = Func::wrap(&store, || -> i32 { loop {} });
     assert_eq!(f.ty().params(), &[]);

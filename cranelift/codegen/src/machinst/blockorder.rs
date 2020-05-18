@@ -1,7 +1,6 @@
 //! Computation of basic block order in emitted code.
 
 use crate::machinst::*;
-use regalloc::{BlockIx, Function};
 
 /// Simple reverse postorder-based block order emission.
 ///
@@ -10,41 +9,32 @@ use regalloc::{BlockIx, Function};
 struct BlockRPO {
     visited: Vec<bool>,
     postorder: Vec<BlockIndex>,
-    deferred_last: Option<BlockIndex>,
 }
 
 impl BlockRPO {
     fn new<I: VCodeInst>(vcode: &VCode<I>) -> BlockRPO {
         BlockRPO {
             visited: vec![false; vcode.num_blocks()],
-            postorder: vec![],
-            deferred_last: None,
+            postorder: Vec::with_capacity(vcode.num_blocks()),
         }
     }
 
     fn visit<I: VCodeInst>(&mut self, vcode: &VCode<I>, block: BlockIndex) {
         self.visited[block as usize] = true;
         for succ in vcode.succs(block) {
-            if !self.visited[*succ as usize] {
-                self.visit(vcode, *succ);
+            if !self.visited[succ.get() as usize] {
+                self.visit(vcode, succ.get());
             }
         }
-
-        for i in vcode.block_insns(BlockIx::new(block)) {
-            if vcode.get_insn(i).is_epilogue_placeholder() {
-                debug_assert!(self.deferred_last.is_none());
-                self.deferred_last = Some(block);
-                return;
-            }
+        if Some(block) != vcode.fallthrough_return_block {
+            self.postorder.push(block);
         }
-
-        self.postorder.push(block);
     }
 
-    fn rpo(self) -> Vec<BlockIndex> {
+    fn rpo<I: VCodeInst>(self, vcode: &VCode<I>) -> Vec<BlockIndex> {
         let mut rpo = self.postorder;
         rpo.reverse();
-        if let Some(block) = self.deferred_last {
+        if let Some(block) = vcode.fallthrough_return_block {
             rpo.push(block);
         }
         rpo
@@ -55,5 +45,5 @@ impl BlockRPO {
 pub fn compute_final_block_order<I: VCodeInst>(vcode: &VCode<I>) -> Vec<BlockIndex> {
     let mut rpo = BlockRPO::new(vcode);
     rpo.visit(vcode, vcode.entry());
-    rpo.rpo()
+    rpo.rpo(vcode)
 }
