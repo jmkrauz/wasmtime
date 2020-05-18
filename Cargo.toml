@@ -22,7 +22,7 @@ doc = false
 
 [dependencies]
 # Enable all supported architectures by default.
-wasmtime = { path = "crates/api", version = "0.16.0", default-features = false }
+wasmtime = { path = "crates/wasmtime", version = "0.16.0", default-features = false }
 wasmtime-debug = { path = "crates/debug", version = "0.16.0" }
 wasmtime-environ = { path = "crates/environ", version = "0.16.0" }
 wasmtime-jit = { path = "crates/jit", version = "0.16.0" }
@@ -36,7 +36,7 @@ anyhow = "1.0.19"
 target-lexicon = { version = "0.10.0", default-features = false }
 pretty_env_logger = "0.4.0"
 file-per-thread-logger = "0.1.1"
-wat = "1.0.10"
+wat = "1.0.18"
 libc = "0.2.60"
 rayon = "1.2.1"
 humantime = "1.3.0"

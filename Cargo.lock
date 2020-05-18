@@ -202,6 +202,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bumpalo"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5356f1d23ee24a1f785a56d1d1a5f0fd5b0f6a0c0fb2412ce11da71649ab78f6"
+
+[[package]]
 name = "byte-tools"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -359,6 +365,8 @@ dependencies = [
  "gimli",
  "hashbrown 0.7.2",
  "log",
+ "peepmatic",
+ "peepmatic-runtime",
  "regalloc",
  "serde",
  "smallvec",
@@ -878,6 +886,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fad85553e09a6f881f739c29f0b00b0f01357c743266d478b68951ce23285f3"
 
 [[package]]
+name = "fst"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f9cac32c1741cdf6b66be7dcf0d9c7f25ccf12f8aa84c16cfa31f9f14513b3"
+
+[[package]]
 name = "fuchsia-cprng"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1227,6 +1241,76 @@ dependencies = [
 ]
 
 [[package]]
+name = "peepmatic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "peepmatic-automata",
+ "peepmatic-macro",
+ "peepmatic-runtime",
+ "wast 15.0.0",
+ "z3",
+]
+
+[[package]]
+name = "peepmatic-automata"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "peepmatic-fuzzing"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "bincode",
+ "env_logger 0.7.1",
+ "fst",
+ "log",
+ "peepmatic",
+ "peepmatic-automata",
+ "peepmatic-runtime",
+ "peepmatic-test",
+ "rand 0.7.3",
+ "serde",
+ "wast 15.0.0",
+]
+
+[[package]]
+name = "peepmatic-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "peepmatic-runtime"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "bumpalo",
+ "log",
+ "peepmatic-automata",
+ "peepmatic-macro",
+ "serde",
+ "thiserror",
+ "wast 15.0.0",
+]
+
+[[package]]
+name = "peepmatic-test"
+version = "0.1.0"
+dependencies = [
+ "env_logger 0.7.1",
+ "log",
+ "peepmatic",
+ "peepmatic-runtime",
+]
+
+[[package]]
 name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,7 +1434,7 @@ dependencies = [
  "rand_isaac",
  "rand_jitter",
  "rand_os",
- "rand_pcg",
+ "rand_pcg 0.1.2",
  "rand_xorshift",
  "winapi",
 ]
@@ -1366,6 +1450,7 @@ dependencies = [
  "rand_chacha 0.2.2",
  "rand_core 0.5.1",
  "rand_hc 0.2.0",
+ "rand_pcg 0.2.1",
 ]
 
 [[package]]
@@ -1472,6 +1557,15 @@ checksum = "abf9b09b01790cfe0364f52bf32995ea3c39f4d2dd011eac241d2914146d0b44"
 dependencies = [
  "autocfg 0.1.7",
  "rand_core 0.4.2",
+]
+
+[[package]]
+name = "rand_pcg"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16abd0c1b639e9eb4d7c50c0b8100b0d0f849be2349829c740fe8e6eb4816429"
+dependencies = [
+ "rand_core 0.5.1",
 ]
 
 [[package]]
@@ -2053,15 +2147,15 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.52.2"
+version = "0.55.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "733954023c0b39602439e60a65126fd31b003196d3a1e8e4531b055165a79b31"
+checksum = "af931e2e1960c53f4a28b063fec4cacd036f35acbec8ff3a4739125b17382a87"
 
 [[package]]
 name = "wasmprinter"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21c3ac16b1f882bf1e1ce007e4f194559d2e3332013367863ddfbc828d1f044f"
+checksum = "c93ba310101ec5ee980db66b47b3d276577c8310df1570e19994347137650454"
 dependencies = [
  "anyhow",
  "wasmparser",
@@ -2194,6 +2288,7 @@ dependencies = [
  "cranelift-reader",
  "cranelift-wasm",
  "libfuzzer-sys",
+ "peepmatic-fuzzing",
  "target-lexicon",
  "wasmtime",
  "wasmtime-fuzzing",
@@ -2324,7 +2419,7 @@ version = "0.16.0"
 dependencies = [
  "anyhow",
  "wasmtime",
- "wast 15.0.0",
+ "wast 17.0.0",
 ]
 
 [[package]]
@@ -2346,12 +2441,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "wat"
-version = "1.0.16"
+name = "wast"
+version = "17.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "526d28df6c047d9f9a92d4925b98afd8d8d95b1b3aa4f13eb1306f17d1da56c4"
+checksum = "5a0e1c36b928fca33dbaf96235188f5fad22ee87100e26cc606bd0fbabdf1932"
 dependencies = [
- "wast 15.0.0",
+ "leb128",
+]
+
+[[package]]
+name = "wat"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b50f9e5e5c81e6fd987ae6997a9f4bbb751df2dec1d8cadb0b5778f1ec13bbe"
+dependencies = [
+ "wast 17.0.0",
 ]
 
 [[package]]
@@ -2468,6 +2572,26 @@ dependencies = [
  "filetime",
  "libc",
  "log",
+]
+
+[[package]]
+name = "z3"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded00cd90f8e3a7ea3155bddd72573f2b099ea201877542d924e47b58dd04e72"
+dependencies = [
+ "lazy_static",
+ "log",
+ "z3-sys",
+]
+
+[[package]]
+name = "z3-sys"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4002d8a1facb54d02dbfb86151281e5450618ab330936bc2f3acaab31eae11ae"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

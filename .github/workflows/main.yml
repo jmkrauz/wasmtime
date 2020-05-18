@@ -5,6 +5,9 @@ on:
     tags-ignore: [dev]
   pull_request:
     branches: [master]
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # Check Code style quickly by running `rustfmt` over all code
@@ -75,10 +78,10 @@ jobs:
         toolchain: nightly
 
     # Check some feature combinations of the `wasmtime` crate
-    - run: cargo check --manifest-path crates/api/Cargo.toml --no-default-features
-    - run: cargo check --manifest-path crates/api/Cargo.toml --features wat
-    - run: cargo check --manifest-path crates/api/Cargo.toml --features lightbeam
-    - run: cargo check --manifest-path crates/api/Cargo.toml --features jitdump
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --no-default-features
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --features wat
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --features lightbeam
+    - run: cargo check --manifest-path crates/wasmtime/Cargo.toml --features jitdump
 
     # Check some feature combinations of the `wasmtime-c-api` crate
     - run: cargo check --manifest-path crates/c-api/Cargo.toml --no-default-features
@@ -131,39 +134,96 @@ jobs:
     # our fuzzers over the sampled inputs still works OK.
     - run: |
         find fuzz/corpus/compile -type f \
-            | shuf \
-            | head -n 3000 \
+            | shuf -n 3000 \
             | xargs cargo fuzz run compile --release --debug-assertions --features binaryen
       env:
         RUST_BACKTRACE: 1
     - run: |
         find fuzz/corpus/instantiate -type f \
-            | shuf \
-            | head -n 2000 \
+            | shuf -n 2000 \
             | xargs cargo fuzz run instantiate --release --debug-assertions --features binaryen
       env:
         RUST_BACKTRACE: 1
     - run: |
         find fuzz/corpus/instantiate_translated -type f \
-            | shuf \
-            | head -n 1000 \
+            | shuf -n 1000 \
             | xargs cargo fuzz run instantiate_translated --release --debug-assertions --features binaryen
       env:
         RUST_BACKTRACE: 1
     - run: |
         find fuzz/corpus/api_calls -type f \
-            | shuf \
-            | head -n 100 \
+            | shuf -n 100 \
             | xargs cargo fuzz run api_calls --release --debug-assertions --features binaryen
       env:
         RUST_BACKTRACE: 1
     - run: |
         find fuzz/corpus/differential -type f \
-            | shuf \
-            | head -n 100 \
+            | shuf -n 100 \
             | xargs cargo fuzz run differential --release --debug-assertions --features binaryen
       env:
         RUST_BACKTRACE: 1
+    - run: |
+        find fuzz/corpus/peepmatic_compile -type f \
+            | shuf \
+            | head -n 10000 \
+            | xargs cargo fuzz run peepmatic_compile --release --debug-assertions --features binaryen
+      env:
+        RUST_BACKTRACE: 1
+    - run: |
+        find fuzz/corpus/peepmatic_fst_differential -type f \
+            | shuf \
+            | head -n 10000 \
+            | xargs cargo fuzz run peepmatic_fst_differential --release --debug-assertions --features binaryen
+      env:
+        RUST_BACKTRACE: 1
+    - run: |
+        find fuzz/corpus/peepmatic_interp -type f \
+            | shuf \
+            | head -n 5000 \
+            | xargs cargo fuzz run peepmatic_interp --release --debug-assertions --features binaryen
+      env:
+        RUST_BACKTRACE: 1
+    - run: |
+        find fuzz/corpus/peepmatic_parser -type f \
+            | shuf \
+            | head -n 10000 \
+            | xargs cargo fuzz run peepmatic_parser --release --debug-assertions --features binaryen
+      env:
+        RUST_BACKTRACE: 1
+    - run: |
+        find fuzz/corpus/peepmatic_simple_automata -type f \
+            | shuf \
+            | head -n 1000 \
+            | xargs cargo fuzz run peepmatic_simple_automata --release --debug-assertions --features binaryen
+      env:
+        RUST_BACKTRACE: 1
+
+  rebuild_peephole_optimizers:
+    name: Rebuild Peephole Optimizers
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+      with:
+        submodules: true
+    - name: Test `peepmatic`
+      run: |
+        cargo test \
+          --package peepmatic \
+          --package peepmatic-automata \
+          --package peepmatic-fuzzing \
+          --package peepmatic-macro \
+          --package peepmatic-runtime \
+          --package peepmatic-test
+    - name: Rebuild Cranelift's peepmatic-based peephole optimizers
+      run: |
+        cd cranelift/
+        cargo build --features 'enable-peepmatic cranelift-codegen/rebuild-peephole-optimizers'
+    - name: Check that peephole optimizers are up to date
+      run: git diff --exit-code
+    - name: Test `cranelift-codegen` with `peepmatic` enabled
+      run: |
+        cd cranelift/
+        cargo test --features 'enable-peepmatic'
 
   # Perform all tests (debug mode) for `wasmtime`. This runs stable/beta/nightly
   # channels of Rust as well as macOS/Linux/Windows.
@@ -202,15 +262,15 @@ jobs:
       # Note: libclang is pre-installed on the macOS and linux images.
       if: matrix.os == 'windows-latest'
       run: |
-        Invoke-WebRequest https://releases.llvm.org/9.0.0/LLVM-9.0.0-win64.exe -OutFile llvm-installer.exe
-        7z x llvm-installer.exe -oC:\llvm-binary
-        Write-Host ::set-env name=LIBCLANG_PATH::C:\llvm-binary\bin\libclang.dll
-        Write-Host ::add-path::C:\llvm-binary\bin
+        curl https://releases.llvm.org/9.0.0/LLVM-9.0.0-win64.exe -o llvm-installer.exe
+        7z x llvm-installer.exe -oC:/llvm-binary
+        echo ::set-env name=LIBCLANG_PATH::C:/llvm-binary/bin/libclang.dll
+        echo ::add-path::C:/llvm-binary/bin
 
     - name: Query Clang Version
       if: matrix.os == 'windows-latest'
       run: |
-        Get-Command clang.exe
+        where clang.exe
         clang.exe --version
 
     # Install wasm32 targets in order to build various tests throughout the
@@ -225,7 +285,17 @@ jobs:
     - run: cargo run -p run-examples
 
     # Build and test all features except for lightbeam
-    - run: cargo test --features test-programs/test_programs --all --exclude lightbeam
+    - run: |
+        cargo test \
+            --features test-programs/test_programs \
+            --all \
+            --exclude lightbeam \
+            --exclude peepmatic \
+            --exclude peepmatic-automata \
+            --exclude peepmatic-fuzzing \
+            --exclude peepmatic-macro \
+            --exclude peepmatic-runtime \
+            --exclude peepmatic-test
       env:
         RUST_BACKTRACE: 1
 
@@ -302,7 +372,6 @@ jobs:
       run: |
         echo ::set-env name=CARGO_BUILD_TARGET::${{ matrix.target }}
         rustup target add ${{ matrix.target }}
-      shell: bash
       if: matrix.target != ''
 
     - name: Install cross-compilation tools
@@ -333,13 +402,28 @@ jobs:
 
     # Build `wasmtime` and executables
     - run: $CENTOS cargo build --release --bin wasmtime
-      shell: bash
+
     # Build `libwasmtime.so`
     - run: $CENTOS cargo build --release --manifest-path crates/c-api/Cargo.toml
-      shell: bash
-    # Test what we just built
-    - run: $CENTOS cargo test --features test-programs/test_programs --release --all --exclude lightbeam
-      shell: bash
+
+    # Test what we just built.
+    #
+    # Ignore some optional dependencies that are used by features that aren't
+    # enabled by default, are tested in other, dedicated CI jobs, and which
+    # would increase build times here.
+    - run: |
+        $CENTOS cargo test \
+            --features test-programs/test_programs \
+            --release \
+            --all \
+            --exclude lightbeam \
+            --exclude peepmatic \
+            --exclude peepmatic-automata \
+            --exclude peepmatic-fuzzing \
+            --exclude peepmatic-macro \
+            --exclude peepmatic-runtime \
+            --exclude peepmatic-test \
+            --exclude wasmtime-fuzz
       env:
         RUST_BACKTRACE: 1
 
@@ -353,7 +437,6 @@ jobs:
     # something that we'll upload from this action.
 
     - run: mkdir dist
-      shell: bash
 
     # Move binaries to dist folder
     - run: cp target/release/wasmtime dist
@@ -361,10 +444,8 @@ jobs:
     - run: cp target/${{ matrix.target }}/release/wasmtime dist
       if: matrix.os != 'windows-latest' && matrix.target != ''
     - run: cp target/release/wasmtime.exe dist
-      shell: bash
       if: matrix.build == 'x86_64-windows'
     - run: cp target/x86_64-pc-windows-gnu/release/wasmtime.exe dist
-      shell: bash
       if: matrix.build == 'x86_64-mingw'
 
     # Move libwasmtime dylib to dist folder
@@ -375,10 +456,8 @@ jobs:
     - run: cp target/release/libwasmtime.{dylib,a} dist
       if: matrix.os == 'macos-latest'
     - run: cp target/release/wasmtime.{dll,lib,dll.lib} dist
-      shell: bash
       if: matrix.build == 'x86_64-windows'
     - run: cp target/x86_64-pc-windows-gnu/release/{wasmtime.dll,libwasmtime.a} dist
-      shell: bash
       if: matrix.build == 'x86_64-mingw'
 
     # Make a Windows MSI installer if we're on Windows
@@ -387,7 +466,6 @@ jobs:
         "$WIX/bin/candle" -arch x64 -out target/wasmtime.wixobj ci/wasmtime.wxs
         "$WIX/bin/light" -out dist/installer.msi target/wasmtime.wixobj -ext WixUtilExtension
         rm dist/installer.wixpdb
-      shell: bash
       if: matrix.build == 'x86_64-windows'
 
     - uses: actions/upload-artifact@v1
