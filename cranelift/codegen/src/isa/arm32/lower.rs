@@ -353,6 +353,30 @@ pub(crate) fn maybe_input_insn_via_conv<C: LowerCtx<I = Inst>>(
     None
 }
 
+pub(crate) fn lower_icmp_or_ifcmp_to_flags<C: LowerCtx<I = Inst>>(
+    ctx: &mut C,
+    insn: IRInst,
+    is_signed: bool,
+) {
+    let narrow_mode = match is_signed {
+        true => NarrowValueMode::SignExtend,
+        false => NarrowValueMode::ZeroExtend,
+    };
+    let inputs = [
+        InsnInput {
+            insn: insn,
+            input: 0,
+        },
+        InsnInput {
+            insn: insn,
+            input: 1,
+        },
+    ];
+    let rn = input_to_reg(ctx, inputs[0], narrow_mode);
+    let rm = input_to_reg(ctx, inputs[1], narrow_mode);
+    ctx.emit(Inst::Cmp { rn, rm });
+}
+
 //=============================================================================
 // Lowering-backend trait implementation.
 

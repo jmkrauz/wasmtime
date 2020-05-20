@@ -217,7 +217,7 @@ pub struct EmitState {
 impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
     type State = EmitState;
 
-    fn emit(&self, sink: &mut O, _flags: &settings::Flags, _state: &mut EmitState) {
+    fn emit(&self, sink: &mut O, flags: &settings::Flags, state: &mut EmitState) {
         match self {
             &Inst::AluRR { .. }
             | &Inst::AluRRImm5 { .. }
@@ -393,6 +393,42 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
                 sink.add_trap(srcloc, code);
                 sink.put2(0b11011110_00000000);
             }
+            &Inst::Push { ref reg_list } => match reg_list.len() {
+                0 => panic!("Unsupported Push case: {:?}", self),
+                1 => {
+                    let reg = u32::from(machreg_to_gpr(reg_list[0]));
+                    let inst: u32 = 0b1111100001001101_0000_101100000100 | (reg << 12);
+                    emit_32(inst, sink);
+                }
+                _ => {
+                    let mut inst: u32 = 0b1110100100101101 << 16;
+                    for reg in reg_list {
+                        inst |= 1 << machreg_to_gpr(*reg);
+                    }
+                    if inst & ((1 << 13) | (1 << 15)) != 0 {
+                        panic!("Unsupported Push case: {:?}", self);
+                    }
+                    emit_32(inst, sink);
+                }
+            },
+            &Inst::Pop { ref reg_list } => match reg_list.len() {
+                0 => panic!("Unsupported Pop case: {:?}", self),
+                1 => {
+                    let reg = u32::from(machreg_to_gpr(reg_list[0].to_reg()));
+                    let inst: u32 = 0b1111100001011101_0000_101100000100 | (reg << 12);
+                    emit_32(inst, sink);
+                }
+                _ => {
+                    let mut inst: u32 = 0b1110100010111101 << 16;
+                    for reg in reg_list {
+                        inst |= 1 << machreg_to_gpr(reg.to_reg());
+                    }
+                    if (inst & (1 << 14) != 0) && (inst & (1 << 15) != 0) {
+                        panic!("Unsupported Pop case: {:?}", self);
+                    }
+                    emit_32(inst, sink);
+                }
+            },
             &Inst::Call {
                 ref dest,
                 loc,
@@ -412,6 +448,21 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
                 if opcode.is_call() {
                     sink.add_call_site(loc, opcode);
                 }
+            }
+            &Inst::LoadExtName {
+                rt,
+                ref name,
+                offset,
+                srcloc,
+            } => {
+                let inst: u32 = (0b11111000_1_1011111 << 16) | 0x4;
+                emit_32(enc_32_regs(inst, None, None, Some(rt.to_reg()), None), sink);
+                let inst = Inst::Jump {
+                    dest: BranchTarget::ResolvedOffset(6),
+                };
+                inst.emit(sink, flags, state);
+                sink.add_reloc(srcloc, Reloc::Abs4, name, (offset + 1).into());
+                sink.put4(0);
             }
             &Inst::Ret => {
                 sink.put2(enc_16_mov(writable_pc_reg(), lr_reg()));

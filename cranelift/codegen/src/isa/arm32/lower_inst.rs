@@ -241,8 +241,13 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
             let trap_info = (ctx.srcloc(insn), inst_trapcode(ctx.data(insn)).unwrap());
             ctx.emit(Inst::Udf { trap_info })
         }
-        Opcode::Return => {
-            ctx.emit(Inst::Ret);
+        Opcode::FallthroughReturn | Opcode::Return => {
+            for (i, input) in inputs.iter().enumerate() {
+                let reg = input_to_reg(ctx, *input, NarrowValueMode::ZeroExtend);
+                let retval_reg = ctx.retval(i);
+                let ty = ctx.input_ty(insn, i);
+                ctx.emit(Inst::gen_move(retval_reg, reg, ty));
+            }
         }
         Opcode::Call | Opcode::CallIndirect => {
             let loc = ctx.srcloc(insn);
@@ -317,10 +322,21 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                     insn: branches[0],
                     input: 0,
                 };
-                if let Some(_icmp_insn) =
+                if let Some(icmp_insn) =
                     maybe_input_insn_via_conv(ctx, flag_input, Opcode::Icmp, Opcode::Bint)
                 {
-                    unimplemented!()
+                    let condcode = inst_condcode(ctx.data(icmp_insn)).unwrap();
+                    let cond = lower_condcode(condcode);
+                    let is_signed = condcode_is_signed(condcode);
+                    let negated = op0 == Opcode::Brz;
+                    let cond = if negated { cond.invert() } else { cond };
+
+                    lower_icmp_or_ifcmp_to_flags(ctx, icmp_insn, is_signed);
+                    ctx.emit(Inst::CondBr {
+                        taken,
+                        not_taken,
+                        kind: CondBrKind::Cond(cond),
+                    });
                 } else if let Some(_fcmp_insn) =
                     maybe_input_insn_via_conv(ctx, flag_input, Opcode::Fcmp, Opcode::Bint)
                 {

@@ -74,6 +74,15 @@ fn apply_reloc(
     };
 
     match r.reloc {
+        #[cfg(target_pointer_width = "32")]
+        Reloc::Abs4 => unsafe {
+            let reloc_address = body.add(r.offset as usize) as usize;
+            let reloc_addend = r.addend as isize;
+            let reloc_abs = (target_func_address as u32)
+                .checked_add(reloc_addend as u32)
+                .unwrap();
+            write_unaligned(reloc_address as *mut u32, reloc_abs);
+        },
         #[cfg(target_pointer_width = "64")]
         Reloc::Abs8 => unsafe {
             let reloc_address = body.add(r.offset as usize) as usize;

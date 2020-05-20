@@ -14,6 +14,7 @@ use regalloc::Map as RegallocMap;
 use regalloc::{RealReg, RealRegUniverse, Reg, RegClass, SpillSlot, VirtualReg, Writable};
 use regalloc::{RegUsageCollector, RegUsageMapper, Set};
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use smallvec::{smallvec, SmallVec};
 use std::string::{String, ToString};
@@ -166,22 +167,37 @@ pub enum Inst {
         trap_info: (SourceLoc, TrapCode),
     },
 
+    Push {
+        reg_list: SmallVec<[Reg; 16]>,
+    },
+
+    Pop {
+        reg_list: SmallVec<[Writable<Reg>; 16]>,
+    },
+
     /// A machine call instruction.
     Call {
-        dest: ExternalName,
-        uses: Set<Reg>,
-        defs: Set<Writable<Reg>>,
+        dest: Box<ExternalName>,
+        uses: Box<Set<Reg>>,
+        defs: Box<Set<Writable<Reg>>>,
+        loc: SourceLoc,
+        opcode: Opcode,
+    },
+    /// A machine indirect-call instruction.
+    CallInd {
+        rm: Reg,
+        uses: Box<Set<Reg>>,
+        defs: Box<Set<Writable<Reg>>>,
         loc: SourceLoc,
         opcode: Opcode,
     },
 
-    /// A machine indirect-call instruction, encoded as `blx`.
-    CallInd {
-        rm: Reg,
-        uses: Set<Reg>,
-        defs: Set<Writable<Reg>>,
-        loc: SourceLoc,
-        opcode: Opcode,
+    /// Load an inline symbol reference.
+    LoadExtName {
+        rt: Writable<Reg>,
+        name: ExternalName,
+        srcloc: SourceLoc,
+        offset: i32,
     },
 
     /// A return instruction is encoded as `mov pc, lr`, however it is more convenient if it is
@@ -319,8 +335,21 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             collector.add_def(rd);
             collector.add_use(rm);
         }
+        &Inst::Push { ref reg_list } => {
+            for reg in reg_list {
+                collector.add_use(*reg);
+            }
+        }
+        &Inst::Pop { ref reg_list } => {
+            for reg in reg_list {
+                collector.add_def(*reg);
+            }
+        }
         &Inst::CallInd { rm, .. } => {
             collector.add_use(rm);
+        }
+        &Inst::LoadExtName { rt, .. } => {
+            collector.add_def(rt);
         }
         &Inst::CondBr { ref kind, .. }
         | &Inst::CondBrLowered { ref kind, .. }
@@ -472,8 +501,21 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
             map_def(mapper, rd);
             map_use(mapper, rm);
         }
+        &mut Inst::Push { ref mut reg_list } => {
+            for reg in reg_list {
+                map_use(mapper, reg);
+            }
+        }
+        &mut Inst::Pop { ref mut reg_list } => {
+            for reg in reg_list {
+                map_def(mapper, reg);
+            }
+        }
         &mut Inst::CallInd { ref mut rm, .. } => {
             map_use(mapper, rm);
+        }
+        &mut Inst::LoadExtName { ref mut rt, .. } => {
+            map_def(mapper, rt);
         }
         &mut Inst::CondBr { ref mut kind, .. }
         | &mut Inst::CondBrLowered { ref mut kind, .. }
@@ -866,10 +908,39 @@ impl ShowWithRRU for Inst {
             }
             &Inst::Bkpt => "bkpt #0".to_string(),
             &Inst::Udf { .. } => "udf".to_string(),
+            &Inst::Push { ref reg_list } => {
+                assert!(!reg_list.is_empty());
+                let first_reg = reg_list[0].show_rru(mb_rru);
+                let regs: String = reg_list
+                    .iter()
+                    .skip(1)
+                    .map(|r| [",", &r.show_rru(mb_rru)].join(" "))
+                    .collect();
+                format!("push {{{}{}}}", first_reg, regs)
+            }
+            &Inst::Pop { ref reg_list } => {
+                assert!(!reg_list.is_empty());
+                let first_reg = reg_list[0].show_rru(mb_rru);
+                let regs: String = reg_list
+                    .iter()
+                    .skip(1)
+                    .map(|r| [",", &r.show_rru(mb_rru)].join(" "))
+                    .collect();
+                format!("pop {{{}{}}}", first_reg, regs)
+            }
             &Inst::Call { dest: _, .. } => format!("bl 0"),
             &Inst::CallInd { rm, .. } => {
                 let rm = rm.show_rru(mb_rru);
                 format!("blx {}", rm)
+            }
+            &Inst::LoadExtName {
+                rt,
+                ref name,
+                offset,
+                srcloc: _srcloc,
+            } => {
+                let rt = rt.show_rru(mb_rru);
+                format!("ldr {} [pc, #4] ; b 4 ; data {:?} + {}", rt, name, offset)
             }
             &Inst::Ret => "mov pc, lr".to_string(),
             &Inst::EpiloguePlaceholder => "epilogue placeholder".to_string(),

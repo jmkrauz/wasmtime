@@ -9,11 +9,13 @@ use crate::isa::arm32::{self, inst::*};
 use crate::machinst::*;
 use crate::settings;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::mem;
 use log::debug;
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
+use smallvec::SmallVec;
 
 /// A location for an argument or return value.
 #[derive(Clone, Copy, Debug)]
@@ -45,18 +47,13 @@ static CALLEE_SAVED_GPR: &[bool] = &[
 ///
 /// Returns the list of argument locations, and the stack-space used (rounded up
 /// to a 8-byte-aligned boundary).
-fn compute_arg_locs(params: &[ir::AbiParam], arg_mode: bool) -> (Vec<ABIArg>, u32) {
+fn compute_arg_locs(params: &[ir::AbiParam]) -> (Vec<ABIArg>, u32) {
     // See AAPCS ABI https://developer.arm.com/docs/ihi0042/latest
     // r9 is an additional callee-saved variable register.
     let mut next_rreg = 0;
     let mut next_stack: u32 = 0;
     let mut ret = vec![];
-
-    let max_rreg = if arg_mode {
-        3 // use r0-r3 for arguments
-    } else {
-        1 // use r0-r1 for returns
-    };
+    let max_rreg = 3;
 
     for param in params {
         // Validate "purpose".
@@ -92,8 +89,8 @@ fn compute_arg_locs(params: &[ir::AbiParam], arg_mode: bool) -> (Vec<ABIArg>, u3
 impl ABISig {
     fn from_func_sig(sig: &ir::Signature) -> ABISig {
         // Compute args and retvals from signature.
-        let (args, stack_arg_space) = compute_arg_locs(&sig.params, true);
-        let (rets, _) = compute_arg_locs(&sig.returns, false);
+        let (args, stack_arg_space) = compute_arg_locs(&sig.params);
+        let (rets, _) = compute_arg_locs(&sig.returns);
 
         // Verify that there are no return values on the stack.
         assert!(rets.iter().all(|a| match a {
@@ -130,17 +127,6 @@ pub struct Arm32ABIBody {
     /// Whether or not this function is a "leaf", meaning it calls no other
     /// functions
     is_leaf: bool,
-    /// If this function has a stack limit specified, then `Reg` is where the
-    /// stack limit will be located after the instructions specified have been
-    /// executed.
-    ///
-    /// Note that this is intended for insertion into the prologue, if
-    /// present. Also note that because the instructions here execute in the
-    /// prologue this happens after legalization/register allocation/etc so we
-    /// need to be extremely careful with each instruction. The instructions are
-    /// manually register-allocated and carefully only use caller-saved
-    /// registers and keep nothing live after this sequence of instructions.
-    stack_limit: Option<(Reg, Vec<Inst>)>,
 }
 
 fn in_int_reg(ty: ir::Type) -> bool {
@@ -185,6 +171,22 @@ fn store_stack(mem: MemArg, from_reg: Reg, ty: Type) -> Inst {
         }
         _ => unimplemented!("store_stack({})", ty),
     }
+}
+
+fn is_callee_save(r: RealReg) -> bool {
+    match r.get_class() {
+        RegClass::I32 => match r.get_hw_encoding() as u8 {
+            n if n >= 4 && n <= 11 => true,
+            _ => false,
+        },
+        _ => unimplemented!(),
+    }
+}
+
+fn get_callee_saves(regs: Vec<Writable<RealReg>>) -> Vec<Writable<RealReg>> {
+    regs.into_iter()
+        .filter(|r| is_callee_save(r.to_reg()))
+        .collect()
 }
 
 fn is_caller_save(r: RealReg) -> bool {
@@ -295,15 +297,6 @@ impl Arm32ABIBody {
             stackslots.push(off);
         }
 
-        // Figure out what instructions, if any, will be needed to check the
-        // stack limit. This can either be specified as a special-purpose
-        // argument or as a global value which often calculates the stack limit
-        // from the arguments.
-        let stack_limit =
-            get_special_purpose_param_register(f, &sig, ir::ArgumentPurpose::StackLimit)
-                .map(|reg| (reg, Vec::new()))
-                .or_else(|| f.stack_limit.map(|gv| gen_stack_limit(f, &sig, gv)));
-
         Self {
             sig,
             stackslots,
@@ -314,7 +307,6 @@ impl Arm32ABIBody {
             call_conv,
             flags,
             is_leaf: f.is_leaf(),
-            stack_limit,
         }
     }
 }
@@ -480,12 +472,113 @@ impl ABIBody for Arm32ABIBody {
     }
 
     fn gen_prologue(&mut self) -> Vec<Inst> {
-        self.total_frame_size = Some(0);
-        vec![]
+        let mut insts = vec![];
+        let mut reg_list = SmallVec::<[Reg; 16]>::new();
+
+        let mut callee_saved_used = 0;
+
+        let clobbered = get_callee_saves(self.clobbered.to_vec());
+        for reg in clobbered {
+            let reg = reg.to_reg();
+            match reg.get_class() {
+                RegClass::I32 => {
+                    reg_list.push(reg.to_reg());
+                    callee_saved_used += 4;
+                }
+                _ => unimplemented!(),
+            }
+        }
+
+        if !self.is_leaf {
+            callee_saved_used += 4;
+        }
+
+        let total_stacksize = self.stackslots_size + 4 * self.spillslots.unwrap() as u32;
+        let frame_size = if total_stacksize == 0 && callee_saved_used % 8 == 4 {
+            reg_list.push(ip_reg());
+            0
+        } else if (total_stacksize + callee_saved_used) % 8 == 0 {
+            total_stacksize
+        } else {
+            total_stacksize + 4
+        };
+
+        if !self.is_leaf {
+            reg_list.push(lr_reg());
+        }
+        if !reg_list.is_empty() {
+            insts.push(Inst::Push { reg_list });
+        }
+
+        // Explicitly allocate the frame.
+        if frame_size > 0 {
+            insts.extend(Inst::load_constant(writable_ip_reg(), frame_size));
+            insts.push(Inst::AluRRRShift {
+                alu_op: ALUOp::Sub,
+                rd: writable_sp_reg(),
+                rn: sp_reg(),
+                rm: ip_reg(),
+                shift: None,
+            });
+        }
+
+        // Stash this value.  We'll need it for the epilogue.
+        debug_assert!(self.total_frame_size.is_none());
+        self.total_frame_size = Some(frame_size);
+        insts
     }
 
     fn gen_epilogue(&self) -> Vec<Inst> {
-        vec![Inst::Ret]
+        let mut insts = vec![];
+
+        // Undo what we did in the prologue.
+
+        // Clear the spill area and the 8-alignment padding below it.
+        let frame_size = self.total_frame_size.unwrap();
+        if frame_size > 0 {
+            insts.extend(Inst::load_constant(writable_ip_reg(), frame_size));
+            insts.push(Inst::AluRRRShift {
+                alu_op: ALUOp::Add,
+                rd: writable_sp_reg(),
+                rn: sp_reg(),
+                rm: ip_reg(),
+                shift: None,
+            });
+        }
+
+        let mut reg_list = SmallVec::<[Writable<Reg>; 16]>::new();
+        let mut callee_saved_used = 0;
+
+        // Restore regs.
+        let clobbered = get_callee_saves(self.clobbered.to_vec());
+        for reg in clobbered.into_iter().rev() {
+            let reg = reg.to_reg();
+            match reg.get_class() {
+                RegClass::I32 => {
+                    reg_list.push(Writable::from_reg(reg.to_reg()));
+                    callee_saved_used += 4;
+                }
+                _ => unimplemented!(),
+            }
+        }
+        
+        if !self.is_leaf {
+            callee_saved_used += 4;
+        }
+        if frame_size == 0 && callee_saved_used % 8 == 4 {
+            reg_list.push(writable_ip_reg());
+        }
+        if !self.is_leaf {
+            reg_list.push(writable_pc_reg());
+        }
+        if !reg_list.is_empty() {
+            insts.push(Inst::Pop { reg_list });
+        }
+        if self.is_leaf {
+            insts.push(Inst::Ret {});
+        }
+
+        insts
     }
 
     fn frame_size(&self) -> u32 {
@@ -661,17 +754,31 @@ impl ABICall for Arm32ABICall {
         );
         match &self.dest {
             &CallDest::ExtName(ref name, RelocDistance::Near) => ctx.emit(Inst::Call {
-                dest: name.clone(),
-                uses,
-                defs,
+                dest: Box::new(name.clone()),
+                uses: Box::new(uses),
+                defs: Box::new(defs),
                 loc: self.loc,
                 opcode: self.opcode,
             }),
-            &CallDest::ExtName(ref _name, RelocDistance::Far) => unimplemented!(),
+            &CallDest::ExtName(ref name, RelocDistance::Far) => {
+                ctx.emit(Inst::LoadExtName {
+                    rt: writable_ip_reg(),
+                    name: name.clone(),
+                    offset: 0,
+                    srcloc: self.loc,
+                });
+                ctx.emit(Inst::CallInd {
+                    rm: ip_reg(),
+                    uses: Box::new(uses),
+                    defs: Box::new(defs),
+                    loc: self.loc,
+                    opcode: self.opcode,
+                });
+            }
             &CallDest::Reg(reg) => ctx.emit(Inst::CallInd {
                 rm: reg,
-                uses,
-                defs,
+                uses: Box::new(uses),
+                defs: Box::new(defs),
                 loc: self.loc,
                 opcode: self.opcode,
             }),

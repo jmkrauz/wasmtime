@@ -5,7 +5,7 @@ use std::any::Any;
 use std::mem;
 use wasmtime_environ::EntityIndex;
 use wasmtime_jit::{CompiledModule, Resolver};
-use wasmtime_runtime::{InstantiationError, SignatureRegistry, VMContext, VMFunctionBody};
+use wasmtime_runtime::{InstantiationError, SignatureRegistry, VMContext};
 
 struct SimpleResolver<'a> {
     imports: &'a [Extern],
@@ -67,10 +67,20 @@ fn instantiate(
                 _ => unreachable!(), // valid modules shouldn't hit this
             };
             super::func::catch_traps(instance.vmctx_ptr(), store, || {
-                mem::transmute::<
-                    *const VMFunctionBody,
-                    unsafe extern "C" fn(*mut VMContext, *mut VMContext),
-                >(f.address)(f.vmctx, instance.vmctx_ptr())
+                #[cfg(not(target_arch = "arm"))]
+                {
+                    mem::transmute::<
+                        *const wasmtime_runtime::VMFunctionBody,
+                        unsafe extern "C" fn(*mut VMContext, *mut VMContext),
+                    >(f.address)(f.vmctx, instance.vmctx_ptr())
+                }
+
+                #[cfg(target_arch = "arm")]
+                {
+                    mem::transmute::<usize, unsafe extern "C" fn(*mut VMContext, *mut VMContext)>(
+                        f.address as usize | 1,
+                    )(f.vmctx, instance.vmctx_ptr());
+                }
             })?;
         }
 
