@@ -73,19 +73,23 @@ impl TargetIsa for TargetIsaAdapter {
 
     fn encode(
         &self,
-        _func: &ir::Function,
-        _inst: &ir::InstructionData,
-        _ctrl_typevar: ir::Type,
+        func: &ir::Function,
+        inst: &ir::InstructionData,
+        ctrl_typevar: ir::Type,
     ) -> Result<Encoding, Legalize> {
-        panic!("Should not be called when new-style backend is available!")
+        if let Some(action) = self.backend.legalize_inst(func, inst, ctrl_typevar) {
+            Err(action)
+        } else {
+            Ok(Encoding::new(0, 0))
+        }
     }
 
     fn encoding_info(&self) -> EncInfo {
         panic!("Should not be called when new-style backend is available!")
     }
 
-    fn legalize_signature(&self, _sig: &mut Cow<ir::Signature>, _current: bool) {
-        panic!("Should not be called when new-style backend is available!")
+    fn legalize_signature(&self, sig: &mut Cow<ir::Signature>, current: bool) {
+        self.backend.legalize_signature(sig, current);
     }
 
     fn regclass_for_abi_type(&self, _ty: ir::Type) -> RegClass {

@@ -1,6 +1,7 @@
 //! 32-bit ARM Instruction Set Architecture.
 
-use crate::ir::Function;
+use crate::ir::{self, Function};
+use crate::isa;
 use crate::isa::Builder as IsaBuilder;
 use crate::machinst::{
     compile, MachBackend, MachCompileResult, ShowWithRRU, TargetIsaAdapter, VCode,
@@ -10,11 +11,13 @@ use crate::settings;
 
 use alloc::boxed::Box;
 use regalloc::RealRegUniverse;
+use std::borrow::Cow;
 use target_lexicon::{Architecture, ArmArchitecture, Triple};
 
 // New backend:
 mod abi;
 mod inst;
+mod legalize;
 mod lower;
 mod lower_inst;
 
@@ -88,6 +91,19 @@ impl MachBackend for Arm32Backend {
 
     fn reg_universe(&self) -> &RealRegUniverse {
         &self.reg_universe
+    }
+
+    fn legalize_inst(
+        &self,
+        func: &ir::Function,
+        inst: &ir::InstructionData,
+        ctrl_typevar: ir::Type,
+    ) -> Option<isa::Legalize> {
+        legalize::legalize_inst(func, inst, ctrl_typevar)
+    }
+
+    fn legalize_signature(&self, sig: &mut Cow<ir::Signature>, _current: bool) {
+        abi::legalize_signature(sig);
     }
 }
 

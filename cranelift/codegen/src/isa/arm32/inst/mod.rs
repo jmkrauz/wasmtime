@@ -604,6 +604,7 @@ impl MachInst for Inst {
     fn rc_for_type(ty: Type) -> CodegenResult<RegClass> {
         match ty {
             I8 | I16 | I32 | B1 | B8 | B16 | B32 => Ok(RegClass::I32),
+            IFLAGS | FFLAGS => Ok(RegClass::I32),
             _ => Err(CodegenError::Unsupported(format!(
                 "Unexpected SSA-value type: {}",
                 ty

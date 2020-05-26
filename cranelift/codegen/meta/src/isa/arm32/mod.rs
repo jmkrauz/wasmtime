@@ -7,6 +7,8 @@ use crate::cdsl::settings::{SettingGroup, SettingGroupBuilder};
 
 use crate::shared::Definitions as SharedDefinitions;
 
+mod legalize;
+
 fn define_settings(_shared: &SettingGroup) -> SettingGroup {
     let setting = SettingGroupBuilder::new("arm32");
     setting.build()
@@ -54,18 +56,19 @@ pub(crate) fn define(shared_defs: &mut SharedDefinitions) -> TargetIsa {
     let regs = define_regs();
 
     let inst_group = InstructionGroupBuilder::new(&mut shared_defs.all_instructions).build();
+    legalize::define(shared_defs);
 
     // CPU modes for 32-bit ARM and Thumb2.
     let mut a32 = CpuMode::new("A32");
     let mut t32 = CpuMode::new("T32");
 
     // TODO refine these.
-    let expand_flags = shared_defs.transform_groups.by_name("expand_flags");
-    let narrow_flags = shared_defs.transform_groups.by_name("narrow_flags");
-    a32.legalize_monomorphic(expand_flags);
-    t32.legalize_monomorphic(expand_flags);
-    a32.legalize_default(narrow_flags);
-    t32.legalize_default(narrow_flags);
+    let arm32_expand = shared_defs.transform_groups.by_name("arm32_expand");
+    let arm32_narrow = shared_defs.transform_groups.by_name("arm32_narrow");
+    a32.legalize_monomorphic(arm32_expand);
+    t32.legalize_monomorphic(arm32_expand);
+    a32.legalize_default(arm32_narrow);
+    t32.legalize_default(arm32_narrow);
 
     let cpu_modes = vec![a32, t32];
 

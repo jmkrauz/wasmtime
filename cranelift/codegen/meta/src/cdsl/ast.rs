@@ -687,6 +687,11 @@ macro_rules! def_rhs {
     ($inst:ident.$type:ident($($src:expr),*)) => {
         ExprBuilder::apply($inst.bind($type).into(), vec![$($src.clone().into()),*])
     };
+
+    // inst.type1.type2(a, b, c)
+    ($inst:ident.$type1:ident.$type2:ident($($src:expr),*)) => {
+        ExprBuilder::apply($inst.bind($type1).bind($type2).into(), vec![$($src.clone().into()),*])
+    };
 }
 
 // Helper macro to define legalization recipes.

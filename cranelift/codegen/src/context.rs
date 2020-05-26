@@ -324,7 +324,7 @@ impl Context {
         // TODO: Avoid doing this when legalization doesn't actually mutate the CFG.
         self.domtree.clear();
         self.loop_analysis.clear();
-        if isa.get_mach_backend().is_some() {
+        if isa.get_mach_backend().is_some() && isa.pointer_bits() == 64 {
             // Run some specific legalizations only.
             simple_legalize(&mut self.func, &mut self.cfg, isa);
             self.verify_if(isa)

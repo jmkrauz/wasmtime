@@ -1,14 +1,16 @@
 //! Implementation of the 32-bit ARM ABI.
 
+use crate::abi::{legalize_args, ArgAction, ArgAssigner, ValueConversion};
 use crate::ir;
 use crate::ir::types;
 use crate::ir::types::*;
-use crate::ir::{ArgumentExtension, StackSlot};
-use crate::isa;
+use crate::ir::{AbiParam, ArgumentExtension, ArgumentLoc, StackSlot};
 use crate::isa::arm32::{self, inst::*};
+use crate::isa::{self, RegUnit};
 use crate::machinst::*;
 use crate::settings;
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::convert::TryInto;
@@ -16,6 +18,84 @@ use core::mem;
 use log::debug;
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
 use smallvec::SmallVec;
+
+struct Args {
+    r_used: u32,
+    r_limit: u32,
+    stack_offset: u32,
+}
+
+impl Args {
+    fn new() -> Self {
+        Self {
+            r_used: 0,
+            r_limit: 4,
+            stack_offset: 0,
+        }
+    }
+}
+
+impl ArgAssigner for Args {
+    fn assign(&mut self, arg: &AbiParam) -> ArgAction {
+        fn align(value: u32, to: u32) -> u32 {
+            (value + to - 1) & !(to - 1)
+        }
+
+        let ty = arg.value_type;
+
+        // Check for a legal type.
+        // SIMD instructions are currently no implemented, so break down vectors
+        if ty.is_vector() {
+            return ValueConversion::VectorSplit.into();
+        }
+
+        // Large integers and booleans are broken down to fit in a register.
+        if !ty.is_float() && ty.bits() > 32 {
+            // Align registers and stack to a multiple of two pointers.
+            self.r_used = align(self.r_used, 2);
+            self.stack_offset = align(self.stack_offset, 8);
+            return ValueConversion::IntSplit.into();
+        }
+
+        // Small integers are extended to the size of a pointer register.
+        if ty.is_int() && ty.bits() < 32 {
+            match arg.extension {
+                ArgumentExtension::None => {}
+                ArgumentExtension::Uext => return ValueConversion::Uext(I32).into(),
+                ArgumentExtension::Sext => return ValueConversion::Sext(I32).into(),
+            }
+        }
+
+        // Try to use a GPR.
+        if !ty.is_float() && self.r_used < self.r_limit {
+            // Assign to a register.
+            let reg = self.r_used as RegUnit;
+            self.r_used += 1;
+            return ArgumentLoc::Reg(reg).into();
+        }
+
+        if ty.is_float() {
+            unimplemented!()
+        }
+
+        // Assign a stack location.
+        let loc = ArgumentLoc::Stack(self.stack_offset as i32);
+        self.stack_offset += 4;
+        loc.into()
+    }
+}
+
+pub fn legalize_signature(sig: &mut Cow<ir::Signature>) {
+    let mut args = Args::new();
+    if let Some(new_params) = legalize_args(&sig.params, &mut args) {
+        sig.to_mut().params = new_params;
+    }
+
+    let mut rets = Args::new();
+    if let Some(new_returns) = legalize_args(&sig.returns, &mut rets) {
+        sig.to_mut().returns = new_returns;
+    }
+}
 
 /// A location for an argument or return value.
 #[derive(Clone, Copy, Debug)]
@@ -50,10 +130,8 @@ static CALLEE_SAVED_GPR: &[bool] = &[
 fn compute_arg_locs(params: &[ir::AbiParam]) -> (Vec<ABIArg>, u32) {
     // See AAPCS ABI https://developer.arm.com/docs/ihi0042/latest
     // r9 is an additional callee-saved variable register.
-    let mut next_rreg = 0;
-    let mut next_stack: u32 = 0;
+    let mut stack_off: u32 = 0;
     let mut ret = vec![];
-    let max_rreg = 3;
 
     for param in params {
         // Validate "purpose".
@@ -65,25 +143,28 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> (Vec<ABIArg>, u32) {
             ),
         }
 
-        if in_int_reg(param.value_type) {
-            if next_rreg <= max_rreg {
-                ret.push(ABIArg::Reg(rreg(next_rreg).to_real_reg(), param.value_type));
-                next_rreg += 1;
-            } else {
-                ret.push(ABIArg::Stack(
-                    next_stack.try_into().unwrap(),
-                    param.value_type,
-                ));
-                next_stack += 4;
+        let ty = param.value_type;
+        match param.location {
+            ArgumentLoc::Reg(reg) => {
+                let reg: u8 = reg.try_into().unwrap();
+                ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty))
             }
-        } else {
-            unimplemented!("param value type {}", param.value_type)
+            ArgumentLoc::Stack(off) => {
+                ret.push(ABIArg::Stack(off, ty));
+                let off: u32 = off.try_into().unwrap();
+                if off > stack_off {
+                    stack_off = off;
+                }
+            }
+            ArgumentLoc::Unassigned => {
+                panic!("Unassigned param location {:?}", param);
+            }
         }
     }
 
-    next_stack = (next_stack + 7) & !7;
+    stack_off = (stack_off + 7) & !7;
 
-    (ret, next_stack)
+    (ret, stack_off)
 }
 
 impl ABISig {
@@ -91,12 +172,6 @@ impl ABISig {
         // Compute args and retvals from signature.
         let (args, stack_arg_space) = compute_arg_locs(&sig.params);
         let (rets, _) = compute_arg_locs(&sig.returns);
-
-        // Verify that there are no return values on the stack.
-        assert!(rets.iter().all(|a| match a {
-            &ABIArg::Stack(..) => false,
-            _ => true,
-        }));
 
         ABISig {
             args,
@@ -561,7 +636,7 @@ impl ABIBody for Arm32ABIBody {
                 _ => unimplemented!(),
             }
         }
-        
+
         if !self.is_leaf {
             callee_saved_used += 4;
         }
