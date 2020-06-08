@@ -2,7 +2,7 @@ use crate::cdsl::xform::TransformGroupBuilder;
 use crate::shared::Definitions as SharedDefinitions;
 
 pub(crate) fn define(shared: &mut SharedDefinitions) {
-    let expand = TransformGroupBuilder::new(
+    let mut expand = TransformGroupBuilder::new(
         "arm32_expand",
         r#"
     Legalize instructions by expansion.
@@ -28,6 +28,7 @@ pub(crate) fn define(shared: &mut SharedDefinitions) {
     let rotl = insts.by_name("rotl");
     let rotr = insts.by_name("rotr");
     let sdiv = insts.by_name("sdiv");
+    let spill = insts.by_name("spill");
     let srem = insts.by_name("srem");
     let sshr = insts.by_name("sshr");
     let udiv = insts.by_name("udiv");
@@ -48,6 +49,8 @@ pub(crate) fn define(shared: &mut SharedDefinitions) {
     narrow.custom_legalize(sshr, "narrow_sshr");
     narrow.custom_legalize(rotr, "narrow_rotr");
     narrow.custom_legalize(rotl, "narrow_rotl");
+
+    expand.custom_legalize(spill, "expand_spill");
 
     expand.build_and_add_to(&mut shared.transform_groups);
     narrow.build_and_add_to(&mut shared.transform_groups);

@@ -2,13 +2,16 @@
 
 use crate::ir::types::*;
 use crate::ir::Inst as IRInst;
-use crate::ir::Opcode;
+use crate::ir::{InstructionData, Opcode};
 use crate::machinst::lower::*;
 use crate::machinst::*;
 
 use crate::isa::arm32::abi::*;
 use crate::isa::arm32::inst::*;
 
+use regalloc::RegClass;
+
+use core::convert::TryFrom;
 use smallvec::SmallVec;
 
 use super::lower::*;
@@ -23,7 +26,11 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
         .map(|i| InsnOutput { insn, output: i })
         .collect();
     let ty = if outputs.len() > 0 {
-        Some(ctx.output_ty(insn, 0))
+        let ty = ctx.output_ty(insn, 0);
+        if ty.bits() > 32 {
+            panic!("Cannot lower inst with type {}!", ty);
+        }
+        Some(ty)
     } else {
         None
     };
@@ -35,7 +42,13 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
             lower_constant_int(ctx, rd, value);
         }
         Opcode::Iadd
+        | Opcode::IaddIfcin
+        | Opcode::IaddIfcout
+        | Opcode::IaddIfcarry
         | Opcode::Isub
+        | Opcode::IsubIfbin
+        | Opcode::IsubIfbout
+        | Opcode::IsubIfborrow
         | Opcode::Band
         | Opcode::Bor
         | Opcode::Bxor
@@ -46,7 +59,13 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
             let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
             let alu_op = match op {
                 Opcode::Iadd => ALUOp::Add,
+                Opcode::IaddIfcin => ALUOp::Adc,
+                Opcode::IaddIfcout => ALUOp::Adds,
+                Opcode::IaddIfcarry => ALUOp::Adcs,
                 Opcode::Isub => ALUOp::Sub,
+                Opcode::IsubIfbin => ALUOp::Sbc,
+                Opcode::IsubIfbout => ALUOp::Subs,
+                Opcode::IsubIfborrow => ALUOp::Sbcs,
                 Opcode::Band => ALUOp::And,
                 Opcode::Bor => ALUOp::Orr,
                 Opcode::Bxor => ALUOp::Eor,
@@ -71,9 +90,15 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
         | Opcode::Ushr
         | Opcode::Sshr
         | Opcode::Rotr => {
+            match ty {
+                Some(I32) | Some(B32) => {}
+                _ => unimplemented!(),
+            }
+
             let rd = output_to_reg(ctx, outputs[0]);
             let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+
             let alu_op = match op {
                 Opcode::SaddSat => ALUOp::Qadd,
                 Opcode::SsubSat => ALUOp::Qsub,
@@ -87,6 +112,64 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
                 _ => unreachable!(),
             };
             ctx.emit(Inst::AluRRR { alu_op, rd, rn, rm });
+        }
+        Opcode::Smulhi | Opcode::Umulhi => {
+            let ty = ty.unwrap();
+            let is_signed = op == Opcode::Smulhi;
+            match ty {
+                I32 => {
+                    let rd_hi = output_to_reg(ctx, outputs[0]);
+                    let rd_lo = ctx.tmp(RegClass::I32, ty);
+                    let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+                    let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+                    let alu_op = if is_signed {
+                        ALUOp::Smull
+                    } else {
+                        ALUOp::Umull
+                    };
+                    ctx.emit(Inst::AluRRRR {
+                        alu_op,
+                        rd_hi,
+                        rd_lo,
+                        rn,
+                        rm,
+                    });
+                }
+                I16 | I8 => {
+                    let narrow_mode = if is_signed {
+                        NarrowValueMode::SignExtend
+                    } else {
+                        NarrowValueMode::ZeroExtend
+                    };
+                    let rd = output_to_reg(ctx, outputs[0]);
+                    let rn = input_to_reg(ctx, inputs[0], narrow_mode);
+                    let rm = input_to_reg(ctx, inputs[1], narrow_mode);
+                    ctx.emit(Inst::AluRRR {
+                        alu_op: ALUOp::Mul,
+                        rd,
+                        rn,
+                        rm,
+                    });
+                    let shift_amt = if ty == I16 { 16 } else { 8 };
+                    let alu_op = if is_signed { ALUOp::Asr } else { ALUOp::Lsr };
+                    ctx.emit(Inst::AluRRImm8 {
+                        alu_op,
+                        rd,
+                        rn: rd.to_reg(),
+                        imm8: shift_amt,
+                    });
+                }
+                _ => panic!("Unexpected type {} in lower {}!", ty, op),
+            }
+        }
+        Opcode::Bnot => {
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            ctx.emit(Inst::AluRR {
+                alu_op: ALUOp::Mvn,
+                rd,
+                rm,
+            });
         }
         Opcode::Icmp => {
             let condcode = inst_condcode(ctx.data(insn)).unwrap();
@@ -214,18 +297,23 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
             let input_ty = ctx.input_ty(insn, 0);
             let from_bits = ty_bits(input_ty) as u8;
             let to_bits = ty_bits(output_ty) as u8;
+            let signed = op == Opcode::Sextend;
+            let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let rd = output_to_reg(ctx, outputs[0]);
 
             if to_bits != 32 {
                 unimplemented!()
             }
 
-            if from_bits < to_bits {
-                let signed = op == Opcode::Sextend;
-                // If we reach this point, we weren't able to incorporate the extend as
-                // a register-mode on another instruction, so we have a 'None'
-                // narrow-value/extend mode here, and we emit the explicit instruction.
-                let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
-                let rd = output_to_reg(ctx, outputs[0]);
+            if from_bits == 1 {
+                assert!(!signed);
+                ctx.emit(Inst::AluRRImm8 {
+                    alu_op: ALUOp::And,
+                    rd,
+                    rn: rd.to_reg(),
+                    imm8: 0x1,
+                });
+            } else if from_bits < to_bits {
                 ctx.emit(Inst::Extend {
                     rd,
                     rm,
@@ -233,6 +321,56 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
                     signed,
                 });
             }
+        }
+        Opcode::Bint | Opcode::Breduce | Opcode::Bextend | Opcode::Ireduce => {
+            let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
+            let rd = output_to_reg(ctx, outputs[0]);
+            let ty = ctx.input_ty(insn, 0);
+            ctx.emit(Inst::gen_move(rd, rn, ty));
+        }
+        Opcode::Copy => {
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let ty = ctx.input_ty(insn, 0);
+            ctx.emit(Inst::gen_move(rd, rn, ty));
+        }
+        Opcode::StackAddr | Opcode::StackLoad => {
+            let (stack_slot, offset) = match *ctx.data(insn) {
+                InstructionData::StackLoad {
+                    opcode: Opcode::StackAddr,
+                    stack_slot,
+                    offset,
+                } => (stack_slot, offset),
+                _ => unreachable!(),
+            };
+            let rd = output_to_reg(ctx, outputs[0]);
+            let offset: i32 = offset.into();
+            let offset = u32::try_from(offset).unwrap();
+            let inst = if op == Opcode::StackAddr {
+                ctx.abi().stackslot_addr(stack_slot, offset, rd)
+            } else {
+                ctx.abi()
+                    .load_stackslot(stack_slot, offset, ty.unwrap(), rd)
+            };
+            ctx.emit(inst);
+        }
+        Opcode::StackStore => {
+            let (stack_slot, offset) = match *ctx.data(insn) {
+                InstructionData::StackStore {
+                    opcode: Opcode::StackStore,
+                    stack_slot,
+                    offset,
+                    ..
+                } => (stack_slot, offset),
+                _ => unreachable!(),
+            };
+            let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let ty = ctx.input_ty(insn, 0);
+            let offset: i32 = offset.into();
+            let inst =
+                ctx.abi()
+                    .store_stackslot(stack_slot, u32::try_from(offset).unwrap(), ty, rn);
+            ctx.emit(inst);
         }
         Opcode::Debugtrap => {
             ctx.emit(Inst::Bkpt);
@@ -272,19 +410,12 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
                 }
                 _ => unreachable!(),
             };
-
-            abi.emit_stack_pre_adjust(ctx);
             assert!(inputs.len() == abi.num_args());
-            for (i, input) in inputs.iter().enumerate() {
-                let arg_reg = input_to_reg(ctx, *input, NarrowValueMode::None);
-                abi.emit_copy_reg_to_arg(ctx, i, arg_reg);
-            }
             abi.emit_call(ctx);
             for (i, output) in outputs.iter().enumerate() {
                 let retval_reg = output_to_reg(ctx, *output);
                 abi.emit_copy_retval_to_reg(ctx, i, retval_reg);
             }
-            abi.emit_stack_post_adjust(ctx);
         }
         _ => panic!("Lowering {} unimplemented!", op),
     }

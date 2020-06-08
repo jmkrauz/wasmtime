@@ -34,13 +34,19 @@ pub use self::regs::*;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ALUOp {
     Add,
+    Adds,
     Adc,
+    Adcs,
     Qadd,
     Sub,
+    Subs,
     Sbc,
+    Sbcs,
     Rsb,
     Qsub,
     Mul,
+    Smull,
+    Umull,
     Udiv,
     Sdiv,
     And,
@@ -84,16 +90,29 @@ pub enum Inst {
         rm: Reg,
     },
 
-    /// An ALU operation with a register source, an immediate-5 source and destination register.
-    AluRRImm5 {
+    AluRRRR {
         alu_op: ALUOp,
-        rd: Writable<Reg>,
+        rd_hi: Writable<Reg>,
+        rd_lo: Writable<Reg>,
+        rn: Reg,
         rm: Reg,
-        imm5: u8,
     },
 
-    /// An ALU operation with a register source, which is also a destination register
-    /// and an immediate-8 source.
+    AluRRImm12 {
+        alu_op: ALUOp,
+        rd: Writable<Reg>,
+        rn: Reg,
+        imm12: u16,
+    },
+
+    // https://static.docs.arm.com/ddi0406/c/DDI0406C_C_arm_architecture_reference_manual.pdf#G10.4954509
+    AluRRImm8 {
+        alu_op: ALUOp,
+        rd: Writable<Reg>,
+        rn: Reg,
+        imm8: u8,
+    },
+
     AluRImm8 {
         alu_op: ALUOp,
         rd: Writable<Reg>,
@@ -104,12 +123,6 @@ pub enum Inst {
     Mov {
         rd: Writable<Reg>,
         rm: Reg,
-    },
-
-    /// Move with an immediate-8 source and one register destination.
-    MovImm8 {
-        rd: Writable<Reg>,
-        imm8: u8,
     },
 
     MovImm16 {
@@ -125,6 +138,11 @@ pub enum Inst {
     Cmp {
         rn: Reg,
         rm: Reg,
+    },
+
+    CmpImm8 {
+        rn: Reg,
+        imm8: u8,
     },
 
     Store {
@@ -299,9 +317,25 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             collector.add_def(rd);
             collector.add_use(rm);
         }
-        &Inst::AluRRImm5 { rd, rm, .. } => {
-            collector.add_def(rd);
+        &Inst::AluRRRR {
+            rd_hi,
+            rd_lo,
+            rn,
+            rm,
+            ..
+        } => {
+            collector.add_def(rd_hi);
+            collector.add_def(rd_lo);
+            collector.add_use(rn);
             collector.add_use(rm);
+        }
+        &Inst::AluRRImm12 { rd, rn, .. } => {
+            collector.add_def(rd);
+            collector.add_use(rn);
+        }
+        &Inst::AluRRImm8 { rd, rn, .. } => {
+            collector.add_def(rd);
+            collector.add_use(rn);
         }
         &Inst::AluRImm8 { rd, .. } => {
             collector.add_def(rd);
@@ -309,9 +343,6 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Mov { rd, rm, .. } => {
             collector.add_def(rd);
             collector.add_use(rm);
-        }
-        &Inst::MovImm8 { rd, .. } => {
-            collector.add_def(rd);
         }
         &Inst::MovImm16 { rd, .. } => {
             collector.add_def(rd);
@@ -322,6 +353,9 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Cmp { rn, rm } => {
             collector.add_use(rn);
             collector.add_use(rm);
+        }
+        &Inst::CmpImm8 { rn, .. } => {
+            collector.add_use(rn);
         }
         &Inst::Store { rt, ref mem, .. } => {
             collector.add_use(rt);
@@ -442,13 +476,33 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
             map_def(mapper, rd);
             map_use(mapper, rm);
         }
-        &mut Inst::AluRRImm5 {
-            ref mut rd,
+        &mut Inst::AluRRRR {
+            ref mut rd_hi,
+            ref mut rd_lo,
+            ref mut rn,
             ref mut rm,
             ..
         } => {
-            map_def(mapper, rd);
+            map_def(mapper, rd_hi);
+            map_def(mapper, rd_lo);
+            map_use(mapper, rn);
             map_use(mapper, rm);
+        }
+        &mut Inst::AluRRImm12 {
+            ref mut rd,
+            ref mut rn,
+            ..
+        } => {
+            map_def(mapper, rd);
+            map_use(mapper, rn);
+        }
+        &mut Inst::AluRRImm8 {
+            ref mut rd,
+            ref mut rn,
+            ..
+        } => {
+            map_def(mapper, rd);
+            map_use(mapper, rn);
         }
         &mut Inst::AluRImm8 { ref mut rd, .. } => {
             map_def(mapper, rd);
@@ -460,9 +514,6 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
         } => {
             map_def(mapper, rd);
             map_use(mapper, rm);
-        }
-        &mut Inst::MovImm8 { ref mut rd, .. } => {
-            map_def(mapper, rd);
         }
         &mut Inst::MovImm16 { ref mut rd, .. } => {
             map_def(mapper, rd);
@@ -476,6 +527,9 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
         } => {
             map_use(mapper, rn);
             map_use(mapper, rm);
+        }
+        &mut Inst::CmpImm8 { ref mut rn, .. } => {
+            map_use(mapper, rn);
         }
         &mut Inst::Store {
             ref mut rt,
@@ -723,13 +777,19 @@ impl ShowWithRRU for Inst {
         fn op_name(alu_op: ALUOp) -> &'static str {
             match alu_op {
                 ALUOp::Add => "add",
+                ALUOp::Adds => "adds",
                 ALUOp::Adc => "adc",
+                ALUOp::Adcs => "adcs",
                 ALUOp::Qadd => "qadd",
                 ALUOp::Sub => "sub",
+                ALUOp::Subs => "subs",
                 ALUOp::Sbc => "sbc",
+                ALUOp::Sbcs => "sbcs",
                 ALUOp::Rsb => "rsb",
                 ALUOp::Qsub => "qsub",
                 ALUOp::Mul => "mul",
+                ALUOp::Smull => "smull",
+                ALUOp::Umull => "umull",
                 ALUOp::Udiv => "udiv",
                 ALUOp::Sdiv => "sdiv",
                 ALUOp::And => "and",
@@ -783,22 +843,43 @@ impl ShowWithRRU for Inst {
                 let op = op_name(alu_op);
                 let rd = rd.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
-                if alu_op == ALUOp::Rsb {
-                    format!("{} {}, {}, #0", op, rd, rm)
-                } else {
-                    format!("{} {}, {}", op, rd, rm)
-                }
+                format!("{} {}, {}", op, rd, rm)
             }
-            &Inst::AluRRImm5 {
+            &Inst::AluRRRR {
+                alu_op,
+                rd_hi,
+                rd_lo,
+                rn,
+                rm,
+            } => {
+                let op = op_name(alu_op);
+                let rd_hi = rd_hi.show_rru(mb_rru);
+                let rd_lo = rd_lo.show_rru(mb_rru);
+                let rn = rn.show_rru(mb_rru);
+                let rm = rm.show_rru(mb_rru);
+                format!("{} {}, {}, {}, {}", op, rd_lo, rd_hi, rn, rm)
+            }
+            &Inst::AluRRImm12 {
                 alu_op,
                 rd,
-                rm,
-                imm5,
+                rn,
+                imm12,
             } => {
                 let op = op_name(alu_op);
                 let rd = rd.show_rru(mb_rru);
-                let rm = rm.show_rru(mb_rru);
-                format!("{} {}, {}, #{}", op, rd, rm, imm5)
+                let rn = rn.show_rru(mb_rru);
+                format!("{} {}, {}, #{}", op, rd, rn, imm12)
+            }
+            &Inst::AluRRImm8 {
+                alu_op,
+                rd,
+                rn,
+                imm8,
+            } => {
+                let op = op_name(alu_op);
+                let rd = rd.show_rru(mb_rru);
+                let rn = rn.show_rru(mb_rru);
+                format!("{} {}, {}, #{}", op, rd, rn, imm8)
             }
             &Inst::AluRImm8 { alu_op, rd, imm8 } => {
                 let op = op_name(alu_op);
@@ -809,10 +890,6 @@ impl ShowWithRRU for Inst {
                 let rd = rd.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
                 format!("mov {}, {}", rd, rm)
-            }
-            &Inst::MovImm8 { rd, imm8 } => {
-                let rd = rd.show_rru(mb_rru);
-                format!("mov {}, #{}", rd, imm8)
             }
             &Inst::MovImm16 { rd, imm16 } => {
                 let rd = rd.show_rru(mb_rru);
@@ -826,6 +903,10 @@ impl ShowWithRRU for Inst {
                 let rn = rn.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
                 format!("cmp {}, {}", rn, rm)
+            }
+            &Inst::CmpImm8 { rn, imm8 } => {
+                let rn = rn.show_rru(mb_rru);
+                format!("cmp {}, #{}", rn, imm8)
             }
             &Inst::Store {
                 rt, ref mem, bits, ..

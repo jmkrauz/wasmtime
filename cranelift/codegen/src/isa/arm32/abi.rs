@@ -173,6 +173,12 @@ impl ABISig {
         let (args, stack_arg_space) = compute_arg_locs(&sig.params);
         let (rets, _) = compute_arg_locs(&sig.returns);
 
+        // Verify that there are no return values on the stack.
+        assert!(rets.iter().all(|a| match a {
+            &ABIArg::Stack(..) => false,
+            _ => true,
+        }));
+
         ABISig {
             args,
             rets,
@@ -520,20 +526,43 @@ impl ABIBody for Arm32ABIBody {
 
     fn load_stackslot(
         &self,
-        _slot: StackSlot,
-        _offset: u32,
-        _ty: Type,
-        _into_reg: Writable<Reg>,
+        slot: StackSlot,
+        offset: u32,
+        ty: Type,
+        into_reg: Writable<Reg>,
     ) -> Inst {
-        unimplemented!()
+        let stack_off = self.stackslots[slot.as_u32() as usize];
+        let sp_off = stack_off + offset;
+        if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), sp_off.try_into().unwrap()) {
+            load_stack(mem, into_reg, ty)
+        } else {
+            unimplemented!()
+        }
     }
 
-    fn store_stackslot(&self, _slot: StackSlot, _offset: u32, _ty: Type, _from_reg: Reg) -> Inst {
-        unimplemented!()
+    fn store_stackslot(&self, slot: StackSlot, offset: u32, ty: Type, from_reg: Reg) -> Inst {
+        let stack_off = self.stackslots[slot.as_u32() as usize];
+        let sp_off = stack_off + offset;
+        if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), sp_off.try_into().unwrap()) {
+            store_stack(mem, from_reg, ty)
+        } else {
+            unimplemented!()
+        }
     }
 
-    fn stackslot_addr(&self, _slot: StackSlot, _offset: u32, _into_reg: Writable<Reg>) -> Inst {
-        unimplemented!()
+    fn stackslot_addr(&self, slot: StackSlot, offset: u32, into_reg: Writable<Reg>) -> Inst {
+        let stack_off = self.stackslots[slot.as_u32() as usize];
+        let sp_off = stack_off + offset;
+        if sp_off & !((1 << 12) - 1) == 0 {
+            Inst::AluRRImm12 {
+                alu_op: ALUOp::Add,
+                rd: into_reg,
+                rn: sp_reg(),
+                imm12: sp_off.try_into().unwrap(),
+            }
+        } else {
+            unimplemented!()
+        }
     }
 
     // Load from a spillslot.
@@ -565,6 +594,7 @@ impl ABIBody for Arm32ABIBody {
         }
 
         if !self.is_leaf {
+            // For lr
             callee_saved_used += 4;
         }
 
@@ -585,17 +615,7 @@ impl ABIBody for Arm32ABIBody {
             insts.push(Inst::Push { reg_list });
         }
 
-        // Explicitly allocate the frame.
-        if frame_size > 0 {
-            insts.extend(Inst::load_constant(writable_ip_reg(), frame_size));
-            insts.push(Inst::AluRRRShift {
-                alu_op: ALUOp::Sub,
-                rd: writable_sp_reg(),
-                rn: sp_reg(),
-                rm: ip_reg(),
-                shift: None,
-            });
-        }
+        insts.extend(adjust_stack(frame_size, true));
 
         // Stash this value.  We'll need it for the epilogue.
         debug_assert!(self.total_frame_size.is_none());
@@ -610,16 +630,7 @@ impl ABIBody for Arm32ABIBody {
 
         // Clear the spill area and the 8-alignment padding below it.
         let frame_size = self.total_frame_size.unwrap();
-        if frame_size > 0 {
-            insts.extend(Inst::load_constant(writable_ip_reg(), frame_size));
-            insts.push(Inst::AluRRRShift {
-                alu_op: ALUOp::Add,
-                rd: writable_sp_reg(),
-                rn: sp_reg(),
-                rm: ip_reg(),
-                shift: None,
-            });
-        }
+        insts.extend(adjust_stack(frame_size, false));
 
         let mut reg_list = SmallVec::<[Writable<Reg>; 16]>::new();
         let mut callee_saved_used = 0;
@@ -752,21 +763,32 @@ impl Arm32ABICall {
     }
 }
 
-fn adjust_stack<C: LowerCtx<I = Inst>>(ctx: &mut C, amount: u32, is_sub: bool) {
+fn adjust_stack(amount: u32, is_sub: bool) -> Vec<Inst> {
+    let mut insts = vec![];
     if amount == 0 {
-        return;
+        return insts;
     }
     let alu_op = if is_sub { ALUOp::Sub } else { ALUOp::Add };
-    for inst in Inst::load_constant(writable_ip_reg(), amount).into_vec() {
-        ctx.emit(inst);
+    if amount & !((1 << 12) - 1) == 0 {
+        insts.push(Inst::AluRRImm12 {
+            alu_op,
+            rd: writable_sp_reg(),
+            rn: sp_reg(),
+            imm12: amount.try_into().unwrap(),
+        });
+    } else {
+        for inst in Inst::load_constant(writable_ip_reg(), amount).into_vec() {
+            insts.push(inst);
+        }
+        insts.push(Inst::AluRRRShift {
+            alu_op,
+            rd: writable_sp_reg(),
+            rn: sp_reg(),
+            rm: ip_reg(),
+            shift: None,
+        });
     }
-    ctx.emit(Inst::AluRRRShift {
-        alu_op,
-        rd: writable_sp_reg(),
-        rn: sp_reg(),
-        rm: ip_reg(),
-        shift: None,
-    });
+    insts
 }
 
 impl ABICall for Arm32ABICall {
@@ -777,11 +799,15 @@ impl ABICall for Arm32ABICall {
     }
 
     fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
-        adjust_stack(ctx, self.sig.stack_arg_space, /* is_sub = */ true)
+        for inst in adjust_stack(self.sig.stack_arg_space, /* is_sub = */ true) {
+            ctx.emit(inst);
+        }
     }
 
     fn emit_stack_post_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
-        adjust_stack(ctx, self.sig.stack_arg_space, /* is_sub = */ false)
+        for inst in adjust_stack(self.sig.stack_arg_space, /* is_sub = */ false) {
+            ctx.emit(inst);
+        }
     }
 
     fn emit_copy_reg_to_arg<C: LowerCtx<I = Self::I>>(
@@ -818,7 +844,17 @@ impl ABICall for Arm32ABICall {
     ) {
         match &self.sig.rets[idx] {
             &ABIArg::Reg(reg, ty) => ctx.emit(Inst::gen_move(into_reg, reg.to_reg(), ty)),
-            _ => unimplemented!(),
+            &ABIArg::Stack(off, ty) => {
+                if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), off) {
+                    ctx.emit(load_stack(mem, into_reg, ty));
+                } else {
+                    for inst in Inst::load_constant(writable_ip_reg(), off as u32) {
+                        ctx.emit(inst);
+                    }
+                    let mem = MemArg::reg_plus_reg(sp_reg(), ip_reg(), 0);
+                    ctx.emit(load_stack(mem, into_reg, ty));
+                }
+            }
         }
     }
 

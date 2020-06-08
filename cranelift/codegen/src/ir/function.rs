@@ -246,10 +246,10 @@ impl Function {
 
     /// Wrapper around `encode` which assigns `inst` the resulting encoding.
     pub fn update_encoding(&mut self, inst: ir::Inst, isa: &dyn TargetIsa) -> Result<(), Legalize> {
-        if isa.get_mach_backend().is_some() && isa.pointer_bits() == 64 {
-            Ok(())
-        } else {
-            self.encode(inst, isa).map(|e| self.encodings[inst] = e)
+        match (isa.get_mach_backend().is_some(), isa.pointer_bits()) {
+            (true, 64) => Ok(()),
+            (true, _) => self.encode(inst, isa).map(|_e| {}),
+            (false, _) => self.encode(inst, isa).map(|e| self.encodings[inst] = e),
         }
     }
 

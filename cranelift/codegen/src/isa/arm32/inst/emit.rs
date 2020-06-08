@@ -157,6 +157,14 @@ fn enc_32_rrr(bits_31_20: u32, bits_15_12: u32, bits_7_4: u32, rd: Reg, rm: Reg,
     enc_32_regs(inst, Some(rm), Some(rd), None, Some(rn))
 }
 
+fn enc_32_imm12(inst: u32, imm12: u16) -> u32 {
+    let imm12 = u32::from(imm12);
+    let imm8 = imm12 & 0xff;
+    let imm3 = (imm12 >> 8) & 0x7;
+    let i = (imm12 >> 11) & 0x1;
+    inst | imm8 | (imm3 << 12) | (i << 26)
+}
+
 fn enc_32_mem_r(bits_24_20: u32, rt: Reg, rn: Reg, rm: Reg, imm2: u32) -> u32 {
     let inst = (imm2 << 4) | (bits_24_20 << 20) | (0b11111 << 27);
     enc_32_regs(inst, Some(rm), None, Some(rt), Some(rn))
@@ -219,10 +227,6 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
 
     fn emit(&self, sink: &mut O, flags: &settings::Flags, state: &mut EmitState) {
         match self {
-            &Inst::AluRR { .. }
-            | &Inst::AluRRImm5 { .. }
-            | &Inst::AluRImm8 { .. }
-            | &Inst::MovImm8 { .. } => unimplemented!(),
             &Inst::Nop0 | &Inst::EpiloguePlaceholder => {}
             &Inst::AluRRR { alu_op, rd, rn, rm } => {
                 let (bits_31_20, bits_15_12, bits_7_4) = match alu_op {
@@ -257,15 +261,99 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
                     ALUOp::Orn => 0b00110,
                     ALUOp::Eor => 0b01000,
                     ALUOp::Add => 0b10000,
+                    ALUOp::Adds => 0b10001,
                     ALUOp::Adc => 0b10100,
+                    ALUOp::Adcs => 0b10101,
                     ALUOp::Sbc => 0b10110,
+                    ALUOp::Sbcs => 0b10111,
                     ALUOp::Sub => 0b11010,
+                    ALUOp::Subs => 0b11011,
                     ALUOp::Rsb => 0b11100,
                     _ => panic!("Invalid ALUOp {:?} in RRRShift form!", alu_op),
                 };
                 let bits_31_20 = (bits_31_24 << 5) | bits_24_20;
                 let inst = enc_32_rrr(bits_31_20, 0, 0, rd.to_reg(), rm, rn);
                 let inst = enc_32_reg_shift(inst, shift);
+                emit_32(inst, sink);
+            }
+            &Inst::AluRR { alu_op, rd, rm } => match alu_op {
+                ALUOp::Mvn => {
+                    let inst = 0b11101010011011110000_0000_0000_0000;
+                    let inst = enc_32_regs(inst, Some(rm), Some(rd.to_reg()), None, None);
+                    emit_32(inst, sink);
+                }
+                _ => panic!("Invalid ALUOp {:?} in RR form!", alu_op),
+            },
+            &Inst::AluRRRR {
+                alu_op,
+                rd_hi,
+                rd_lo,
+                rn,
+                rm,
+            } => {
+                let (bits_7_4, bits_22_20) = match alu_op {
+                    ALUOp::Smull => (0b000, 0b0000),
+                    ALUOp::Umull => (0b010, 0b0000),
+                    _ => panic!("Invalid ALUOp {:?} in RRRR form!", alu_op),
+                };
+                let inst = (0b111110111 << 23) | (bits_22_20 << 20) | (bits_7_4 << 4);
+                let inst = enc_32_regs(
+                    inst,
+                    Some(rm),
+                    Some(rd_hi.to_reg()),
+                    Some(rd_lo.to_reg()),
+                    Some(rn),
+                );
+                emit_32(inst, sink);
+            }
+            &Inst::AluRRImm12 {
+                alu_op,
+                rd,
+                rn,
+                imm12,
+            } => {
+                let bits_24_20 = match alu_op {
+                    ALUOp::Add => 0b00000,
+                    ALUOp::Sub => 0b01010,
+                    _ => panic!("Invalid ALUOp {:?} in RRImm12 form!", alu_op),
+                };
+                let inst = (0b11110_0_1 << 25) | (bits_24_20 << 20);
+                let inst = enc_32_regs(inst, None, Some(rd.to_reg()), None, Some(rn));
+                let inst = enc_32_imm12(inst, imm12);
+                emit_32(inst, sink);
+            }
+            &Inst::AluRRImm8 {
+                alu_op,
+                rd,
+                rn,
+                imm8,
+            } => {
+                let bits_24_20 = match alu_op {
+                    ALUOp::And => 0b00000,
+                    ALUOp::Bic => 0b00010,
+                    ALUOp::Orr => 0b00100,
+                    ALUOp::Orn => 0b00110,
+                    ALUOp::Eor => 0b01000,
+                    ALUOp::Add => 0b10000,
+                    ALUOp::Adc => 0b10100,
+                    ALUOp::Sbc => 0b10110,
+                    ALUOp::Sub => 0b11010,
+                    ALUOp::Rsb => 0b11100,
+                    _ => panic!("Invalid ALUOp {:?} in RRImm8 form!", alu_op),
+                };
+                let imm8 = u32::from(imm8);
+                let inst = 0b11110_0_0_00000_0000_0_000_0000_00000000 | imm8 | (bits_24_20 << 20);
+                let inst = enc_32_regs(inst, None, Some(rd.to_reg()), None, Some(rn));
+                emit_32(inst, sink);
+            }
+            &Inst::AluRImm8 { alu_op, rd, imm8 } => {
+                let bits_24_20 = match alu_op {
+                    ALUOp::Mvn => 0b00110,
+                    _ => panic!("Invalid ALUOp {:?} in RImm8 form!", alu_op),
+                };
+                let imm8 = u32::from(imm8);
+                let inst = 0b11110_0_0_00000_1111_0_000_0000_00000000 | imm8 | (bits_24_20 << 20);
+                let inst = enc_32_regs(inst, None, Some(rd.to_reg()), None, None);
                 emit_32(inst, sink);
             }
             &Inst::Mov { rd, rm } => {
@@ -283,6 +371,11 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
                 } else {
                     sink.put2(enc_16_rr_any(0b01000101, rn, rm));
                 }
+            }
+            &Inst::CmpImm8 { rn, imm8 } => {
+                let inst = 0b11110_0_011011_0000_0_000_1111_00000000 | u32::from(imm8);
+                let inst = enc_32_regs(inst, None, None, None, Some(rn));
+                emit_32(inst, sink);
             }
             &Inst::Store {
                 rt,
@@ -397,7 +490,7 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
                 0 => panic!("Unsupported Push case: {:?}", self),
                 1 => {
                     let reg = u32::from(machreg_to_gpr(reg_list[0]));
-                    let inst: u32 = 0b1111100001001101_0000_101100000100 | (reg << 12);
+                    let inst: u32 = 0b1111100001001101_0000_110100000100 | (reg << 12);
                     emit_32(inst, sink);
                 }
                 _ => {
@@ -457,10 +550,17 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
             } => {
                 let inst: u32 = (0b11111000_1_1011111 << 16) | 0x4;
                 emit_32(enc_32_regs(inst, None, None, Some(rt.to_reg()), None), sink);
+                let padding = if sink.cur_offset_from_start() & 0x3 == 0 {
+                    2
+                } else {
+                    0
+                };
+                // This jump should take 2 bytes.
                 let inst = Inst::Jump {
-                    dest: BranchTarget::ResolvedOffset(6),
+                    dest: BranchTarget::ResolvedOffset(6 + padding),
                 };
                 inst.emit(sink, flags, state);
+                sink.align_to(4);
                 sink.add_reloc(srcloc, Reloc::Abs4, name, (offset + 1).into());
                 sink.put4(0);
             }

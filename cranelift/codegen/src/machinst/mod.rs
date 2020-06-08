@@ -98,8 +98,7 @@
 
 use crate::binemit::{CodeInfo, CodeOffset};
 use crate::ir::condcodes::IntCC;
-use crate::ir::{self, Function, Type};
-use crate::isa::Legalize;
+use crate::ir::{Function, Type};
 use crate::result::CodegenResult;
 use crate::settings::Flags;
 
@@ -110,7 +109,6 @@ use regalloc::RegUsageCollector;
 use regalloc::{
     RealReg, RealRegUniverse, Reg, RegClass, RegUsageMapper, SpillSlot, VirtualReg, Writable,
 };
-use std::borrow::Cow;
 use std::string::String;
 use target_lexicon::Triple;
 
@@ -275,22 +273,5 @@ pub trait MachBackend {
     fn unsigned_sub_overflow_condition(&self) -> IntCC {
         // TODO: this is what x86 specifies. Is this right for arm64?
         IntCC::UnsignedLessThan
-    }
-
-    /// Instruction legalization needed by 32-bit architectures.
-    fn legalize_inst(
-        &self,
-        _func: &ir::Function,
-        _inst: &ir::InstructionData,
-        _ctrl_typevar: ir::Type,
-    ) -> Option<Legalize> {
-        // 32-bit isa should override this.
-        panic!("Should not be called when target isa is 64-bit!")
-    }
-
-    /// Signature legalization needed by 32-bit architectures.
-    fn legalize_signature(&self, _sig: &mut Cow<ir::Signature>, _current: bool) {
-        // 32-bit isa should override this.
-        panic!("Should not be called when target isa is 64-bit!")
     }
 }

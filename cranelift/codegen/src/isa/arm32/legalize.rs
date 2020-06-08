@@ -2,7 +2,8 @@ use crate::cursor::{Cursor, FuncCursor};
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::entities::{Block, Value};
 use crate::ir::types::Type;
-use crate::ir::{self, InstBuilder};
+#[allow(unused)]
+use crate::ir::{self, InstBuilder, ValueLoc};
 use crate::isa::{self, TargetIsa};
 
 pub fn legalize_inst(
@@ -14,8 +15,6 @@ pub fn legalize_inst(
         ir::Opcode::BrIcmp
         | ir::Opcode::GlobalValue
         | ir::Opcode::HeapAddr
-        | ir::Opcode::StackLoad
-        | ir::Opcode::StackStore
         | ir::Opcode::TableAddr
         | ir::Opcode::Trapnz
         | ir::Opcode::Trapz
@@ -35,7 +34,9 @@ pub fn legalize_inst(
         | ir::Opcode::UdivImm
         | ir::Opcode::UremImm
         | ir::Opcode::UshrImm
-        | ir::Opcode::IcmpImm => return Some(arm32_expand),
+        | ir::Opcode::IcmpImm
+        | ir::Opcode::Spill
+        | ir::Opcode::Ireduce => return Some(arm32_expand),
         op if op.is_ghost() => return None,
         _ => {}
     }
@@ -597,4 +598,33 @@ fn narrow_rotr(
             return (res_lo, res_hi);
         },
     );
+}
+
+fn expand_spill(
+    inst: ir::Inst,
+    func: &mut ir::Function,
+    _cfg: &mut ControlFlowGraph,
+    _isa: &dyn TargetIsa,
+) {
+    let x = match func.dfg[inst] {
+        ir::InstructionData::Unary {
+            opcode: ir::Opcode::Spill,
+            arg,
+        } => arg,
+        _ => panic!("Expected spill: {}", func.dfg.display_inst(inst, None)),
+    };
+    let result = func.dfg.first_result(inst);
+    let loc = func.locations[result];
+    let ss = match loc {
+        ValueLoc::Stack(ss) => ss,
+        _ => panic!("Expected stack location: {:?}", loc),
+    };
+
+    let mut pos = FuncCursor::new(func).at_inst(inst);
+    pos.use_srcloc(inst);
+
+    pos.ins().stack_store(x, ss, 0);
+
+    pos.func.dfg.clear_results(inst);
+    pos.remove_inst();
 }

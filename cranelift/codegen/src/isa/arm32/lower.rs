@@ -130,6 +130,16 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
     let in_reg = ctx.input(input.insn, input.input);
     match (narrow_mode, from_bits) {
         (NarrowValueMode::None, _) => in_reg,
+        (NarrowValueMode::ZeroExtend, 1) => {
+            let tmp = ctx.tmp(RegClass::I32, I32);
+            ctx.emit(Inst::AluRRImm8 {
+                alu_op: ALUOp::And,
+                rd: tmp,
+                rn: in_reg,
+                imm8: 0x1,
+            });
+            tmp.to_reg()
+        }
         (NarrowValueMode::ZeroExtend, n) if n < 32 => {
             let tmp = ctx.tmp(RegClass::I32, I32);
             ctx.emit(Inst::Extend {
