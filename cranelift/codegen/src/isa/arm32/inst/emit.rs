@@ -209,7 +209,11 @@ fn enc_32_cond_branch20(cond: Cond, off20: u32) -> u32 {
         | (s << 26)
 }
 
-fn emit_32<O: MachSectionOutput>(inst: u32, sink: &mut O) {
+fn u32_swap_halfwords(x: u32) -> u32 {
+    (x >> 16) | (x << 16)
+}
+
+fn emit_32(inst: u32, sink: &mut MachBuffer<Inst>) {
     let inst_hi = (inst >> 16) as u16;
     let inst_lo = (inst & 0xffff) as u16;
     sink.put2(inst_hi);
@@ -222,10 +226,12 @@ pub struct EmitState {
     virtual_sp_offset: i64,
 }
 
-impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
+impl MachInstEmit for Inst {
     type State = EmitState;
 
-    fn emit(&self, sink: &mut O, flags: &settings::Flags, state: &mut EmitState) {
+    fn emit(&self, sink: &mut MachBuffer<Inst>, flags: &settings::Flags, state: &mut EmitState) {
+        let start_off = sink.cur_offset();
+
         match self {
             &Inst::Nop0 | &Inst::EpiloguePlaceholder => {}
             &Inst::AluRRR { alu_op, rd, rn, rm } => {
@@ -550,70 +556,109 @@ impl<O: MachSectionOutput> MachInstEmit<O> for Inst {
             } => {
                 let inst: u32 = (0b11111000_1_1011111 << 16) | 0x4;
                 emit_32(enc_32_regs(inst, None, None, Some(rt.to_reg()), None), sink);
-                let padding = if sink.cur_offset_from_start() & 0x3 == 0 {
-                    2
-                } else {
-                    0
-                };
+                let padding = if start_off & 0x3 == 0 { 2 } else { 0 };
                 // This jump should take 2 bytes.
-                let inst = Inst::Jump {
-                    dest: BranchTarget::ResolvedOffset(6 + padding),
-                };
-                inst.emit(sink, flags, state);
+                sink.put2(enc_16_jump11((padding + 2) >> 1));
                 sink.align_to(4);
                 sink.add_reloc(srcloc, Reloc::Abs4, name, (offset + 1).into());
                 sink.put4(0);
             }
             &Inst::Ret => {
-                sink.put2(enc_16_mov(writable_pc_reg(), lr_reg()));
+                sink.put2(0b010001110_1110_000);    // bx lr
             }
             &Inst::Jump { ref dest } => {
-                if let Some(off11) = dest.as_off11() {
-                    sink.put2(enc_16_jump11(off11));
-                } else if let Some(off24) = dest.as_off24() {
+                let off = sink.cur_offset();
+                // Indicate that the jump uses a label, if so, so that a fixup can occur later.
+                if let Some(l) = dest.as_label() {
+                    sink.use_label_at_offset(off, l, LabelUse::Branch24);
+                    sink.add_uncond_branch(off, off + 4, l);
+                }
+                if let Some(off24) = dest.as_off24() {
+                    eprintln!("in emit {:#08x}", enc_32_jump24(off24));
                     emit_32(enc_32_jump24(off24), sink);
                 } else {
                     unimplemented!()
                 }
             }
-            &Inst::CondBr { .. } => panic!("Unlowered CondBr during binemit!"),
-            &Inst::CondBrLowered { target, kind } => match kind {
-                CondBrKind::Zero(reg) => {
-                    sink.put2(enc_16_comp_branch6(reg, true, target.as_off6().unwrap()));
-                }
-                CondBrKind::NotZero(reg) => {
-                    sink.put2(enc_16_comp_branch6(reg, false, target.as_off6().unwrap()));
-                }
-                CondBrKind::Cond(c) => {
-                    if let Some(off8) = target.as_off8() {
-                        sink.put2(enc_16_cond_branch8(c, off8));
-                    } else if let Some(off20) = target.as_off20() {
-                        emit_32(enc_32_cond_branch20(c, off20), sink);
-                    } else {
-                        unimplemented!()
-                    }
-                }
-            },
-            &Inst::CondBrLoweredCompound {
+            &Inst::CondBr {
                 taken,
                 not_taken,
                 kind,
             } => {
                 // Conditional part first.
-                match kind {
-                    CondBrKind::Zero(reg) => {
-                        sink.put2(enc_16_comp_branch6(reg, true, taken.as_off6().unwrap()));
-                    }
-                    CondBrKind::NotZero(reg) => {
-                        sink.put2(enc_16_comp_branch6(reg, false, taken.as_off6().unwrap()));
-                    }
-                    CondBrKind::Cond(c) => {
-                        sink.put2(enc_16_cond_branch8(c, taken.as_off8().unwrap()));
+                let cond_off = sink.cur_offset();
+                if let Some(l) = taken.as_label() {
+                    let label_use = if let CondBrKind::Cond(_) = kind {
+                        LabelUse::Branch20
+                    } else {
+                        LabelUse::Branch6
+                    };
+                    sink.use_label_at_offset(cond_off, l, label_use);
+                    match kind {
+                        CondBrKind::Zero(reg) => {
+                            let inverted = enc_16_comp_branch6(reg, false, taken.as_off6().unwrap()).to_le_bytes();
+                            sink.add_cond_branch(cond_off, cond_off + 2, l, &inverted[..]);
+                        }
+                        CondBrKind::NotZero(reg) => {
+                            let inverted = enc_16_comp_branch6(reg, true, taken.as_off6().unwrap()).to_le_bytes();
+                            sink.add_cond_branch(cond_off, cond_off + 2, l, &inverted[..]);
+                        }
+                        CondBrKind::Cond(c) => {
+                            let inverted = enc_32_cond_branch20(c.invert(), taken.as_off20().unwrap());
+                            let inverted = u32_swap_halfwords(inverted).to_le_bytes();
+                            sink.add_cond_branch(cond_off, cond_off + 4, l, &inverted[..]);
+                        }
                     }
                 }
+                let maybe_off6 = taken.as_off6();
+                let maybe_off20 = taken.as_off20();
+
+                match (kind, maybe_off6, maybe_off20) {
+                    (CondBrKind::Zero(reg), Some(off), _) => {
+                        sink.put2(enc_16_comp_branch6(reg, true, off));
+                    }
+                    (CondBrKind::NotZero(reg), Some(off), _) => {
+                        sink.put2(enc_16_comp_branch6(reg, false, off));
+                    }
+                    (CondBrKind::Cond(c), _, Some(off)) => {
+                        emit_32(enc_32_cond_branch20(c, off), sink);
+                    }
+                    _ => unimplemented!(),
+                }
+
                 // Unconditional part.
-                sink.put2(enc_16_jump11(not_taken.as_off11().unwrap()));
+                let uncond_off = sink.cur_offset();
+                if let Some(l) = not_taken.as_label() {
+                    sink.use_label_at_offset(uncond_off, l, LabelUse::Branch24);
+                    sink.add_uncond_branch(uncond_off, uncond_off + 4, l);
+                }
+                emit_32(enc_32_jump24(not_taken.as_off24().unwrap()), sink);
+            }
+            &Inst::OneWayCondBr { target, kind } => {
+                unimplemented!()
+                /*if let Some(_l) = target.as_label() {
+                    //unimplemented!()
+                }
+                eprintln!("{:?}", target);
+                let maybe_off6 = target.as_off6();
+                let maybe_off20 = target.as_off20();
+
+                match (kind, maybe_off6, maybe_off20) {
+                    (CondBrKind::Zero(reg), Some(off), _) => {
+                        sink.put2(enc_16_comp_branch6(reg, true, off));
+                    }
+                    (CondBrKind::NotZero(reg), Some(off), _) => {
+                        sink.put2(enc_16_comp_branch6(reg, false, off));
+                    }
+                    (CondBrKind::Cond(c), _, Some(off)) => {
+                        emit_32(enc_32_cond_branch20(c, off), sink);
+                    }
+                    _ => unimplemented!()
+                }*/
             }
         }
+
+        let end_off = sink.cur_offset();
+        debug_assert!((end_off - start_off) <= Inst::worst_case_size());
     }
 }

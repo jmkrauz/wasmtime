@@ -32,20 +32,20 @@ pub(crate) fn create_handle(
         .local
         .signatures
         .values()
-        .map(|sig| store.compiler().signatures().register(sig))
+        .map(|(wasm, native)| store.register_signature(wasm.clone(), native.clone()))
         .collect::<PrimaryMap<_, _>>();
 
     unsafe {
         let handle = InstanceHandle::new(
             Arc::new(module),
+            Arc::new(()),
             finished_functions.into_boxed_slice(),
             trampolines,
             imports,
             store.memory_creator(),
             signatures.into_boxed_slice(),
-            None,
             state,
-            store.compiler().interrupts().clone(),
+            store.interrupts().clone(),
         )?;
         Ok(store.add_instance(handle))
     }

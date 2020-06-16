@@ -22,7 +22,7 @@ pub fn link_module(module: &Module, compilation: &Compilation) {
     for (i, function_relocs) in compilation.trampoline_relocations.iter() {
         for r in function_relocs.iter() {
             println!("tramopline relocation");
-            let body = compilation.trampolines[&i] as *const VMFunctionBody;
+            let body = compilation.trampolines[*i] as *const VMFunctionBody;
             apply_reloc(module, compilation, body, r);
         }
     }
@@ -46,6 +46,13 @@ fn apply_reloc(
         RelocationTarget::LibCall(libcall) => {
             use cranelift_codegen::ir::LibCall::*;
             match libcall {
+                UdivI64 => wasmtime_i64_udiv as usize,
+                SdivI64 => wasmtime_i64_sdiv as usize,
+                UremI64 => wasmtime_i64_urem as usize,
+                SremI64 => wasmtime_i64_srem as usize,
+                IshlI64 => wasmtime_i64_ishl as usize,
+                UshrI64 => wasmtime_i64_ushr as usize,
+                SshrI64 => wasmtime_i64_sshr as usize,
                 CeilF32 => wasmtime_f32_ceil as usize,
                 FloorF32 => wasmtime_f32_floor as usize,
                 TruncF32 => wasmtime_f32_trunc as usize,

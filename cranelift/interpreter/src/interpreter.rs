@@ -11,8 +11,8 @@ use cranelift_codegen::ir::{
     Value as ValueRef, ValueList,
 };
 use cranelift_reader::{DataValue, DataValueCastFailure};
-use log::debug;
-use std::ops::{Add, Sub};
+use log::trace;
+use std::ops::{Add, Div, Mul, Sub};
 use thiserror::Error;
 
 /// The valid control flow states.
@@ -105,27 +105,32 @@ impl Interpreter {
 
     /// Interpret a call to a [Function] given its [DataValue] arguments.
     fn call(&self, function: &Function, arguments: &[DataValue]) -> Result<ControlFlow, Trap> {
-        debug!("Call: {}({:?})", function.name, arguments);
+        trace!("Call: {}({:?})", function.name, arguments);
         let first_block = function
             .layout
             .blocks()
             .next()
             .expect("to have a first block");
         let parameters = function.dfg.block_params(first_block);
-        let mut frame = Frame::new(function).with_parameters(parameters, arguments);
+        let mut frame = Frame::new(function);
+        frame.set_all(parameters, arguments.to_vec());
         self.block(&mut frame, first_block)
     }
 
-    /// Interpret a single [Block] in a [Function].
+    /// Interpret a [Block] in a [Function]. This drives the interpretation over sequences of
+    /// instructions, which may continue in other blocks, until the function returns.
     fn block(&self, frame: &mut Frame, block: Block) -> Result<ControlFlow, Trap> {
-        debug!("Block: {}", block);
-        for inst in frame.function.layout.block_insts(block) {
+        trace!("Block: {}", block);
+        let layout = &frame.function.layout;
+        let mut maybe_inst = layout.first_inst(block);
+        while let Some(inst) = maybe_inst {
             match self.inst(frame, inst)? {
-                ControlFlow::Continue => continue,
+                ControlFlow::Continue => maybe_inst = layout.next_inst(inst),
                 ControlFlow::ContinueAt(block, old_names) => {
+                    trace!("Block: {}", block);
                     let new_names = frame.function.dfg.block_params(block);
                     frame.rename(&old_names, new_names);
-                    return self.block(frame, block);
+                    maybe_inst = layout.first_inst(block)
                 }
                 ControlFlow::Return(rs) => return Ok(ControlFlow::Return(rs)),
             }
@@ -137,7 +142,7 @@ impl Interpreter {
     /// implementations.
     fn inst(&self, frame: &mut Frame, inst: Inst) -> Result<ControlFlow, Trap> {
         use ControlFlow::{Continue, ContinueAt};
-        debug!("Inst: {}", &frame.function.dfg.display_inst(inst, None));
+        trace!("Inst: {}", &frame.function.dfg.display_inst(inst, None));
 
         let data = &frame.function.dfg[inst];
         match data {
@@ -145,20 +150,26 @@ impl Interpreter {
                 let arg1 = frame.get(&args[0]);
                 let arg2 = frame.get(&args[1]);
                 let result = match opcode {
-                    Iadd => binary_op!(Add::add[arg1, arg2]; [I8, I16, I32, I64, F32, F64]; inst),
-                    Isub => binary_op!(Sub::sub[arg1, arg2]; [I8, I16, I32, I64, F32, F64]; inst),
+                    Iadd => binary_op!(Add::add[arg1, arg2]; [I8, I16, I32, I64]; inst),
+                    Isub => binary_op!(Sub::sub[arg1, arg2]; [I8, I16, I32, I64]; inst),
+                    Imul => binary_op!(Mul::mul[arg1, arg2]; [I8, I16, I32, I64]; inst),
+                    Fadd => binary_op!(Add::add[arg1, arg2]; [F32, F64]; inst),
+                    Fsub => binary_op!(Sub::sub[arg1, arg2]; [F32, F64]; inst),
+                    Fmul => binary_op!(Mul::mul[arg1, arg2]; [F32, F64]; inst),
+                    Fdiv => binary_op!(Div::div[arg1, arg2]; [F32, F64]; inst),
                     _ => unimplemented!("interpreter does not support opcode yet: {}", opcode),
                 }?;
                 frame.set(first_result(frame.function, inst), result);
                 Ok(Continue)
             }
 
-            BinaryImm { opcode, arg, imm } => {
+            BinaryImm64 { opcode, arg, imm } => {
                 let imm = DataValue::from_integer(*imm, type_of(*arg, frame.function))?;
                 let arg = frame.get(&arg);
                 let result = match opcode {
-                    IaddImm => binary_op!(Add::add[arg, imm]; [I8, I16, I32, I64, F32, F64]; inst),
-                    IrsubImm => binary_op!(Sub::sub[arg, imm]; [I8, I16, I32, I64, F32, F64]; inst),
+                    IaddImm => binary_op!(Add::add[arg, imm]; [I8, I16, I32, I64]; inst),
+                    IrsubImm => binary_op!(Sub::sub[imm, arg]; [I8, I16, I32, I64]; inst),
+                    ImulImm => binary_op!(Mul::mul[arg, imm]; [I8, I16, I32, I64]; inst),
                     _ => unimplemented!("interpreter does not support opcode yet: {}", opcode),
                 }?;
                 frame.set(first_result(frame.function, inst), result);
@@ -344,9 +355,9 @@ mod tests {
     fn sanity() {
         let code = "function %test() -> b1 {
         block0:
-            v0 = iconst.i32 40
-            v1 = iadd_imm v0, 3
-            v2 = irsub_imm v1, 1
+            v0 = iconst.i32 1
+            v1 = iadd_imm v0, 1
+            v2 = irsub_imm v1, 44  ; 44 - 2 == 42 (see irsub_imm's semantics)
             v3 = icmp_imm eq v2, 42
             return v3
         }";

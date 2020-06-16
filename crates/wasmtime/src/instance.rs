@@ -1,11 +1,11 @@
 use crate::trampoline::StoreInstanceHandle;
-use crate::{Export, Extern, Func, Global, Memory, Module, Store, Table, Trap};
+use crate::{Engine, Export, Extern, Func, Global, Memory, Module, Store, Table, Trap};
 use anyhow::{bail, Error, Result};
 use std::any::Any;
 use std::mem;
 use wasmtime_environ::EntityIndex;
 use wasmtime_jit::{CompiledModule, Resolver};
-use wasmtime_runtime::{InstantiationError, SignatureRegistry, VMContext};
+use wasmtime_runtime::{InstantiationError, VMContext, VMFunctionBody};
 
 struct SimpleResolver<'a> {
     imports: &'a [Extern],
@@ -23,16 +23,32 @@ fn instantiate(
     store: &Store,
     compiled_module: &CompiledModule,
     imports: &[Extern],
-    sig_registry: &SignatureRegistry,
     host: Box<dyn Any>,
 ) -> Result<StoreInstanceHandle, Error> {
+    // For now we have a restriction that the `Store` that we're working
+    // with is the same for everything involved here.
+    for import in imports {
+        if !import.comes_from_same_store(store) {
+            bail!("cross-`Store` instantiation is not currently supported");
+        }
+    }
+
+    if imports.len() != compiled_module.module().imports.len() {
+        bail!(
+            "wrong number of imports provided, {} != {}",
+            imports.len(),
+            compiled_module.module().imports.len()
+        );
+    }
+
     let mut resolver = SimpleResolver { imports };
-    unsafe {
-        let config = store.engine().config();
+    let config = store.engine().config();
+    let instance = unsafe {
         let instance = compiled_module.instantiate(
             &mut resolver,
-            sig_registry,
+            &mut store.signatures_mut(),
             config.memory_creator.as_ref().map(|a| a as _),
+            store.interrupts().clone(),
             host,
         )?;
 
@@ -51,41 +67,51 @@ fn instantiate(
             )
             .map_err(|e| -> Error {
                 match e {
-                    InstantiationError::StartTrap(trap) | InstantiationError::Trap(trap) => {
-                        Trap::from_runtime(trap).into()
-                    }
+                    InstantiationError::Trap(trap) => Trap::from_runtime(trap).into(),
                     other => other.into(),
                 }
             })?;
 
-        // If a start function is present, now that we've got our compiled
-        // instance we can invoke it. Make sure we use all the trap-handling
-        // configuration in `store` as well.
-        if let Some(start) = instance.module().start_func {
-            let f = match instance.lookup_by_declaration(&EntityIndex::Function(start)) {
-                wasmtime_runtime::Export::Function(f) => f,
-                _ => unreachable!(), // valid modules shouldn't hit this
-            };
-            super::func::catch_traps(instance.vmctx_ptr(), store, || {
+        instance
+    };
+
+    let start_func = instance.handle.module().start_func;
+
+    // If a start function is present, invoke it. Make sure we use all the
+    // trap-handling configuration in `store` as well.
+    if let Some(start) = start_func {
+        let f = match instance
+            .handle
+            .lookup_by_declaration(&EntityIndex::Function(start))
+        {
+            wasmtime_runtime::Export::Function(f) => f,
+            _ => unreachable!(), // valid modules shouldn't hit this
+        };
+        let vmctx_ptr = instance.handle.vmctx_ptr();
+        unsafe {
+            super::func::catch_traps(vmctx_ptr, store, || {
                 #[cfg(not(target_arch = "arm"))]
                 {
                     mem::transmute::<
-                        *const wasmtime_runtime::VMFunctionBody,
+                        *const VMFunctionBody,
                         unsafe extern "C" fn(*mut VMContext, *mut VMContext),
-                    >(f.address)(f.vmctx, instance.vmctx_ptr())
+                    >(f.address)(f.vmctx, vmctx_ptr)
                 }
 
                 #[cfg(target_arch = "arm")]
                 {
-                    mem::transmute::<usize, unsafe extern "C" fn(*mut VMContext, *mut VMContext)>(
-                        f.address as usize | 1,
-                    )(f.vmctx, instance.vmctx_ptr());
+                    mem::transmute::<
+                        *const VMFunctionBody,
+                        unsafe extern "C" fn(*mut VMContext, *mut VMContext),
+                    >((f.address as usize | 1) as *const VMFunctionBody)(
+                        f.vmctx, vmctx_ptr
+                    )
                 }
             })?;
         }
-
-        Ok(instance)
     }
+
+    Ok(instance)
 }
 
 /// An instantiated WebAssembly module.
@@ -107,6 +133,7 @@ fn instantiate(
 #[derive(Clone)]
 pub struct Instance {
     pub(crate) handle: StoreInstanceHandle,
+    store: Store,
     module: Module,
 }
 
@@ -120,6 +147,15 @@ impl Instance {
     /// specified below), but if successful the `start` function will be
     /// automatically run (if provided) and then the [`Instance`] will be
     /// returned.
+    ///
+    /// Per the WebAssembly spec, instantiation includes running the module's
+    /// start function, if it has one (not to be confused with the `_start`
+    /// function, which is not run).
+    ///
+    /// Note that this is a low-level function that just performance an
+    /// instantiation. See the `Linker` struct for an API which provides a
+    /// convenient way to link imports and provides automatic Command and Reactor
+    /// behavior.
     ///
     /// ## Providing Imports
     ///
@@ -155,36 +191,19 @@ impl Instance {
     /// [inst]: https://webassembly.github.io/spec/core/exec/modules.html#exec-instantiation
     /// [issue]: https://github.com/bytecodealliance/wasmtime/issues/727
     /// [`ExternType`]: crate::ExternType
-    pub fn new(module: &Module, imports: &[Extern]) -> Result<Instance, Error> {
-        let store = module.store();
-
-        // For now we have a restriction that the `Store` that we're working
-        // with is the same for everything involved here.
-        for import in imports {
-            if !import.comes_from_same_store(store) {
-                bail!("cross-`Store` instantiation is not currently supported");
-            }
-        }
-
-        if imports.len() != module.imports().len() {
-            bail!(
-                "wrong number of imports provided, {} != {}",
-                imports.len(),
-                module.imports().len()
-            );
+    pub fn new(store: &Store, module: &Module, imports: &[Extern]) -> Result<Instance, Error> {
+        if !Engine::same(store.engine(), module.engine()) {
+            bail!("cross-`Engine` instantiation is not currently supported");
         }
 
         let info = module.register_frame_info();
-        let handle = instantiate(
-            store,
-            module.compiled_module(),
-            imports,
-            store.compiler().signatures(),
-            Box::new(info),
-        )?;
+        store.register_jit_code(module.compiled_module().jit_code_ranges());
+
+        let handle = instantiate(store, module.compiled_module(), imports, Box::new(info))?;
 
         Ok(Instance {
             handle,
+            store: store.clone(),
             module: module.clone(),
         })
     }
@@ -194,7 +213,7 @@ impl Instance {
     /// This is the [`Store`] that generally serves as a sort of global cache
     /// for various instance-related things.
     pub fn store(&self) -> &Store {
-        self.module.store()
+        &self.store
     }
 
     /// Returns the list of exported items from this [`Instance`].

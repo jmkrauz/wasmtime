@@ -2,11 +2,9 @@
 
 use crate::binemit;
 use crate::ir::{self, Function};
-use crate::isa::{EncInfo, Encoding, Encodings, Legalize, RegClass, RegInfo, TargetIsa};
 use crate::isa::Builder as IsaBuilder;
-use crate::machinst::{
-    compile, MachBackend, MachCompileResult, ShowWithRRU, VCode,
-};
+use crate::isa::{EncInfo, Encoding, Encodings, Legalize, RegClass, RegInfo, TargetIsa};
+use crate::machinst::{compile, MachBackend, MachCompileResult, ShowWithRRU, VCode};
 use crate::regalloc::RegisterSet;
 use crate::result::CodegenResult;
 use crate::settings::{self, Flags};
@@ -15,9 +13,10 @@ use crate::settings::{self, Flags};
 use crate::regalloc::RegDiversions;
 
 use alloc::boxed::Box;
+use core::any::Any;
 use regalloc::RealRegUniverse;
-use std::fmt;
 use std::borrow::Cow;
+use std::fmt;
 use target_lexicon::{Architecture, ArmArchitecture, Triple};
 
 // New backend:
@@ -54,7 +53,7 @@ impl Arm32Backend {
     ) -> CodegenResult<VCode<inst::Inst>> {
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
-        let abi = Box::new(abi::Arm32ABIBody::new(func, flags));
+        let abi = Box::new(abi::Arm32ABIBody::new(func, flags)?);
         compile::compile::<Arm32Backend>(func, self, abi)
     }
 }
@@ -67,7 +66,7 @@ impl MachBackend for Arm32Backend {
     ) -> CodegenResult<MachCompileResult> {
         let flags = self.flags();
         let vcode = self.compile_vcode(func, flags.clone())?;
-        let sections = vcode.emit();
+        let buffer = vcode.emit();
         let frame_size = vcode.frame_size();
 
         let disasm = if want_disasm {
@@ -76,8 +75,10 @@ impl MachBackend for Arm32Backend {
             None
         };
 
+        let buffer = buffer.finish();
+
         Ok(MachCompileResult {
-            sections,
+            buffer,
             frame_size,
             disasm,
         })
@@ -230,5 +231,9 @@ impl TargetIsa for Arm32Isa {
 
     fn unsigned_sub_overflow_condition(&self) -> ir::condcodes::IntCC {
         self.backend.unsigned_sub_overflow_condition()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
     }
 }

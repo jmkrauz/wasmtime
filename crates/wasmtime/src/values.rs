@@ -1,7 +1,8 @@
-use crate::r#ref::AnyRef;
+use crate::r#ref::ExternRef;
 use crate::{Func, Store, ValType};
 use anyhow::{bail, Result};
 use std::ptr;
+use wasmtime_runtime::VMExternRef;
 
 /// Possible runtime values that a WebAssembly module can either consume or
 /// produce.
@@ -25,10 +26,8 @@ pub enum Val {
     /// `f64::from_bits` to create an `f64` value.
     F64(u64),
 
-    /// An `anyref` value which can hold opaque data to the wasm instance itself.
-    ///
-    /// Note that this is a nullable value as well.
-    AnyRef(AnyRef),
+    /// An `externref` value which can hold opaque data to the wasm instance itself.
+    ExternRef(Option<ExternRef>),
 
     /// A first-class reference to a WebAssembly function.
     FuncRef(Func),
@@ -62,9 +61,9 @@ macro_rules! accessors {
 }
 
 impl Val {
-    /// Returns a null `anyref` value.
+    /// Returns a null `externref` value.
     pub fn null() -> Val {
-        Val::AnyRef(AnyRef::null())
+        Val::ExternRef(None)
     }
 
     /// Returns the corresponding [`ValType`] for this `Val`.
@@ -74,7 +73,7 @@ impl Val {
             Val::I64(_) => ValType::I64,
             Val::F32(_) => ValType::F32,
             Val::F64(_) => ValType::F64,
-            Val::AnyRef(_) => ValType::AnyRef,
+            Val::ExternRef(_) => ValType::ExternRef,
             Val::FuncRef(_) => ValType::FuncRef,
             Val::V128(_) => ValType::V128,
         }
@@ -87,18 +86,31 @@ impl Val {
             Val::F32(u) => ptr::write(p as *mut u32, *u),
             Val::F64(u) => ptr::write(p as *mut u64, *u),
             Val::V128(b) => ptr::write(p as *mut u128, *b),
+            Val::ExternRef(None) => ptr::write(p, 0),
+            Val::ExternRef(Some(x)) => ptr::write(p as *mut *mut u8, x.inner.clone().into_raw()),
             _ => unimplemented!("Val::write_value_to"),
         }
     }
 
-    pub(crate) unsafe fn read_value_from(p: *const u128, ty: &ValType) -> Val {
+    pub(crate) unsafe fn read_value_from(store: &Store, p: *const u128, ty: &ValType) -> Val {
         match ty {
             ValType::I32 => Val::I32(ptr::read(p as *const i32)),
             ValType::I64 => Val::I64(ptr::read(p as *const i64)),
             ValType::F32 => Val::F32(ptr::read(p as *const u32)),
             ValType::F64 => Val::F64(ptr::read(p as *const u64)),
             ValType::V128 => Val::V128(ptr::read(p as *const u128)),
-            _ => unimplemented!("Val::read_value_from"),
+            ValType::ExternRef => {
+                let raw = ptr::read(p as *const *mut u8);
+                if raw.is_null() {
+                    Val::ExternRef(None)
+                } else {
+                    Val::ExternRef(Some(ExternRef {
+                        inner: VMExternRef::from_raw(raw),
+                        store: store.weak(),
+                    }))
+                }
+            }
+            _ => unimplemented!("Val::read_value_from: {:?}", ty),
         }
     }
 
@@ -112,25 +124,32 @@ impl Val {
         (V128(u128) v128 unwrap_v128 *e)
     }
 
-    /// Attempt to access the underlying value of this `Val`, returning
-    /// `None` if it is not the correct type.
+    /// Attempt to access the underlying `externref` value of this `Val`.
     ///
-    /// This will return `Some` for both the `AnyRef` and `FuncRef` types.
-    pub fn anyref(&self) -> Option<AnyRef> {
+    /// If this is not an `externref`, then `None` is returned.
+    ///
+    /// If this is a null `externref`, then `Some(None)` is returned.
+    ///
+    /// If this is a non-null `externref`, then `Some(Some(..))` is returned.
+    pub fn externref(&self) -> Option<Option<ExternRef>> {
         match self {
-            Val::AnyRef(e) => Some(e.clone()),
+            Val::ExternRef(e) => Some(e.clone()),
             _ => None,
         }
     }
 
-    /// Returns the underlying value of this `Val`, panicking if it's the
+    /// Returns the underlying `externref` value of this `Val`, panicking if it's the
     /// wrong type.
+    ///
+    /// If this is a null `externref`, then `None` is returned.
+    ///
+    /// If this is a non-null `externref`, then `Some(..)` is returned.
     ///
     /// # Panics
     ///
-    /// Panics if `self` is not of the right type.
-    pub fn unwrap_anyref(&self) -> AnyRef {
-        self.anyref().expect("expected anyref")
+    /// Panics if `self` is not a (nullable) `externref`.
+    pub fn unwrap_externref(&self) -> Option<ExternRef> {
+        self.externref().expect("expected externref")
     }
 
     pub(crate) fn comes_from_same_store(&self, store: &Store) -> bool {
@@ -138,10 +157,10 @@ impl Val {
             Val::FuncRef(f) => Store::same(store, f.store()),
 
             // TODO: need to implement this once we actually finalize what
-            // `anyref` will look like and it's actually implemented to pass it
+            // `externref` will look like and it's actually implemented to pass it
             // to compiled wasm as well.
-            Val::AnyRef(AnyRef::Ref(_)) | Val::AnyRef(AnyRef::Other(_)) => false,
-            Val::AnyRef(AnyRef::Null) => true,
+            Val::ExternRef(Some(e)) => e.store.ptr_eq(&store.weak()),
+            Val::ExternRef(None) => true,
 
             // Integers have no association with any particular store, so
             // they're always considered as "yes I came from that store",
@@ -174,9 +193,15 @@ impl From<f64> for Val {
     }
 }
 
-impl From<AnyRef> for Val {
-    fn from(val: AnyRef) -> Val {
-        Val::AnyRef(val)
+impl From<ExternRef> for Val {
+    fn from(val: ExternRef) -> Val {
+        Val::ExternRef(Some(val))
+    }
+}
+
+impl From<Option<ExternRef>> for Val {
+    fn from(val: Option<ExternRef>) -> Val {
+        Val::ExternRef(val)
     }
 }
 
@@ -194,7 +219,7 @@ pub(crate) fn into_checked_anyfunc(
         bail!("cross-`Store` values are not supported");
     }
     Ok(match val {
-        Val::AnyRef(AnyRef::Null) => wasmtime_runtime::VMCallerCheckedAnyfunc {
+        Val::ExternRef(None) => wasmtime_runtime::VMCallerCheckedAnyfunc {
             func_ptr: ptr::null(),
             type_index: wasmtime_runtime::VMSharedSignatureIndex::default(),
             vmctx: ptr::null_mut(),
@@ -216,7 +241,7 @@ pub(crate) fn from_checked_anyfunc(
     store: &Store,
 ) -> Val {
     if item.type_index == wasmtime_runtime::VMSharedSignatureIndex::default() {
-        return Val::AnyRef(AnyRef::Null);
+        return Val::ExternRef(None);
     }
     let instance_handle = unsafe { wasmtime_runtime::InstanceHandle::from_vmctx(item.vmctx) };
     let export = wasmtime_runtime::ExportFunction {

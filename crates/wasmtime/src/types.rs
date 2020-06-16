@@ -62,9 +62,23 @@ pub enum ValType {
     /// A 128 bit number.
     V128,
     /// A reference to opaque data in the Wasm instance.
-    AnyRef, /* = 128 */
+    ExternRef, /* = 128 */
     /// A reference to a Wasm function.
     FuncRef,
+}
+
+impl fmt::Display for ValType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ValType::I32 => write!(f, "i32"),
+            ValType::I64 => write!(f, "i64"),
+            ValType::F32 => write!(f, "f32"),
+            ValType::F64 => write!(f, "f64"),
+            ValType::V128 => write!(f, "v128"),
+            ValType::ExternRef => write!(f, "externref"),
+            ValType::FuncRef => write!(f, "funcref"),
+        }
+    }
 }
 
 impl ValType {
@@ -80,7 +94,7 @@ impl ValType {
     /// Returns true if `ValType` matches either of the reference types.
     pub fn is_ref(&self) -> bool {
         match self {
-            ValType::AnyRef | ValType::FuncRef => true,
+            ValType::ExternRef | ValType::FuncRef => true,
             _ => false,
         }
     }
@@ -104,6 +118,31 @@ impl ValType {
             ir::types::F64 => Some(ValType::F64),
             ir::types::I8X16 => Some(ValType::V128),
             _ => None,
+        }
+    }
+
+    pub(crate) fn to_wasm_type(&self) -> wasm::WasmType {
+        match self {
+            Self::I32 => wasm::WasmType::I32,
+            Self::I64 => wasm::WasmType::I64,
+            Self::F32 => wasm::WasmType::F32,
+            Self::F64 => wasm::WasmType::F64,
+            Self::V128 => wasm::WasmType::V128,
+            Self::FuncRef => wasm::WasmType::FuncRef,
+            Self::ExternRef => wasm::WasmType::ExternRef,
+        }
+    }
+
+    pub(crate) fn from_wasm_type(ty: &wasm::WasmType) -> Option<Self> {
+        match ty {
+            wasm::WasmType::I32 => Some(Self::I32),
+            wasm::WasmType::I64 => Some(Self::I64),
+            wasm::WasmType::F32 => Some(Self::F32),
+            wasm::WasmType::F64 => Some(Self::F64),
+            wasm::WasmType::V128 => Some(Self::V128),
+            wasm::WasmType::FuncRef => Some(Self::FuncRef),
+            wasm::WasmType::ExternRef => Some(Self::ExternRef),
+            wasm::WasmType::Func | wasm::WasmType::EmptyBlockType => None,
         }
     }
 }
@@ -184,12 +223,6 @@ impl From<TableType> for ExternType {
     }
 }
 
-// Function Types
-fn from_wasmtime_abiparam(param: &ir::AbiParam) -> Option<ValType> {
-    assert_eq!(param.purpose, ir::ArgumentPurpose::Normal);
-    ValType::from_wasmtime_type(param.value_type)
-}
-
 /// A descriptor for a function in a WebAssembly module.
 ///
 /// WebAssembly functions can have 0 or more parameters and results.
@@ -216,6 +249,13 @@ impl FuncType {
     /// Returns the list of result types for this function.
     pub fn results(&self) -> &[ValType] {
         &self.results
+    }
+
+    pub(crate) fn to_wasm_func_type(&self) -> wasm::WasmFuncType {
+        wasm::WasmFuncType {
+            params: self.params.iter().map(|p| p.to_wasm_type()).collect(),
+            returns: self.results.iter().map(|r| r.to_wasm_type()).collect(),
+        }
     }
 
     /// Returns `Some` if this function signature was compatible with cranelift,
@@ -251,17 +291,16 @@ impl FuncType {
     /// Returns `None` if any types in the signature can't be converted to the
     /// types in this crate, but that should very rarely happen and largely only
     /// indicate a bug in our cranelift integration.
-    pub(crate) fn from_wasmtime_signature(signature: &ir::Signature) -> Option<FuncType> {
+    pub(crate) fn from_wasm_func_type(signature: &wasm::WasmFuncType) -> Option<FuncType> {
         let params = signature
             .params
             .iter()
-            .skip(2) // skip the caller/callee vmctx
-            .map(|p| from_wasmtime_abiparam(p))
+            .map(|p| ValType::from_wasm_type(p))
             .collect::<Option<Vec<_>>>()?;
         let results = signature
             .returns
             .iter()
-            .map(|p| from_wasmtime_abiparam(p))
+            .map(|r| ValType::from_wasm_type(r))
             .collect::<Option<Vec<_>>>()?;
         Some(FuncType {
             params: params.into_boxed_slice(),
@@ -321,7 +360,7 @@ impl GlobalType {
 /// A descriptor for a table in a WebAssembly module.
 ///
 /// Tables are contiguous chunks of a specific element, typically a `funcref` or
-/// an `anyref`. The most common use for tables is a function table through
+/// an `externref`. The most common use for tables is a function table through
 /// which `call_indirect` can invoke other functions.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct TableType {
@@ -390,7 +429,7 @@ impl MemoryType {
 
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub(crate) enum EntityType<'module> {
-    Function(&'module ir::Signature),
+    Function(&'module wasm::WasmFuncType),
     Table(&'module wasm::Table),
     Memory(&'module wasm::Memory),
     Global(&'module wasm::Global),
@@ -404,7 +443,7 @@ impl<'module> EntityType<'module> {
     ) -> EntityType<'module> {
         match entity_index {
             EntityIndex::Function(func_index) => {
-                let sig = module.local.func_signature(*func_index);
+                let sig = module.local.wasm_func_type(*func_index);
                 EntityType::Function(&sig)
             }
             EntityIndex::Table(table_index) => {
@@ -419,9 +458,10 @@ impl<'module> EntityType<'module> {
         }
     }
 
-    fn extern_type(&self) -> ExternType {
+    /// Convert this `EntityType` to an `ExternType`.
+    pub(crate) fn extern_type(&self) -> ExternType {
         match self {
-            EntityType::Function(sig) => FuncType::from_wasmtime_signature(sig)
+            EntityType::Function(sig) => FuncType::from_wasm_func_type(sig)
                 .expect("core wasm function type should be supported")
                 .into(),
             EntityType::Table(table) => TableType::from_wasmtime_table(table).into(),

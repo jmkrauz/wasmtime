@@ -125,7 +125,11 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
                 GlobalVariable::Memory { gv, offset, ty } => {
                     let addr = builder.ins().global_value(environ.pointer_type(), gv);
                     let flags = ir::MemFlags::trusted();
-                    let val = state.pop1();
+                    let mut val = state.pop1();
+                    // Ensure SIMD values are cast to their default Cranelift type, I8x16.
+                    if ty.is_vector() {
+                        val = optionally_bitcast_vector(val, I8X16, builder);
+                    }
                     debug_assert_eq!(ty, builder.func.dfg.value_type(val));
                     builder.ins().store(flags, val, addr, offset);
                 }
@@ -1167,23 +1171,26 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             )?);
         }
         Operator::TableGrow { table } => {
+            let table_index = TableIndex::from_u32(*table);
             let delta = state.pop1();
             let init_value = state.pop1();
             state.push1(environ.translate_table_grow(
                 builder.cursor(),
-                *table,
+                table_index,
                 delta,
                 init_value,
             )?);
         }
         Operator::TableGet { table } => {
+            let table_index = TableIndex::from_u32(*table);
             let index = state.pop1();
-            state.push1(environ.translate_table_get(builder.cursor(), *table, index)?);
+            state.push1(environ.translate_table_get(builder.cursor(), table_index, index)?);
         }
         Operator::TableSet { table } => {
+            let table_index = TableIndex::from_u32(*table);
             let value = state.pop1();
             let index = state.pop1();
-            environ.translate_table_set(builder.cursor(), *table, value, index)?;
+            environ.translate_table_set(builder.cursor(), table_index, value, index)?;
         }
         Operator::TableCopy {
             dst_table: dst_table_index,
@@ -1206,10 +1213,11 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             )?;
         }
         Operator::TableFill { table } => {
+            let table_index = TableIndex::from_u32(*table);
             let len = state.pop1();
             let val = state.pop1();
             let dest = state.pop1();
-            environ.translate_table_fill(builder.cursor(), *table, dest, val, len)?;
+            environ.translate_table_fill(builder.cursor(), table_index, dest, val, len)?;
         }
         Operator::TableInit {
             segment,
@@ -1302,7 +1310,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let ty = type_of(op);
             let reduced = builder.ins().ireduce(ty.lane_type(), replacement);
             let vector = optionally_bitcast_vector(vector, ty, builder);
-            state.push1(builder.ins().insertlane(vector, *lane, reduced))
+            state.push1(builder.ins().insertlane(vector, reduced, *lane))
         }
         Operator::I32x4ReplaceLane { lane }
         | Operator::I64x2ReplaceLane { lane }
@@ -1310,7 +1318,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         | Operator::F64x2ReplaceLane { lane } => {
             let (vector, replacement) = state.pop2();
             let vector = optionally_bitcast_vector(vector, type_of(op), builder);
-            state.push1(builder.ins().insertlane(vector, *lane, replacement))
+            state.push1(builder.ins().insertlane(vector, replacement, *lane))
         }
         Operator::V8x16Shuffle { lanes, .. } => {
             let (a, b) = pop2_with_bitcast(state, I8X16, builder);
@@ -1375,7 +1383,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let a = pop1_with_bitcast(state, type_of(op), builder);
             state.push1(builder.ins().ineg(a))
         }
-        Operator::I16x8Mul | Operator::I32x4Mul => {
+        Operator::I16x8Mul | Operator::I32x4Mul | Operator::I64x2Mul => {
             let (a, b) = pop2_with_bitcast(state, type_of(op), builder);
             state.push1(builder.ins().imul(a, b))
         }
@@ -1536,8 +1544,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let a = pop1_with_bitcast(state, I32X4, builder);
             state.push1(builder.ins().fcvt_from_sint(F32X4, a))
         }
-        Operator::I64x2Mul
-        | Operator::I32x4TruncSatF32x4S
+        Operator::I32x4TruncSatF32x4S
         | Operator::I32x4TruncSatF32x4U
         | Operator::F32x4ConvertI32x4U
         | Operator::I8x16Abs
@@ -1556,6 +1563,10 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         | Operator::I32x4WidenLowI16x8U { .. }
         | Operator::I32x4WidenHighI16x8U { .. } => {
             return Err(wasm_unsupported!("proposed SIMD operator {:?}", op));
+        }
+
+        Operator::ReturnCall { .. } | Operator::ReturnCallIndirect { .. } => {
+            return Err(wasm_unsupported!("proposed tail-call operator {:?}", op));
         }
     };
     Ok(())
@@ -2057,7 +2068,8 @@ fn type_of(operator: &Operator) -> Type {
         | Operator::I64x2ShrS
         | Operator::I64x2ShrU
         | Operator::I64x2Add
-        | Operator::I64x2Sub => I64X2,
+        | Operator::I64x2Sub
+        | Operator::I64x2Mul => I64X2,
 
         Operator::F32x4Splat
         | Operator::F32x4ExtractLane { .. }

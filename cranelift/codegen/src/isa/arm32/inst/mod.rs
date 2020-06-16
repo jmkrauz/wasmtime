@@ -10,12 +10,12 @@ use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode, Type};
 use crate::machinst::*;
 use crate::{settings, CodegenError, CodegenResult};
 
-use regalloc::Map as RegallocMap;
-use regalloc::{RealReg, RealRegUniverse, Reg, RegClass, SpillSlot, VirtualReg, Writable};
-use regalloc::{RegUsageCollector, RegUsageMapper, Set};
+use regalloc::{RealRegUniverse, Reg, RegClass, SpillSlot, VirtualReg, Writable};
+use regalloc::{RegUsageCollector, RegUsageMapper};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::convert::TryInto;
 use smallvec::{smallvec, SmallVec};
 use std::string::{String, ToString};
 
@@ -196,16 +196,16 @@ pub enum Inst {
     /// A machine call instruction.
     Call {
         dest: Box<ExternalName>,
-        uses: Box<Set<Reg>>,
-        defs: Box<Set<Writable<Reg>>>,
+        uses: Box<Vec<Reg>>,
+        defs: Box<Vec<Writable<Reg>>>,
         loc: SourceLoc,
         opcode: Opcode,
     },
     /// A machine indirect-call instruction.
     CallInd {
         rm: Reg,
-        uses: Box<Set<Reg>>,
-        defs: Box<Set<Writable<Reg>>>,
+        uses: Box<Vec<Reg>>,
+        defs: Box<Vec<Writable<Reg>>>,
         loc: SourceLoc,
         opcode: Opcode,
     },
@@ -234,20 +234,10 @@ pub enum Inst {
         kind: CondBrKind,
     },
 
-    /// Lowered conditional branch: contains the original branch kind (or the
-    /// inverse), but only one BranchTarget is retained. The other is
-    /// implicitly the next instruction, given the final basic-block layout.
-    CondBrLowered {
+    /// A one-way conditional branch, invisible to the CFG processing; used *only* as part of
+    /// straight-line sequences in code to be emitted.
+    OneWayCondBr {
         target: BranchTarget,
-        kind: CondBrKind,
-    },
-
-    /// As for `CondBrLowered`, but represents a condbr/uncond-br sequence (two
-    /// actual machine instructions). Needed when the final block layout implies
-    /// that neither arm of a conditional branch targets the fallthrough block.
-    CondBrLoweredCompound {
-        taken: BranchTarget,
-        not_taken: BranchTarget,
         kind: CondBrKind,
     },
 
@@ -266,7 +256,7 @@ impl Inst {
     }
 
     /// Create an instruction that loads a constant.
-    pub fn load_constant(rd: Writable<Reg>, value: u32) -> SmallVec<[Inst; 7]> {
+    pub fn load_constant(rd: Writable<Reg>, value: u32) -> SmallVec<[Inst; 4]> {
         let imm16 = (value & 0xffff) as u16;
         let mut insts = smallvec![Inst::MovImm16 { rd, imm16 }];
 
@@ -385,9 +375,13 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::LoadExtName { rt, .. } => {
             collector.add_def(rt);
         }
-        &Inst::CondBr { ref kind, .. }
-        | &Inst::CondBrLowered { ref kind, .. }
-        | &Inst::CondBrLoweredCompound { ref kind, .. } => match kind {
+        &Inst::CondBr { ref kind, .. } => match kind {
+            CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
+                collector.add_use(*rt);
+            }
+            CondBrKind::Cond(_) => {}
+        },
+        &Inst::OneWayCondBr { ref kind, .. } => match kind {
             CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
                 collector.add_use(*rt);
             }
@@ -399,29 +393,22 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
 //=============================================================================
 // Instructions: map_regs
 
-fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
-    fn map(m: &RegallocMap<VirtualReg, RealReg>, r: &mut Reg) {
-        if r.is_virtual() {
-            let new = m.get(&r.to_virtual_reg()).cloned().unwrap().to_reg();
-            *r = new;
-        }
-    }
-
-    fn map_use(m: &RegUsageMapper, r: &mut Reg) {
+fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
+    fn map_use<RUM: RegUsageMapper>(m: &RUM, r: &mut Reg) {
         if r.is_virtual() {
             let new = m.get_use(r.to_virtual_reg()).unwrap().to_reg();
             *r = new;
         }
     }
 
-    fn map_def(m: &RegUsageMapper, r: &mut Writable<Reg>) {
+    fn map_def<RUM: RegUsageMapper>(m: &RUM, r: &mut Writable<Reg>) {
         if r.to_reg().is_virtual() {
             let new = m.get_def(r.to_reg().to_virtual_reg()).unwrap().to_reg();
             *r = Writable::from_reg(new);
         }
     }
 
-    fn map_mem(m: &RegUsageMapper, mem: &mut MemArg) {
+    fn map_mem<RUM: RegUsageMapper>(m: &RUM, mem: &mut MemArg) {
         match mem {
             &mut MemArg::RegReg(ref mut rn, ref mut rm, ..) => {
                 map_use(m, rn);
@@ -431,7 +418,7 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
         };
     }
 
-    fn map_br(m: &RegUsageMapper, br: &mut CondBrKind) {
+    fn map_br<RUM: RegUsageMapper>(m: &RUM, br: &mut CondBrKind) {
         match br {
             &mut CondBrKind::Zero(ref mut reg) => map_use(m, reg),
             &mut CondBrKind::NotZero(ref mut reg) => map_use(m, reg),
@@ -571,9 +558,10 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
         &mut Inst::LoadExtName { ref mut rt, .. } => {
             map_def(mapper, rt);
         }
-        &mut Inst::CondBr { ref mut kind, .. }
-        | &mut Inst::CondBrLowered { ref mut kind, .. }
-        | &mut Inst::CondBrLoweredCompound { ref mut kind, .. } => {
+        &mut Inst::CondBr { ref mut kind, .. } => {
+            map_br(mapper, kind);
+        }
+        &mut Inst::OneWayCondBr { ref mut kind, .. } => {
             map_br(mapper, kind);
         }
     }
@@ -584,11 +572,13 @@ fn arm32_map_regs(inst: &mut Inst, mapper: &RegUsageMapper) {
 
 #[allow(unused)]
 impl MachInst for Inst {
+    type LabelUse = LabelUse;
+
     fn get_regs(&self, collector: &mut RegUsageCollector) {
         arm32_get_regs(self, collector)
     }
 
-    fn map_regs(&mut self, mapper: &RegUsageMapper) {
+    fn map_regs<RUM: RegUsageMapper>(&mut self, mapper: &RUM) {
         arm32_map_regs(self, mapper);
     }
 
@@ -610,24 +600,10 @@ impl MachInst for Inst {
     fn is_term<'a>(&'a self) -> MachTerminator<'a> {
         match self {
             &Inst::Ret | &Inst::EpiloguePlaceholder => MachTerminator::Ret,
-            &Inst::Jump { dest } => MachTerminator::Uncond(dest.as_block_index().unwrap()),
+            &Inst::Jump { dest } => MachTerminator::Uncond(dest.as_label().unwrap()),
             &Inst::CondBr {
                 taken, not_taken, ..
-            } => MachTerminator::Cond(
-                taken.as_block_index().unwrap(),
-                not_taken.as_block_index().unwrap(),
-            ),
-            &Inst::CondBrLowered { .. } => {
-                // When this is used prior to branch finalization for branches
-                // within an open-coded sequence, i.e. with ResolvedOffsets,
-                // do not consider it a terminator. From the point of view of CFG analysis,
-                // it is part of a black-box single-in single-out region, hence is not
-                // denoted a terminator.
-                MachTerminator::None
-            }
-            &Inst::CondBrLoweredCompound { .. } => {
-                panic!("is_term() called after lowering branches");
-            }
+            } => MachTerminator::Cond(taken.as_label().unwrap(), not_taken.as_label().unwrap()),
             _ => MachTerminator::None,
         }
     }
@@ -640,6 +616,20 @@ impl MachInst for Inst {
             Inst::mov(to_reg, from_reg)
         } else {
             unimplemented!()
+        }
+    }
+
+    fn gen_constant(to_reg: Writable<Reg>, value: u64, ty: Type) -> SmallVec<[Inst; 4]> {
+        match ty {
+            B1 | I8 | B8 | I16 | B16 | I32 | B32 => {
+                let value: i64 = value as i64;
+                if value >= (1 << 32) || value < -(1 << 32) {
+                    panic!("Cannot load constant value {}", value)
+                }
+                let value: i32 = value.try_into().unwrap();
+                Inst::load_constant(to_reg, value as u32)
+            }
+            _ => unimplemented!(),
         }
     }
 
@@ -666,93 +656,19 @@ impl MachInst for Inst {
         }
     }
 
-    fn gen_jump(blockindex: BlockIndex) -> Inst {
+    fn gen_jump(target: MachLabel) -> Inst {
         Inst::Jump {
-            dest: BranchTarget::Block(blockindex),
+            dest: BranchTarget::Label(target),
         }
     }
 
-    fn with_block_rewrites(&mut self, block_target_map: &[BlockIndex]) {
-        match self {
-            &mut Inst::Jump { ref mut dest } => {
-                dest.map(block_target_map);
-            }
-            &mut Inst::CondBr {
-                ref mut taken,
-                ref mut not_taken,
-                ..
-            } => {
-                taken.map(block_target_map);
-                not_taken.map(block_target_map);
-            }
-            &mut Inst::CondBrLowered { .. } => {
-                // See note in `is_term()`: this is used in open-coded sequences
-                // within blocks and should be left alone.
-            }
-            &mut Inst::CondBrLoweredCompound { .. } => {
-                panic!("with_block_rewrites called after branch lowering!");
-            }
-            _ => {}
-        }
+    fn reg_universe(_flags: &settings::Flags) -> RealRegUniverse {
+        create_reg_universe()
     }
 
-    fn with_fallthrough_block(&mut self, fallthrough: Option<BlockIndex>) {
-        match self {
-            &mut Inst::CondBr {
-                taken,
-                not_taken,
-                kind,
-            } => {
-                if taken.as_block_index() == fallthrough
-                    && not_taken.as_block_index() == fallthrough
-                {
-                    *self = Inst::Nop0;
-                } else if taken.as_block_index() == fallthrough {
-                    *self = Inst::CondBrLowered {
-                        target: not_taken,
-                        kind: kind.invert(),
-                    };
-                } else if not_taken.as_block_index() == fallthrough {
-                    *self = Inst::CondBrLowered {
-                        target: taken,
-                        kind,
-                    };
-                } else {
-                    // We need a compound sequence (condbr / uncond-br).
-                    *self = Inst::CondBrLoweredCompound {
-                        taken,
-                        not_taken,
-                        kind,
-                    };
-                }
-            }
-            &mut Inst::Jump { dest } => {
-                if dest.as_block_index() == fallthrough {
-                    *self = Inst::Nop0;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn with_block_offsets(&mut self, my_offset: CodeOffset, targets: &[CodeOffset]) {
-        match self {
-            &mut Inst::CondBrLowered { ref mut target, .. } => {
-                target.lower(targets, my_offset);
-            }
-            &mut Inst::CondBrLoweredCompound {
-                ref mut taken,
-                ref mut not_taken,
-                ..
-            } => {
-                taken.lower(targets, my_offset);
-                not_taken.lower(targets, my_offset + 2);
-            }
-            &mut Inst::Jump { ref mut dest } => {
-                dest.lower(targets, my_offset);
-            }
-            _ => {}
-        }
+    fn worst_case_size() -> CodeOffset {
+        // LoadExtName
+        12
     }
 }
 
@@ -1052,12 +968,12 @@ impl ShowWithRRU for Inst {
                     }
                 }
             }
-            &Inst::CondBrLowered {
+            &Inst::OneWayCondBr {
                 ref target,
                 ref kind,
             } => {
                 let target = target.show_rru(mb_rru);
-                match &kind {
+                match kind {
                     &CondBrKind::Zero(reg) => {
                         let reg = reg.show_rru(mb_rru);
                         format!("cbz {}, {}", reg, target)
@@ -1072,20 +988,169 @@ impl ShowWithRRU for Inst {
                     }
                 }
             }
-            &Inst::CondBrLoweredCompound {
-                ref taken,
-                ref not_taken,
-                ref kind,
-            } => {
-                let first = Inst::CondBrLowered {
-                    target: taken.clone(),
-                    kind: kind.clone(),
-                };
-                let second = Inst::Jump {
-                    dest: not_taken.clone(),
-                };
-                first.show_rru(mb_rru) + " ; " + &second.show_rru(mb_rru)
+        }
+    }
+}
+
+//=============================================================================
+// Label fixups and jump veneers.
+
+/// Different forms of label references for different instruction formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelUse {
+    /// 6-bit branch offset used by 16-bit cbz and cbnz instructions.
+    Branch6,
+
+    /// 20-bit branch offset used by 32-bit conditional jumps.
+    Branch20,
+
+    /// 24-bit branch offset used by 32-bit uncoditional jump instruction.
+    Branch24,
+}
+
+impl MachInstLabelUse for LabelUse {
+    /// Alignment for veneer code. Every instruction must be 4-byte-aligned.
+    const ALIGN: CodeOffset = 2;
+
+    /// Maximum PC-relative range (positive), inclusive.
+    fn max_pos_range(self) -> CodeOffset {
+        match self {
+            LabelUse::Branch6 => (1 << 7) + 2,
+            LabelUse::Branch20 => (1 << 20) + 2,
+            LabelUse::Branch24 => (1 << 24) + 2,
+        }
+    }
+
+    /// Maximum PC-relative range (negative).
+    fn max_neg_range(self) -> CodeOffset {
+        match self {
+            LabelUse::Branch6 => 0,
+            LabelUse::Branch20 => (1 << 20) - 4,
+            LabelUse::Branch24 => (1 << 24) - 4,
+        }
+    }
+
+    /// Size of window into code needed to do the patch.
+    fn patch_size(self) -> CodeOffset {
+        if self == LabelUse::Branch6 {
+            2
+        } else {
+            4
+        }
+    }
+
+    /// Perform the patch.
+    fn patch(self, buffer: &mut [u8], use_offset: CodeOffset, label_offset: CodeOffset) {
+        let off = (label_offset as i64) - (use_offset as i64);
+        debug_assert!(off <= self.max_pos_range() as i64);
+        debug_assert!(off >= -(self.max_neg_range() as i64));
+        let off = off - 4;
+        match self {
+            LabelUse::Branch6 => {
+                let off = off as u16 >> 1;
+                let off_inserted = ((off & 0x1f) << 3) | ((off & 0x20) << 4);
+                let insn = u16::from_le_bytes([buffer[0], buffer[1]]);
+                let insn = (insn & !0x02f8) | off_inserted;
+                buffer[0..2].clone_from_slice(&u16::to_le_bytes(insn));
+            }
+            LabelUse::Branch20 => {
+                let off = off as u32 >> 1;
+                let imm11 = (off & 0x7ff) as u16;
+                let imm6 = ((off >> 11) & 0x3f) as u16;
+                let j1 = ((off >> 17) & 0x1) as u16;
+                let j2 = ((off >> 18) & 0x1) as u16;
+                let s = ((off >> 19) & 0x1) as u16;
+                let insn_fst = u16::from_le_bytes([buffer[0], buffer[1]]);
+                let insn_fst = (insn_fst & !0x43f) | imm6 | (s << 10);
+                let insn_snd = u16::from_le_bytes([buffer[2], buffer[3]]);
+                let insn_snd = (insn_snd & !0x2fff) | imm11 | (j2 << 11) | (j1 << 13);
+                buffer[0..2].clone_from_slice(&u16::to_le_bytes(insn_fst));
+                buffer[2..4].clone_from_slice(&u16::to_le_bytes(insn_snd));
+            }
+            LabelUse::Branch24 => {
+                let off = off as u32 >> 1;
+                let imm11 = (off & 0x7ff) as u16;
+                let imm10 = ((off >> 11) & 0x3ff) as u16;
+                let s = ((off >> 23) & 0x1) as u16;
+                let j1 = (((off >> 22) & 0x1) as u16 ^ s) ^ 0x1;
+                let j2 = (((off >> 21) & 0x1) as u16 ^ s) ^ 0x1;
+                let insn_fst = u16::from_le_bytes([buffer[0], buffer[1]]);
+                let insn_fst = (insn_fst & !0x07ff) | imm10 | (s << 10);
+                let insn_snd = u16::from_le_bytes([buffer[2], buffer[3]]);
+                let insn_snd = (insn_snd & !0x2fff) | imm11 | (j2 << 11) | (j1 << 13);
+                buffer[0..2].clone_from_slice(&u16::to_le_bytes(insn_fst));
+                buffer[2..4].clone_from_slice(&u16::to_le_bytes(insn_snd));
             }
         }
+    }
+
+    fn supports_veneer(self) -> bool {
+        false
+    }
+
+    /// How large is the veneer, if supported?
+    fn veneer_size(self) -> CodeOffset {
+        0
+    }
+
+    /// Generate a veneer into the buffer, given that this veneer is at `veneer_offset`, and return
+    /// an offset and label-use for the veneer's use of the original label.
+    fn generate_veneer(
+        self,
+        _buffer: &mut [u8],
+        _veneer_offset: CodeOffset,
+    ) -> (CodeOffset, LabelUse) {
+        unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_branch6() {
+        let label_use = LabelUse::Branch6;
+        let mut buffer = 0xb100_u16.to_le_bytes(); // cbz r0
+        let use_offset: CodeOffset = 0;
+        let label_offset: CodeOffset = label_use.max_pos_range();
+        label_use.patch(&mut buffer, use_offset, label_offset);
+        assert_eq!(u16::from_le_bytes(buffer), 0xb3f8);
+    }
+
+    #[test]
+    fn patch_branch20() {
+        let label_use = LabelUse::Branch20;
+        let mut buffer = 0x8000_f000_u32.to_le_bytes(); // beq
+        let use_offset: CodeOffset = 0;
+        let label_offset: CodeOffset = label_use.max_pos_range();
+        label_use.patch(&mut buffer, use_offset, label_offset);
+        assert_eq!(u16::from_le_bytes([buffer[0], buffer[1]]), 0xf03f);
+        assert_eq!(u16::from_le_bytes([buffer[2], buffer[3]]), 0xafff);
+
+        let mut buffer = 0x8000_f000_u32.to_le_bytes(); // beq
+        let use_offset = label_use.max_neg_range();
+        let label_offset: CodeOffset = 0;
+        label_use.patch(&mut buffer, use_offset, label_offset);
+        assert_eq!(u16::from_le_bytes([buffer[0], buffer[1]]), 0xf400);
+        assert_eq!(u16::from_le_bytes([buffer[2], buffer[3]]), 0x8000);
+    }
+
+    #[test]
+    fn patch_branch24() {
+        let label_use = LabelUse::Branch24;
+        let mut buffer = 0x9000_f000_u32.to_le_bytes();
+        let use_offset: CodeOffset = 0;
+        let label_offset: CodeOffset = label_use.max_pos_range();
+        label_use.patch(&mut buffer, use_offset, label_offset);
+        assert_eq!(u16::from_le_bytes([buffer[0], buffer[1]]), 0xf3ff);
+        assert_eq!(u16::from_le_bytes([buffer[2], buffer[3]]), 0x97ff);
+
+        let mut buffer = 0x9000_f000_u32.to_le_bytes();
+        let use_offset = label_use.max_neg_range();
+        let label_offset: CodeOffset = 0;
+        label_use.patch(&mut buffer, use_offset, label_offset);
+        assert_eq!(u16::from_le_bytes([buffer[0], buffer[1]]), 0xf400);
+        assert_eq!(u16::from_le_bytes([buffer[2], buffer[3]]), 0x9000);
     }
 }

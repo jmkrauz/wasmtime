@@ -38,9 +38,10 @@ use wasmtime_runtime::{Export, InstanceHandle, VMContext, VMFunctionBody};
 /// ```
 /// # use wasmtime::*;
 /// # fn main() -> anyhow::Result<()> {
-/// let store = Store::default();
-/// let module = Module::new(&store, r#"(module (func (export "foo")))"#)?;
-/// let instance = Instance::new(&module, &[])?;
+/// let engine = Engine::default();
+/// let store = Store::new(&engine);
+/// let module = Module::new(&engine, r#"(module (func (export "foo")))"#)?;
+/// let instance = Instance::new(&store, &module, &[])?;
 /// let foo = instance.get_func("foo").expect("export wasn't a function");
 ///
 /// // Work with `foo` as a `Func` at this point, such as calling it
@@ -76,7 +77,7 @@ use wasmtime_runtime::{Export, InstanceHandle, VMContext, VMFunctionBody};
 ///
 /// // Next we can hook that up to a wasm module which uses it.
 /// let module = Module::new(
-///     &store,
+///     store.engine(),
 ///     r#"
 ///         (module
 ///             (import "" "" (func $add (param i32 i32) (result i32)))
@@ -90,7 +91,7 @@ use wasmtime_runtime::{Export, InstanceHandle, VMContext, VMFunctionBody};
 ///                 i32.add))
 ///     "#,
 /// )?;
-/// let instance = Instance::new(&module, &[add.into()])?;
+/// let instance = Instance::new(&store, &module, &[add.into()])?;
 /// let call_add_twice = instance.get_func("call_add_twice").expect("export wasn't a function");
 /// let call_add_twice = call_add_twice.get0::<i32>()?;
 ///
@@ -120,7 +121,7 @@ use wasmtime_runtime::{Export, InstanceHandle, VMContext, VMFunctionBody};
 /// });
 ///
 /// let module = Module::new(
-///     &store,
+///     store.engine(),
 ///     r#"
 ///         (module
 ///             (import "" "" (func $double (param i32) (result i32)))
@@ -131,7 +132,7 @@ use wasmtime_runtime::{Export, InstanceHandle, VMContext, VMFunctionBody};
 ///             (start $start))
 ///     "#,
 /// )?;
-/// let instance = Instance::new(&module, &[double.into()])?;
+/// let instance = Instance::new(&store, &module, &[double.into()])?;
 /// // .. work with `instance` if necessary
 /// # Ok(())
 /// # }
@@ -244,9 +245,10 @@ impl Func {
             // number of arguments and the right types of arguments. As a result
             // we should be able to safely run through them all and read them.
             let mut args = Vec::with_capacity(ty_clone.params().len());
+            let store = Store::upgrade(&store_weak).unwrap();
             for (i, ty) in ty_clone.params().iter().enumerate() {
                 unsafe {
-                    args.push(Val::read_value_from(values_vec.add(i), ty));
+                    args.push(Val::read_value_from(&store, values_vec.add(i), ty));
                 }
             }
             let mut returns = vec![Val::null(); ty_clone.results().len()];
@@ -294,11 +296,13 @@ impl Func {
     /// | Rust Argument Type | WebAssembly Type |
     /// |--------------------|------------------|
     /// | `i32`              | `i32`            |
+    /// | `u32`              | `i32`            |
     /// | `i64`              | `i64`            |
+    /// | `u64`              | `i64`            |
     /// | `f32`              | `f32`            |
     /// | `f64`              | `f64`            |
     /// | (not supported)    | `v128`           |
-    /// | (not supported)    | `anyref`         |
+    /// | (not supported)    | `externref`         |
     ///
     /// Any of the Rust types can be returned from the closure as well, in
     /// addition to some extra types
@@ -334,7 +338,7 @@ impl Func {
     /// # let store = Store::default();
     /// let add = Func::wrap(&store, |a: i32, b: i32| a + b);
     /// let module = Module::new(
-    ///     &store,
+    ///     store.engine(),
     ///     r#"
     ///         (module
     ///             (import "" "" (func $add (param i32 i32) (result i32)))
@@ -344,7 +348,7 @@ impl Func {
     ///                 call $add))
     ///     "#,
     /// )?;
-    /// let instance = Instance::new(&module, &[add.into()])?;
+    /// let instance = Instance::new(&store, &module, &[add.into()])?;
     /// let foo = instance.get_func("foo").unwrap().get2::<i32, i32, i32>()?;
     /// assert_eq!(foo(1, 2)?, 3);
     /// # Ok(())
@@ -365,7 +369,7 @@ impl Func {
     ///     }
     /// });
     /// let module = Module::new(
-    ///     &store,
+    ///     store.engine(),
     ///     r#"
     ///         (module
     ///             (import "" "" (func $add (param i32 i32) (result i32)))
@@ -375,7 +379,7 @@ impl Func {
     ///                 call $add))
     ///     "#,
     /// )?;
-    /// let instance = Instance::new(&module, &[add.into()])?;
+    /// let instance = Instance::new(&store, &module, &[add.into()])?;
     /// let foo = instance.get_func("foo").unwrap().get2::<i32, i32, i32>()?;
     /// assert_eq!(foo(1, 2)?, 3);
     /// assert!(foo(i32::max_value(), 1).is_err());
@@ -389,26 +393,31 @@ impl Func {
     /// # use wasmtime::*;
     /// # fn main() -> anyhow::Result<()> {
     /// # let store = Store::default();
-    /// let debug = Func::wrap(&store, |a: i32, b: f32, c: i64, d: f64| {
+    /// let debug = Func::wrap(&store, |a: i32, b: u32, c: f32, d: i64, e: u64, f: f64| {
+    ///
     ///     println!("a={}", a);
     ///     println!("b={}", b);
     ///     println!("c={}", c);
     ///     println!("d={}", d);
+    ///     println!("e={}", e);
+    ///     println!("f={}", f);
     /// });
     /// let module = Module::new(
-    ///     &store,
+    ///     store.engine(),
     ///     r#"
     ///         (module
-    ///             (import "" "" (func $debug (param i32 f32 i64 f64)))
+    ///             (import "" "" (func $debug (param i32 i32 f32 i64 i64 f64)))
     ///             (func (export "foo")
+    ///                 i32.const -1
     ///                 i32.const 1
     ///                 f32.const 2
+    ///                 i64.const -3
     ///                 i64.const 3
     ///                 f64.const 4
     ///                 call $debug))
     ///     "#,
     /// )?;
-    /// let instance = Instance::new(&module, &[debug.into()])?;
+    /// let instance = Instance::new(&store, &module, &[debug.into()])?;
     /// let foo = instance.get_func("foo").unwrap().get0::<()>()?;
     /// foo()?;
     /// # Ok(())
@@ -452,7 +461,7 @@ impl Func {
     ///     Ok(())
     /// });
     /// let module = Module::new(
-    ///     &store,
+    ///     store.engine(),
     ///     r#"
     ///         (module
     ///             (import "" "" (func $log_str (param i32 i32)))
@@ -464,7 +473,7 @@ impl Func {
     ///             (data (i32.const 4) "Hello, world!"))
     ///     "#,
     /// )?;
-    /// let instance = Instance::new(&module, &[log_str.into()])?;
+    /// let instance = Instance::new(&store, &module, &[log_str.into()])?;
     /// let foo = instance.get_func("foo").unwrap().get0::<()>()?;
     /// foo()?;
     /// # Ok(())
@@ -478,41 +487,23 @@ impl Func {
     pub fn ty(&self) -> FuncType {
         // Signatures should always be registered in the store's registry of
         // shared signatures, so we should be able to unwrap safely here.
-        let sig = self
-            .instance
-            .store
-            .compiler()
-            .signatures()
-            .lookup(self.export.signature)
-            .expect("failed to lookup signature");
+        let sig = self.instance.store.lookup_signature(self.export.signature);
 
         // This is only called with `Export::Function`, and since it's coming
         // from wasmtime_runtime itself we should support all the types coming
         // out of it, so assert such here.
-        FuncType::from_wasmtime_signature(&sig).expect("core wasm signature should be supported")
+        FuncType::from_wasm_func_type(&sig).expect("core wasm signature should be supported")
     }
 
     /// Returns the number of parameters that this function takes.
     pub fn param_arity(&self) -> usize {
-        let sig = self
-            .instance
-            .store
-            .compiler()
-            .signatures()
-            .lookup(self.export.signature)
-            .expect("failed to lookup signature");
-        sig.params.len() - 2 // skip the two vmctx leading parameters
+        let sig = self.instance.store.lookup_signature(self.export.signature);
+        sig.params.len()
     }
 
     /// Returns the number of results this function produces.
     pub fn result_arity(&self) -> usize {
-        let sig = self
-            .instance
-            .store
-            .compiler()
-            .signatures()
-            .lookup(self.export.signature)
-            .expect("failed to lookup signature");
+        let sig = self.instance.store.lookup_signature(self.export.signature);
         sig.returns.len()
     }
 
@@ -546,7 +537,11 @@ impl Func {
         let param_tys = my_ty.params().iter();
         for ((arg, slot), ty) in params.iter().zip(&mut values_vec).zip(param_tys) {
             if arg.ty() != *ty {
-                bail!("argument type mismatch");
+                bail!(
+                    "argument type mismatch: found {} but expected {}",
+                    arg.ty(),
+                    ty
+                );
             }
             if !arg.comes_from_same_store(&self.instance.store) {
                 bail!("cross-`Store` values are not currently supported");
@@ -571,7 +566,7 @@ impl Func {
         for (index, ty) in my_ty.results().iter().enumerate() {
             unsafe {
                 let ptr = values_vec.as_ptr().add(index);
-                results.push(Val::read_value_from(ptr, ty));
+                results.push(Val::read_value_from(&self.instance.store, ptr, ty));
             }
         }
 
@@ -722,7 +717,8 @@ impl Func {
         (get15, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15)
     }
 
-    pub(crate) fn store(&self) -> &Store {
+    /// Get a reference to this function's store.
+    pub fn store(&self) -> &Store {
         &self.instance.store
     }
 }
@@ -743,7 +739,7 @@ pub(crate) fn catch_traps(
         wasmtime_runtime::catch_traps(
             vmctx,
             store.engine().config().max_wasm_stack,
-            |addr| store.compiler().is_in_jit_code(addr),
+            |addr| store.is_in_jit_code(addr),
             signalhandler.as_deref(),
             closure,
         )
@@ -806,6 +802,23 @@ unsafe impl WasmTy for i32 {
     }
 }
 
+unsafe impl WasmTy for u32 {
+    fn push(dst: &mut Vec<ValType>) {
+        <i32 as WasmTy>::push(dst)
+    }
+    fn matches(tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
+        <i32 as WasmTy>::matches(tys)
+    }
+    #[inline]
+    unsafe fn load(ptr: &mut *const u128) -> Self {
+        <i32 as WasmTy>::load(ptr) as Self
+    }
+    #[inline]
+    unsafe fn store(abi: Self, ptr: *mut u128) {
+        <i32 as WasmTy>::store(abi as i32, ptr)
+    }
+}
+
 unsafe impl WasmTy for i64 {
     fn push(dst: &mut Vec<ValType>) {
         dst.push(ValType::I64);
@@ -828,6 +841,23 @@ unsafe impl WasmTy for i64 {
     #[inline]
     unsafe fn store(abi: Self, ptr: *mut u128) {
         *ptr = abi as u128;
+    }
+}
+
+unsafe impl WasmTy for u64 {
+    fn push(dst: &mut Vec<ValType>) {
+        <i64 as WasmTy>::push(dst)
+    }
+    fn matches(tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
+        <i64 as WasmTy>::matches(tys)
+    }
+    #[inline]
+    unsafe fn load(ptr: &mut *const u128) -> Self {
+        <i64 as WasmTy>::load(ptr) as Self
+    }
+    #[inline]
+    unsafe fn store(abi: Self, ptr: *mut u128) {
+        <i64 as WasmTy>::store(abi as i64, ptr)
     }
 }
 
@@ -1038,6 +1068,12 @@ impl Caller<'_> {
             Some(Extern::Memory(mem))
         }
     }
+
+    /// Get a handle to this caller's store.
+    pub fn store(&self) -> Store {
+        // See comment above the `store` member for why this unwrap is OK.
+        Store::upgrade(&self.store).unwrap()
+    }
 }
 
 macro_rules! impl_into_func {
@@ -1174,4 +1210,60 @@ impl_into_func! {
     (A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13)
     (A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14)
     (A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A15)
+}
+
+#[test]
+fn wasm_ty_roundtrip() -> Result<(), anyhow::Error> {
+    use crate::*;
+    let store = Store::default();
+    let debug = Func::wrap(&store, |a: i32, b: u32, c: f32, d: i64, e: u64, f: f64| {
+        assert_eq!(a, -1);
+        assert_eq!(b, 1);
+        assert_eq!(c, 2.0);
+        assert_eq!(d, -3);
+        assert_eq!(e, 3);
+        assert_eq!(f, 4.0);
+    });
+    let module = Module::new(
+        store.engine(),
+        r#"
+             (module
+                 (import "" "" (func $debug (param i32 i32 f32 i64 i64 f64)))
+                 (func (export "foo") (param i32 i32 f32 i64 i64 f64)
+                    (if (i32.ne (local.get 0) (i32.const -1))
+                        (then unreachable)
+                    )
+                    (if (i32.ne (local.get 1) (i32.const 1))
+                        (then unreachable)
+                    )
+                    (if (f32.ne (local.get 2) (f32.const 2))
+                        (then unreachable)
+                    )
+                    (if (i64.ne (local.get 3) (i64.const -3))
+                        (then unreachable)
+                    )
+                    (if (i64.ne (local.get 4) (i64.const 3))
+                        (then unreachable)
+                    )
+                    (if (f64.ne (local.get 5) (f64.const 4))
+                        (then unreachable)
+                    )
+                    local.get 0
+                    local.get 1
+                    local.get 2
+                    local.get 3
+                    local.get 4
+                    local.get 5
+                    call $debug
+                )
+            )
+         "#,
+    )?;
+    let instance = Instance::new(&store, &module, &[debug.into()])?;
+    let foo = instance
+        .get_func("foo")
+        .unwrap()
+        .get6::<i32, u32, f32, i64, u64, f64, ()>()?;
+    foo(-1, 1, 2.0, -3, 3, 4.0)?;
+    Ok(())
 }

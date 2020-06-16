@@ -117,6 +117,18 @@ WASM_API_EXTERN own wasmtime_error_t* wasmtime_linker_instantiate(
     own wasm_trap_t **trap
 );
 
+WASM_API_EXTERN own wasmtime_error_t* wasmtime_linker_module(
+    const wasmtime_linker_t *linker,
+    const wasm_name_t *name,
+    const wasm_module_t *module
+);
+
+WASM_API_EXTERN own wasmtime_error_t* wasmtime_linker_get_default(
+    const wasmtime_linker_t *linker,
+    const wasm_name_t *name,
+    own wasm_func_t **func
+);
+
 ///////////////////////////////////////////////////////////////////////////////
 //
 // wasmtime_caller_t extension, binding the `Caller` type in the Rust API
@@ -232,6 +244,7 @@ WASM_API_EXTERN own wasmtime_error_t *wasmtime_global_set(
 // instance is returned), or an instance can be returned (meaning no error or
 // trap is returned).
 WASM_API_EXTERN own wasmtime_error_t *wasmtime_instance_new(
+    wasm_store_t *store,
     const wasm_module_t *module,
     const wasm_extern_t* const imports[],
     size_t num_imports,

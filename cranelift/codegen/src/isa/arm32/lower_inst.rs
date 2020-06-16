@@ -5,6 +5,7 @@ use crate::ir::Inst as IRInst;
 use crate::ir::{InstructionData, Opcode};
 use crate::machinst::lower::*;
 use crate::machinst::*;
+use crate::CodegenResult;
 
 use crate::isa::arm32::abi::*;
 use crate::isa::arm32::inst::*;
@@ -17,7 +18,10 @@ use smallvec::SmallVec;
 use super::lower::*;
 
 /// Actually codegen an instruction's results into registers.
-pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRInst) {
+pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
+    ctx: &mut C,
+    insn: IRInst,
+) -> CodegenResult<()> {
     let op = ctx.data(insn).opcode();
     let inputs: SmallVec<[InsnInput; 4]> = (0..ctx.num_inputs(insn))
         .map(|i| InsnInput { insn, input: i })
@@ -119,7 +123,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
             match ty {
                 I32 => {
                     let rd_hi = output_to_reg(ctx, outputs[0]);
-                    let rd_lo = ctx.tmp(RegClass::I32, ty);
+                    let rd_lo = ctx.alloc_tmp(RegClass::I32, ty);
                     let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
                     let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
                     let alu_op = if is_signed {
@@ -397,7 +401,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
                     assert!(inputs.len() == sig.params.len());
                     assert!(outputs.len() == sig.returns.len());
                     (
-                        Arm32ABICall::from_func(sig, &extname, dist, loc),
+                        Arm32ABICall::from_func(sig, &extname, dist, loc)?,
                         &inputs[..],
                     )
                 }
@@ -406,7 +410,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
                     let sig = ctx.call_sig(insn).unwrap();
                     assert!(inputs.len() - 1 == sig.params.len());
                     assert!(outputs.len() == sig.returns.len());
-                    (Arm32ABICall::from_ptr(sig, ptr, loc, op), &inputs[1..])
+                    (Arm32ABICall::from_ptr(sig, ptr, loc, op)?, &inputs[1..])
                 }
                 _ => unreachable!(),
             };
@@ -419,14 +423,16 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(ctx: &mut C, insn: IRIns
         }
         _ => panic!("Lowering {} unimplemented!", op),
     }
+
+    Ok(())
 }
 
 pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
     ctx: &mut C,
     branches: &[IRInst],
-    targets: &[BlockIndex],
-    fallthrough: Option<BlockIndex>,
-) {
+    targets: &[MachLabel],
+    fallthrough: Option<MachLabel>,
+) -> CodegenResult<()> {
     // A block should end with at most two branches. The first may be a
     // conditional branch; a conditional branch can be followed only by an
     // unconditional branch or fallthrough. Otherwise, if only one branch,
@@ -441,10 +447,10 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
         let op1 = ctx.data(branches[1]).opcode();
 
         assert!(op1 == Opcode::Jump || op1 == Opcode::Fallthrough);
-        let taken = BranchTarget::Block(targets[0]);
+        let taken = BranchTarget::Label(targets[0]);
         let not_taken = match op1 {
-            Opcode::Jump => BranchTarget::Block(targets[1]),
-            Opcode::Fallthrough => BranchTarget::Block(fallthrough.unwrap()),
+            Opcode::Jump => BranchTarget::Label(targets[1]),
+            Opcode::Fallthrough => BranchTarget::Label(fallthrough.unwrap()),
             _ => unreachable!(), // assert above.
         };
         match op0 {
@@ -508,11 +514,13 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                 // fills in `targets[0]` with our fallthrough block, so this
                 // is valid for both Jump and Fallthrough.
                 ctx.emit(Inst::Jump {
-                    dest: BranchTarget::Block(targets[0]),
+                    dest: BranchTarget::Label(targets[0]),
                 });
             }
             Opcode::BrTable => unimplemented!(),
             _ => panic!("Unknown branch type!"),
         }
     }
+
+    Ok(())
 }

@@ -9,15 +9,18 @@ use crate::isa::arm32::{self, inst::*};
 use crate::isa::{self, RegUnit};
 use crate::machinst::*;
 use crate::settings;
+use crate::{CodegenError, CodegenResult};
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::mem;
-use log::debug;
+use log::{debug, trace};
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
 use smallvec::SmallVec;
+
+static STACK_ARG_RET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
 struct Args {
     r_used: u32,
@@ -111,6 +114,8 @@ struct ABISig {
     args: Vec<ABIArg>,
     rets: Vec<ABIArg>,
     stack_arg_space: u32,
+    stack_ret_space: u32,
+    stack_ret_arg: Option<usize>,
 }
 
 #[rustfmt::skip]
@@ -123,15 +128,31 @@ static CALLEE_SAVED_GPR: &[bool] = &[
     false, false, false, false
 ];
 
+/// Are we computing information about arguments or return values? Much of the
+/// handling is factored out into common routines; this enum allows us to
+/// distinguish which case we're handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgsOrRets {
+    Args,
+    Rets,
+}
+
 /// Process a list of parameters or return values and allocate them to R-regs and stack slots.
 ///
 /// Returns the list of argument locations, and the stack-space used (rounded up
 /// to a 8-byte-aligned boundary).
-fn compute_arg_locs(params: &[ir::AbiParam]) -> (Vec<ABIArg>, u32) {
+fn compute_arg_locs(
+    params: &[ir::AbiParam],
+    args_or_rets: ArgsOrRets,
+    add_ret_area_ptr: bool,
+) -> CodegenResult<(Vec<ABIArg>, u32, Option<usize>)> {
     // See AAPCS ABI https://developer.arm.com/docs/ihi0042/latest
     // r9 is an additional callee-saved variable register.
     let mut stack_off: u32 = 0;
+    let mut next_rreg: u8 = 0;
     let mut ret = vec![];
+
+    let max_rreg: u8 = 3;
 
     for param in params {
         // Validate "purpose".
@@ -147,7 +168,10 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> (Vec<ABIArg>, u32) {
         match param.location {
             ArgumentLoc::Reg(reg) => {
                 let reg: u8 = reg.try_into().unwrap();
-                ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty))
+                ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty));
+                if next_rreg <= reg {
+                    next_rreg += 1;
+                }
             }
             ArgumentLoc::Stack(off) => {
                 ret.push(ABIArg::Stack(off, ty));
@@ -162,28 +186,60 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> (Vec<ABIArg>, u32) {
         }
     }
 
+    let extra_arg = if add_ret_area_ptr {
+        debug_assert!(args_or_rets == ArgsOrRets::Args);
+        if next_rreg < max_rreg {
+            ret.push(ABIArg::Reg(rreg(next_rreg).to_real_reg(), I32));
+        } else {
+            ret.push(ABIArg::Stack(stack_off as i32 + 4, I32));
+            stack_off += 4;
+        }
+        Some(ret.len() - 1)
+    } else {
+        None
+    };
+
+    // To avoid overflow issues, limit the arg/return size to something
+    // reasonable -- here, 128 MB.
+    if stack_off >= STACK_ARG_RET_SIZE_LIMIT {
+        return Err(CodegenError::ImplLimitExceeded);
+    }
+
     stack_off = (stack_off + 7) & !7;
 
-    (ret, stack_off)
+    Ok((ret, stack_off, extra_arg))
 }
 
 impl ABISig {
-    fn from_func_sig(sig: &ir::Signature) -> ABISig {
-        // Compute args and retvals from signature.
-        let (args, stack_arg_space) = compute_arg_locs(&sig.params);
-        let (rets, _) = compute_arg_locs(&sig.returns);
+    fn from_func_sig(sig: &ir::Signature) -> CodegenResult<ABISig> {
+        // Compute args and retvals from signature. Handle retvals first,
+        // because we may need to add a return-area arg to the args.
+        let (rets, stack_ret_space, _) = compute_arg_locs(
+            &sig.returns,
+            ArgsOrRets::Rets,
+            /* extra ret-area ptr = */ false,
+        )?;
+        let need_stack_return_area = stack_ret_space > 0;
+        let (args, stack_arg_space, stack_ret_arg) =
+            compute_arg_locs(&sig.params, ArgsOrRets::Args, need_stack_return_area)?;
 
-        // Verify that there are no return values on the stack.
-        assert!(rets.iter().all(|a| match a {
-            &ABIArg::Stack(..) => false,
-            _ => true,
-        }));
-
-        ABISig {
+        trace!(
+            "ABISig: sig {:?} => args = {:?} rets = {:?} arg stack = {} ret stack = {} stack_ret_arg = {:?}",
+            sig,
             args,
             rets,
             stack_arg_space,
-        }
+            stack_ret_space,
+            stack_ret_arg
+        );
+
+        Ok(ABISig {
+            args,
+            rets,
+            stack_arg_space,
+            stack_ret_space,
+            stack_ret_arg,
+        })
     }
 }
 
@@ -201,8 +257,8 @@ pub struct Arm32ABIBody {
     spillslots: Option<usize>,
     /// Total frame size.
     total_frame_size: Option<u32>,
-    /// Calling convention this function expects.
-    call_conv: isa::CallConv,
+    /// The register holding the return-area pointer, if needed.
+    ret_area_ptr: Option<Writable<Reg>>,
     /// The settings controlling this function's compilation.
     flags: settings::Flags,
     /// Whether or not this function is a "leaf", meaning it calls no other
@@ -281,12 +337,12 @@ fn is_caller_save(r: RealReg) -> bool {
     }
 }
 
-fn get_caller_saves_set() -> Set<Writable<Reg>> {
-    let mut set = Set::empty();
+fn get_caller_saves() -> Vec<Writable<Reg>> {
+    let mut set = vec![];
     for i in 0..15 {
         let r = writable_rreg(i);
         if is_caller_save(r.to_reg().to_real_reg()) {
-            set.insert(r);
+            set.push(r);
         }
     }
     set
@@ -354,10 +410,10 @@ fn get_special_purpose_param_register(
 
 impl Arm32ABIBody {
     /// Create a new body ABI instance.
-    pub fn new(f: &ir::Function, flags: settings::Flags) -> Self {
+    pub fn new(f: &ir::Function, flags: settings::Flags) -> CodegenResult<Self> {
         debug!("Arm32 ABI: func signature {:?}", f.signature);
 
-        let sig = ABISig::from_func_sig(&f.signature);
+        let sig = ABISig::from_func_sig(&f.signature)?;
 
         let call_conv = f.signature.call_conv;
         // Only this calling conventions are supported.
@@ -378,22 +434,33 @@ impl Arm32ABIBody {
             stackslots.push(off);
         }
 
-        Self {
+        Ok(Self {
             sig,
             stackslots,
             stackslots_size: stack_offset,
             clobbered: Set::empty(),
             spillslots: None,
             total_frame_size: None,
-            call_conv,
+            ret_area_ptr: None,
             flags,
             is_leaf: f.is_leaf(),
-        }
+        })
     }
 }
 
 impl ABIBody for Arm32ABIBody {
     type I = Inst;
+
+    fn temp_needed(&self) -> bool {
+        self.sig.stack_ret_arg.is_some()
+    }
+
+    fn init(&mut self, maybe_tmp: Option<Writable<Reg>>) {
+        if self.sig.stack_ret_arg.is_some() {
+            assert!(maybe_tmp.is_some());
+            self.ret_area_ptr = maybe_tmp;
+        }
+    }
 
     fn flags(&self) -> &settings::Flags {
         &self.flags
@@ -442,6 +509,21 @@ impl ABIBody for Arm32ABIBody {
                 };
                 load_stack(mem, into_reg, ty)
             }
+        }
+    }
+
+    fn gen_retval_area_setup(&self) -> Option<Inst> {
+        if let Some(i) = self.sig.stack_ret_arg {
+            let inst = self.gen_copy_arg_to_reg(i, self.ret_area_ptr.unwrap());
+            trace!(
+                "gen_retval_area_setup: inst {:?}; ptr reg is {:?}",
+                inst,
+                self.ret_area_ptr.unwrap().to_reg()
+            );
+            Some(inst)
+        } else {
+            trace!("gen_retval_area_setup: not needed");
+            None
         }
     }
 
@@ -693,28 +775,28 @@ enum CallDest {
 /// Arm32 ABI object for a function call.
 pub struct Arm32ABICall {
     sig: ABISig,
-    uses: Set<Reg>,
-    defs: Set<Writable<Reg>>,
+    uses: Vec<Reg>,
+    defs: Vec<Writable<Reg>>,
     dest: CallDest,
     loc: ir::SourceLoc,
     opcode: ir::Opcode,
 }
 
-fn abisig_to_uses_and_defs(sig: &ABISig) -> (Set<Reg>, Set<Writable<Reg>>) {
+fn abisig_to_uses_and_defs(sig: &ABISig) -> (Vec<Reg>, Vec<Writable<Reg>>) {
     // Compute uses: all arg regs.
-    let mut uses = Set::empty();
+    let mut uses = vec![];
     for arg in &sig.args {
         match arg {
-            &ABIArg::Reg(reg, _) => uses.insert(reg.to_reg()),
+            &ABIArg::Reg(reg, _) => uses.push(reg.to_reg()),
             _ => {}
         }
     }
 
     // Compute defs: all retval regs, and all caller-save (clobbered) regs.
-    let mut defs = get_caller_saves_set();
+    let mut defs = get_caller_saves();
     for ret in &sig.rets {
         match ret {
-            &ABIArg::Reg(reg, _) => defs.insert(Writable::from_reg(reg.to_reg())),
+            &ABIArg::Reg(reg, _) => defs.push(Writable::from_reg(reg.to_reg())),
             _ => {}
         }
     }
@@ -729,17 +811,17 @@ impl Arm32ABICall {
         extname: &ir::ExternalName,
         dist: RelocDistance,
         loc: ir::SourceLoc,
-    ) -> Arm32ABICall {
-        let sig = ABISig::from_func_sig(sig);
+    ) -> CodegenResult<Arm32ABICall> {
+        let sig = ABISig::from_func_sig(sig)?;
         let (uses, defs) = abisig_to_uses_and_defs(&sig);
-        Arm32ABICall {
+        Ok(Arm32ABICall {
             sig,
             uses,
             defs,
             dest: CallDest::ExtName(extname.clone(), dist),
             loc,
             opcode: ir::Opcode::Call,
-        }
+        })
     }
 
     /// Create a callsite ABI object for a call to a function pointer with the
@@ -749,17 +831,17 @@ impl Arm32ABICall {
         ptr: Reg,
         loc: ir::SourceLoc,
         opcode: ir::Opcode,
-    ) -> Arm32ABICall {
-        let sig = ABISig::from_func_sig(sig);
+    ) -> CodegenResult<Arm32ABICall> {
+        let sig = ABISig::from_func_sig(sig)?;
         let (uses, defs) = abisig_to_uses_and_defs(&sig);
-        Arm32ABICall {
+        Ok(Arm32ABICall {
             sig,
             uses,
             defs,
             dest: CallDest::Reg(ptr),
             loc,
             opcode,
-        }
+        })
     }
 }
 
@@ -795,7 +877,11 @@ impl ABICall for Arm32ABICall {
     type I = Inst;
 
     fn num_args(&self) -> usize {
-        self.sig.args.len()
+        if self.sig.stack_ret_arg.is_some() {
+            self.sig.args.len() - 1
+        } else {
+            self.sig.args.len()
+        }
     }
 
     fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
@@ -860,8 +946,8 @@ impl ABICall for Arm32ABICall {
 
     fn emit_call<C: LowerCtx<I = Self::I>>(&mut self, ctx: &mut C) {
         let (uses, defs) = (
-            mem::replace(&mut self.uses, Set::empty()),
-            mem::replace(&mut self.defs, Set::empty()),
+            mem::replace(&mut self.uses, vec![]),
+            mem::replace(&mut self.defs, vec![]),
         );
         match &self.dest {
             &CallDest::ExtName(ref name, RelocDistance::Near) => ctx.emit(Inst::Call {

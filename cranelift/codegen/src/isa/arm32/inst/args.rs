@@ -1,11 +1,10 @@
 //! 32-bit ARM ISA definitions: instruction arguments.
 
-use crate::binemit::CodeOffset;
 use crate::isa::arm32::inst::*;
 
 use regalloc::{RealRegUniverse, Reg};
 
-use core::convert::{TryFrom, TryInto};
+use core::convert::TryInto;
 use std::string::String;
 
 /// A shift operator for a register or immediate.
@@ -188,33 +187,19 @@ impl CondBrKind {
 /// from end of current instruction).
 #[derive(Clone, Copy, Debug)]
 pub enum BranchTarget {
-    /// An unresolved reference to a BlockIndex, as passed into
+    /// An unresolved reference to a Label, as passed into
     /// `lower_branch_group()`.
-    Block(BlockIndex),
+    Label(MachLabel),
     /// A resolved reference to another instruction, after
     /// `Inst::with_block_offsets()`.
     ResolvedOffset(isize),
 }
 
 impl BranchTarget {
-    /// Lower the branch target given offsets of each block.
-    pub fn lower(&mut self, targets: &[CodeOffset], my_offset: CodeOffset) {
+    /// Return the target's label, if it is a label-based target.
+    pub fn as_label(self) -> Option<MachLabel> {
         match self {
-            &mut BranchTarget::Block(bix) => {
-                let bix = usize::try_from(bix).unwrap();
-                assert!(bix < targets.len());
-                let block_offset_in_func = targets[bix];
-                let branch_offset = (block_offset_in_func as isize) - (my_offset as isize);
-                *self = BranchTarget::ResolvedOffset(branch_offset);
-            }
-            &mut BranchTarget::ResolvedOffset(..) => {}
-        }
-    }
-
-    /// Get the block index.
-    pub fn as_block_index(&self) -> Option<BlockIndex> {
-        match self {
-            &BranchTarget::Block(bix) => Some(bix),
+            BranchTarget::Label(l) => Some(l),
             _ => None,
         }
     }
@@ -274,17 +259,6 @@ impl BranchTarget {
             None
         }
     }
-
-    /// Map the block index given a transform map.
-    pub fn map(&mut self, block_index_map: &[BlockIndex]) {
-        match self {
-            &mut BranchTarget::Block(ref mut bix) => {
-                let n = block_index_map[usize::try_from(*bix).unwrap()];
-                *bix = n;
-            }
-            &mut BranchTarget::ResolvedOffset(_) => {}
-        }
-    }
 }
 
 impl ShowWithRRU for ShiftOpAndAmt {
@@ -325,7 +299,7 @@ impl ShowWithRRU for Cond {
 impl ShowWithRRU for BranchTarget {
     fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
         match self {
-            &BranchTarget::Block(block) => format!("block{}", block),
+            &BranchTarget::Label(label) => format!("label{:?}", label),
             &BranchTarget::ResolvedOffset(off) => format!("{}", off),
         }
     }
