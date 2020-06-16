@@ -707,6 +707,16 @@ impl MachInstEmit for Inst {
                             op, r1, r2, /* scaled = */ true, extendop, rd,
                         ));
                     }
+                    &MemArg::RegExtended(r1, r2, extendop) => {
+                        sink.put4(enc_ldst_reg(
+                            op,
+                            r1,
+                            r2,
+                            /* scaled = */ false,
+                            Some(extendop),
+                            rd,
+                        ));
+                    }
                     &MemArg::Label(ref label) => {
                         let offset = match label {
                             // cast i32 to u32 (two's-complement)
@@ -833,6 +843,16 @@ impl MachInstEmit for Inst {
                             op, r1, r2, /* scaled = */ true, extendop, rd,
                         ));
                     }
+                    &MemArg::RegExtended(r1, r2, extendop) => {
+                        sink.put4(enc_ldst_reg(
+                            op,
+                            r1,
+                            r2,
+                            /* scaled = */ false,
+                            Some(extendop),
+                            rd,
+                        ));
+                    }
                     &MemArg::Label(..) => {
                         panic!("Store to a MemLabel not implemented!");
                     }
@@ -936,6 +956,21 @@ impl MachInstEmit for Inst {
             &Inst::FpuMove128 { rd, rn } => {
                 sink.put4(enc_vecmov(/* 16b = */ true, rd, rn));
             }
+            &Inst::FpuMoveFromVec { rd, rn, idx, ty } => {
+                let (imm5, shift, mask) = match ty {
+                    F32 => (0b00100, 3, 0b011),
+                    F64 => (0b01000, 4, 0b001),
+                    _ => unimplemented!(),
+                };
+                debug_assert_eq!(idx & mask, idx);
+                let imm5 = imm5 | ((idx as u32) << shift);
+                sink.put4(
+                    0b010_11110000_00000_000001_00000_00000
+                        | (imm5 << 16)
+                        | (machreg_to_vec(rn) << 5)
+                        | machreg_to_vec(rd.to_reg()),
+                );
+            }
             &Inst::FpuRR { fpu_op, rd, rn } => {
                 let top22 = match fpu_op {
                     FPUOp1::Abs32 => 0b000_11110_00_1_000001_10000,
@@ -1020,7 +1055,7 @@ impl MachInstEmit for Inst {
             &Inst::VecMisc { op, rd, rn, ty } => {
                 let bits_12_16 = match op {
                     VecMisc2::Not => {
-                        debug_assert_eq!(I8X16, ty);
+                        debug_assert_eq!(128, ty_bits(ty));
                         0b00101
                     }
                 };
@@ -1142,11 +1177,67 @@ impl MachInstEmit for Inst {
                         | machreg_to_vec(rd.to_reg()),
                 );
             }
-            &Inst::MovFromVec64 { rd, rn } => {
+            &Inst::MovFromVec { rd, rn, idx, ty } => {
+                let (q, imm5, shift, mask) = match ty {
+                    I8 => (0b0, 0b00001, 1, 0b1111),
+                    I16 => (0b0, 0b00010, 2, 0b0111),
+                    I32 => (0b0, 0b00100, 3, 0b0011),
+                    I64 => (0b1, 0b01000, 4, 0b0001),
+                    _ => unreachable!(),
+                };
+                debug_assert_eq!(idx & mask, idx);
+                let imm5 = imm5 | ((idx as u32) << shift);
                 sink.put4(
-                    0b010_01110000_01000_0_0111_1_00000_00000
+                    0b000_01110000_00000_0_0111_1_00000_00000
+                        | (q << 30)
+                        | (imm5 << 16)
                         | (machreg_to_vec(rn) << 5)
                         | machreg_to_gpr(rd.to_reg()),
+                );
+            }
+            &Inst::VecDup { rd, rn, ty } => {
+                let imm5 = match ty {
+                    I8 => 0b00001,
+                    I16 => 0b00010,
+                    I32 => 0b00100,
+                    I64 => 0b01000,
+                    _ => unimplemented!(),
+                };
+                sink.put4(
+                    0b010_01110000_00000_000011_00000_00000
+                        | (imm5 << 16)
+                        | (machreg_to_gpr(rn) << 5)
+                        | machreg_to_vec(rd.to_reg()),
+                );
+            }
+            &Inst::VecDupFromFpu { rd, rn, ty } => {
+                let imm5 = match ty {
+                    F32 => 0b00100,
+                    F64 => 0b01000,
+                    _ => unimplemented!(),
+                };
+                sink.put4(
+                    0b010_01110000_00000_000001_00000_00000
+                        | (imm5 << 16)
+                        | (machreg_to_vec(rn) << 5)
+                        | machreg_to_vec(rd.to_reg()),
+                );
+            }
+            &Inst::VecExtend { t, rd, rn } => {
+                let (u, immh) = match t {
+                    VecExtendOp::Sxtl8 => (0b0, 0b001),
+                    VecExtendOp::Sxtl16 => (0b0, 0b010),
+                    VecExtendOp::Sxtl32 => (0b0, 0b100),
+                    VecExtendOp::Uxtl8 => (0b1, 0b001),
+                    VecExtendOp::Uxtl16 => (0b1, 0b010),
+                    VecExtendOp::Uxtl32 => (0b1, 0b100),
+                };
+                sink.put4(
+                    0b000_011110_0000_000_101001_00000_00000
+                        | (u << 29)
+                        | (immh << 19)
+                        | (machreg_to_vec(rn) << 5)
+                        | machreg_to_vec(rd.to_reg()),
                 );
             }
             &Inst::VecRRR {
@@ -1158,6 +1249,8 @@ impl MachInstEmit for Inst {
             } => {
                 let enc_size_for_cmp = match ty {
                     I8X16 => 0b00,
+                    I16X8 => 0b01,
+                    I32X4 => 0b10,
                     _ => 0,
                 };
 
@@ -1183,6 +1276,28 @@ impl MachInstEmit for Inst {
                     VecALUOp::Cmgt => (0b010_01110_00_1 | enc_size_for_cmp << 1, 0b001101),
                     VecALUOp::Cmhi => (0b011_01110_00_1 | enc_size_for_cmp << 1, 0b001101),
                     VecALUOp::Cmhs => (0b011_01110_00_1 | enc_size_for_cmp << 1, 0b001111),
+                    // The following instructions operate on bytes, so are not encoded differently
+                    // for the different vector types.
+                    VecALUOp::And => {
+                        debug_assert_eq!(128, ty_bits(ty));
+                        (0b010_01110_00_1, 0b000111)
+                    }
+                    VecALUOp::Bic => {
+                        debug_assert_eq!(128, ty_bits(ty));
+                        (0b010_01110_01_1, 0b000111)
+                    }
+                    VecALUOp::Orr => {
+                        debug_assert_eq!(128, ty_bits(ty));
+                        (0b010_01110_10_1, 0b000111)
+                    }
+                    VecALUOp::Eor => {
+                        debug_assert_eq!(128, ty_bits(ty));
+                        (0b011_01110_00_1, 0b000111)
+                    }
+                    VecALUOp::Bsl => {
+                        debug_assert_eq!(128, ty_bits(ty));
+                        (0b011_01110_01_1, 0b000111)
+                    }
                 };
                 sink.put4(enc_vec_rrr(top11, rm, bit15_10, rn, rd));
             }

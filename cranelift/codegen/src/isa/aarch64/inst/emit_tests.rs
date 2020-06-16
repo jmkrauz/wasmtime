@@ -1284,6 +1284,15 @@ fn test_aarch64_binemit() {
     insns.push((
         Inst::ULoad64 {
             rd: writable_xreg(1),
+            mem: MemArg::RegExtended(xreg(2), xreg(3), ExtendOp::SXTW),
+            srcloc: None,
+        },
+        "41C863F8",
+        "ldr x1, [x2, w3, SXTW]",
+    ));
+    insns.push((
+        Inst::ULoad64 {
+            rd: writable_xreg(1),
             mem: MemArg::Label(MemLabel::PCRel(64)),
             srcloc: None,
         },
@@ -1473,6 +1482,15 @@ fn test_aarch64_binemit() {
         },
         "415823F8",
         "str x1, [x2, w3, UXTW #3]",
+    ));
+    insns.push((
+        Inst::Store64 {
+            rd: xreg(1),
+            mem: MemArg::RegExtended(xreg(2), xreg(3), ExtendOp::UXTW),
+            srcloc: None,
+        },
+        "414823F8",
+        "str x1, [x2, w3, UXTW]",
     ));
     insns.push((
         Inst::Store64 {
@@ -1799,9 +1817,41 @@ fn test_aarch64_binemit() {
         "mov v20.d[0], x21",
     ));
     insns.push((
-        Inst::MovFromVec64 {
+        Inst::MovFromVec {
+            rd: writable_xreg(3),
+            rn: vreg(27),
+            idx: 14,
+            ty: I8,
+        },
+        "633F1D0E",
+        "umov w3, v27.b[14]",
+    ));
+    insns.push((
+        Inst::MovFromVec {
+            rd: writable_xreg(24),
+            rn: vreg(5),
+            idx: 3,
+            ty: I16,
+        },
+        "B83C0E0E",
+        "umov w24, v5.h[3]",
+    ));
+    insns.push((
+        Inst::MovFromVec {
+            rd: writable_xreg(12),
+            rn: vreg(17),
+            idx: 1,
+            ty: I32,
+        },
+        "2C3E0C0E",
+        "mov w12, v17.s[1]",
+    ));
+    insns.push((
+        Inst::MovFromVec {
             rd: writable_xreg(21),
             rn: vreg(20),
+            idx: 0,
+            ty: I64,
         },
         "953E084E",
         "mov x21, v20.d[0]",
@@ -1825,6 +1875,114 @@ fn test_aarch64_binemit() {
         },
         "E5979F9A",
         "cset x5, hi",
+    ));
+    insns.push((
+        Inst::VecDup {
+            rd: writable_vreg(25),
+            rn: xreg(7),
+            ty: I8,
+        },
+        "F90C014E",
+        "dup v25.16b, w7",
+    ));
+    insns.push((
+        Inst::VecDup {
+            rd: writable_vreg(2),
+            rn: xreg(23),
+            ty: I16,
+        },
+        "E20E024E",
+        "dup v2.8h, w23",
+    ));
+    insns.push((
+        Inst::VecDup {
+            rd: writable_vreg(0),
+            rn: xreg(28),
+            ty: I32,
+        },
+        "800F044E",
+        "dup v0.4s, w28",
+    ));
+    insns.push((
+        Inst::VecDup {
+            rd: writable_vreg(31),
+            rn: xreg(5),
+            ty: I64,
+        },
+        "BF0C084E",
+        "dup v31.2d, x5",
+    ));
+    insns.push((
+        Inst::VecDupFromFpu {
+            rd: writable_vreg(14),
+            rn: vreg(19),
+            ty: F32,
+        },
+        "6E06044E",
+        "dup v14.4s, v19.s[0]",
+    ));
+    insns.push((
+        Inst::VecDupFromFpu {
+            rd: writable_vreg(18),
+            rn: vreg(10),
+            ty: F64,
+        },
+        "5205084E",
+        "dup v18.2d, v10.d[0]",
+    ));
+    insns.push((
+        Inst::VecExtend {
+            t: VecExtendOp::Sxtl8,
+            rd: writable_vreg(4),
+            rn: vreg(27),
+        },
+        "64A7080F",
+        "sxtl v4.8h, v27.8b",
+    ));
+    insns.push((
+        Inst::VecExtend {
+            t: VecExtendOp::Sxtl16,
+            rd: writable_vreg(17),
+            rn: vreg(19),
+        },
+        "71A6100F",
+        "sxtl v17.4s, v19.4h",
+    ));
+    insns.push((
+        Inst::VecExtend {
+            t: VecExtendOp::Sxtl32,
+            rd: writable_vreg(30),
+            rn: vreg(6),
+        },
+        "DEA4200F",
+        "sxtl v30.2d, v6.2s",
+    ));
+    insns.push((
+        Inst::VecExtend {
+            t: VecExtendOp::Uxtl8,
+            rd: writable_vreg(3),
+            rn: vreg(29),
+        },
+        "A3A7082F",
+        "uxtl v3.8h, v29.8b",
+    ));
+    insns.push((
+        Inst::VecExtend {
+            t: VecExtendOp::Uxtl16,
+            rd: writable_vreg(15),
+            rn: vreg(12),
+        },
+        "8FA5102F",
+        "uxtl v15.4s, v12.4h",
+    ));
+    insns.push((
+        Inst::VecExtend {
+            t: VecExtendOp::Uxtl32,
+            rd: writable_vreg(28),
+            rn: vreg(2),
+        },
+        "5CA4202F",
+        "uxtl v28.2d, v2.2s",
     ));
     insns.push((
         Inst::VecRRR {
@@ -1932,11 +2090,191 @@ fn test_aarch64_binemit() {
     ));
 
     insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmeq,
+            rd: writable_vreg(3),
+            rn: vreg(23),
+            rm: vreg(24),
+            ty: I16X8,
+        },
+        "E38E786E",
+        "cmeq v3.8h, v23.8h, v24.8h",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmgt,
+            rd: writable_vreg(3),
+            rn: vreg(23),
+            rm: vreg(24),
+            ty: I16X8,
+        },
+        "E336784E",
+        "cmgt v3.8h, v23.8h, v24.8h",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmge,
+            rd: writable_vreg(23),
+            rn: vreg(9),
+            rm: vreg(12),
+            ty: I16X8,
+        },
+        "373D6C4E",
+        "cmge v23.8h, v9.8h, v12.8h",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmhi,
+            rd: writable_vreg(5),
+            rn: vreg(1),
+            rm: vreg(1),
+            ty: I16X8,
+        },
+        "2534616E",
+        "cmhi v5.8h, v1.8h, v1.8h",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmhs,
+            rd: writable_vreg(8),
+            rn: vreg(2),
+            rm: vreg(15),
+            ty: I16X8,
+        },
+        "483C6F6E",
+        "cmhs v8.8h, v2.8h, v15.8h",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmeq,
+            rd: writable_vreg(3),
+            rn: vreg(23),
+            rm: vreg(24),
+            ty: I32X4,
+        },
+        "E38EB86E",
+        "cmeq v3.4s, v23.4s, v24.4s",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmgt,
+            rd: writable_vreg(3),
+            rn: vreg(23),
+            rm: vreg(24),
+            ty: I32X4,
+        },
+        "E336B84E",
+        "cmgt v3.4s, v23.4s, v24.4s",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmge,
+            rd: writable_vreg(23),
+            rn: vreg(9),
+            rm: vreg(12),
+            ty: I32X4,
+        },
+        "373DAC4E",
+        "cmge v23.4s, v9.4s, v12.4s",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmhi,
+            rd: writable_vreg(5),
+            rn: vreg(1),
+            rm: vreg(1),
+            ty: I32X4,
+        },
+        "2534A16E",
+        "cmhi v5.4s, v1.4s, v1.4s",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Cmhs,
+            rd: writable_vreg(8),
+            rn: vreg(2),
+            rm: vreg(15),
+            ty: I32X4,
+        },
+        "483CAF6E",
+        "cmhs v8.4s, v2.4s, v15.4s",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::And,
+            rd: writable_vreg(20),
+            rn: vreg(19),
+            rm: vreg(18),
+            ty: I32X4,
+        },
+        "741E324E",
+        "and v20.16b, v19.16b, v18.16b",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Bic,
+            rd: writable_vreg(8),
+            rn: vreg(11),
+            rm: vreg(1),
+            ty: I8X16,
+        },
+        "681D614E",
+        "bic v8.16b, v11.16b, v1.16b",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Orr,
+            rd: writable_vreg(15),
+            rn: vreg(2),
+            rm: vreg(12),
+            ty: I16X8,
+        },
+        "4F1CAC4E",
+        "orr v15.16b, v2.16b, v12.16b",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Eor,
+            rd: writable_vreg(18),
+            rn: vreg(3),
+            rm: vreg(22),
+            ty: I8X16,
+        },
+        "721C366E",
+        "eor v18.16b, v3.16b, v22.16b",
+    ));
+
+    insns.push((
+        Inst::VecRRR {
+            alu_op: VecALUOp::Bsl,
+            rd: writable_vreg(8),
+            rn: vreg(9),
+            rm: vreg(1),
+            ty: I8X16,
+        },
+        "281D616E",
+        "bsl v8.16b, v9.16b, v1.16b",
+    ));
+
+    insns.push((
         Inst::VecMisc {
             op: VecMisc2::Not,
             rd: writable_vreg(2),
             rn: vreg(1),
-            ty: I8X16,
+            ty: I32X4,
         },
         "2258206E",
         "mvn v2.16b, v1.16b",
@@ -2281,6 +2619,28 @@ fn test_aarch64_binemit() {
         },
         "511FBA4E",
         "mov v17.16b, v26.16b",
+    ));
+
+    insns.push((
+        Inst::FpuMoveFromVec {
+            rd: writable_vreg(1),
+            rn: vreg(30),
+            idx: 2,
+            ty: F32,
+        },
+        "C107145E",
+        "mov s1, v30.s[2]",
+    ));
+
+    insns.push((
+        Inst::FpuMoveFromVec {
+            rd: writable_vreg(23),
+            rn: vreg(11),
+            idx: 0,
+            ty: F64,
+        },
+        "7705085E",
+        "mov d23, v11.d[0]",
     ));
 
     insns.push((

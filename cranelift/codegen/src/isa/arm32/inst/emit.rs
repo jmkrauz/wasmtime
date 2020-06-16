@@ -574,7 +574,6 @@ impl MachInstEmit for Inst {
                     sink.add_uncond_branch(off, off + 4, l);
                 }
                 if let Some(off24) = dest.as_off24() {
-                    eprintln!("in emit {:#08x}", enc_32_jump24(off24));
                     emit_32(enc_32_jump24(off24), sink);
                 } else {
                     unimplemented!()

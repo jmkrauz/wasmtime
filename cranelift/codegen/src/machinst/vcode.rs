@@ -136,8 +136,10 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 
     /// Set the type of a VReg.
     pub fn set_vreg_type(&mut self, vreg: VirtualReg, ty: Type) {
-        while self.vcode.vreg_types.len() <= vreg.get_index() {
-            self.vcode.vreg_types.push(ir::types::I8); // Default type.
+        if self.vcode.vreg_types.len() <= vreg.get_index() {
+            self.vcode
+                .vreg_types
+                .resize(vreg.get_index() + 1, ir::types::I8);
         }
         self.vcode.vreg_types[vreg.get_index()] = ty;
     }
@@ -465,8 +467,8 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
         insn.is_move()
     }
 
-    fn get_vreg_count_estimate(&self) -> Option<usize> {
-        Some(self.vreg_types.len())
+    fn get_num_vregs(&self) -> usize {
+        self.vreg_types.len()
     }
 
     fn get_spillslot_size(&self, regclass: RegClass, vreg: VirtualReg) -> u32 {

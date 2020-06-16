@@ -1,6 +1,7 @@
 //! 32-bit ARM Instruction Set Architecture.
 
 use crate::binemit;
+use crate::ir::condcodes::IntCC;
 use crate::ir::{self, Function};
 use crate::isa::Builder as IsaBuilder;
 use crate::isa::{EncInfo, Encoding, Encodings, Legalize, RegClass, RegInfo, TargetIsa};
@@ -98,6 +99,14 @@ impl MachBackend for Arm32Backend {
 
     fn reg_universe(&self) -> &RealRegUniverse {
         &self.reg_universe
+    }
+
+    fn unsigned_add_overflow_condition(&self) -> IntCC {
+        IntCC::UnsignedGreaterThanOrEqual
+    }
+
+    fn unsigned_sub_overflow_condition(&self) -> IntCC {
+        IntCC::UnsignedLessThan
     }
 }
 

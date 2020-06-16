@@ -99,6 +99,7 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let jump = insts.by_name("jump");
     let load = insts.by_name("load");
     let popcnt = insts.by_name("popcnt");
+    let resumable_trapnz = insts.by_name("resumable_trapnz");
     let rotl = insts.by_name("rotl");
     let rotl_imm = insts.by_name("rotl_imm");
     let rotr = insts.by_name("rotr");
@@ -138,6 +139,7 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     // TODO: Add sufficient XForm syntax that we don't need to hand-code these.
     expand.custom_legalize(trapz, "expand_cond_trap");
     expand.custom_legalize(trapnz, "expand_cond_trap");
+    expand.custom_legalize(resumable_trapnz, "expand_cond_trap");
     expand.custom_legalize(br_table, "expand_br_table");
     expand.custom_legalize(select, "expand_select");
     widen.custom_legalize(select, "expand_select"); // small ints
@@ -199,8 +201,6 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
     let ah = var("ah");
     let cc = var("cc");
     let block = var("block");
-    let block1 = var("block1");
-    let block2 = var("block2");
     let ptr = var("ptr");
     let flags = var("flags");
     let offset = var("off");
@@ -269,39 +269,45 @@ pub(crate) fn define(insts: &InstructionGroup, imm: &Immediates) -> TransformGro
         ],
     );
 
-    narrow.legalize(
-        def!(brz.I128(x, block, vararg)),
-        vec![
-            def!((xl, xh) = isplit(x)),
-            def!(
-                a = icmp_imm(
-                    Literal::enumerator_for(&imm.intcc, "eq"),
-                    xl,
-                    Literal::constant(&imm.imm64, 0)
-                )
-            ),
-            def!(
-                b = icmp_imm(
-                    Literal::enumerator_for(&imm.intcc, "eq"),
-                    xh,
-                    Literal::constant(&imm.imm64, 0)
-                )
-            ),
-            def!(c = band(a, b)),
-            def!(brnz(c, block, vararg)),
-        ],
-    );
+    for &ty in &[I128, I64] {
+        let block = var("block");
+        let block1 = var("block1");
+        let block2 = var("block2");
 
-    narrow.legalize(
-        def!(brnz.I128(x, block1, vararg)),
-        vec![
-            def!((xl, xh) = isplit(x)),
-            def!(brnz(xl, block1, vararg)),
-            def!(jump(block2, Literal::empty_vararg())),
-            block!(block2),
-            def!(brnz(xh, block1, vararg)),
-        ],
-    );
+        narrow.legalize(
+            def!(brz.ty(x, block, vararg)),
+            vec![
+                def!((xl, xh) = isplit(x)),
+                def!(
+                    a = icmp_imm(
+                        Literal::enumerator_for(&imm.intcc, "eq"),
+                        xl,
+                        Literal::constant(&imm.imm64, 0)
+                    )
+                ),
+                def!(
+                    b = icmp_imm(
+                        Literal::enumerator_for(&imm.intcc, "eq"),
+                        xh,
+                        Literal::constant(&imm.imm64, 0)
+                    )
+                ),
+                def!(c = band(a, b)),
+                def!(brnz(c, block, vararg)),
+            ],
+        );
+
+        narrow.legalize(
+            def!(brnz.ty(x, block1, vararg)),
+            vec![
+                def!((xl, xh) = isplit(x)),
+                def!(brnz(xl, block1, vararg)),
+                def!(jump(block2, Literal::empty_vararg())),
+                block!(block2),
+                def!(brnz(xh, block1, vararg)),
+            ],
+        );
+    }
 
     narrow.legalize(
         def!(a = popcnt.I128(x)),

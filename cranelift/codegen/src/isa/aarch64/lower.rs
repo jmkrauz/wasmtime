@@ -212,9 +212,14 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
     let from_bits = ty_bits(ty) as u8;
     let inputs = ctx.get_input(input.insn, input.input);
     let in_reg = if let Some(c) = inputs.constant {
+        let masked = if from_bits < 64 {
+            c & ((1u64 << from_bits) - 1)
+        } else {
+            c
+        };
         // Generate constants fresh at each use to minimize long-range register pressure.
         let to_reg = ctx.alloc_tmp(Inst::rc_for_type(ty).unwrap(), ty);
-        for inst in Inst::gen_constant(to_reg, c, ty).into_iter() {
+        for inst in Inst::gen_constant(to_reg, masked, ty).into_iter() {
             ctx.emit(inst);
         }
         to_reg.to_reg()
@@ -545,7 +550,51 @@ pub(crate) fn lower_address<C: LowerCtx<I = Inst>>(
         return MemArg::RegOffset(reg, offset as i64, elem_ty);
     }
 
-    // Handle two regs and a zero offset, if possible.
+    // Handle two regs and a zero offset with built-in extend, if possible.
+    if addends.len() == 2 && offset == 0 {
+        // r1, r2 (to be extended), r2_bits, is_signed
+        let mut parts: Option<(Reg, Reg, usize, bool)> = None;
+        // Handle extension of either first or second addend.
+        for i in 0..2 {
+            if let Some((op, ext_insn)) =
+                maybe_input_insn_multi(ctx, addends[i], &[Opcode::Uextend, Opcode::Sextend])
+            {
+                // Non-extended addend.
+                let r1 = input_to_reg(ctx, addends[1 - i], NarrowValueMode::ZeroExtend64);
+                // Extended addend.
+                let r2 = input_to_reg(
+                    ctx,
+                    InsnInput {
+                        insn: ext_insn,
+                        input: 0,
+                    },
+                    NarrowValueMode::None,
+                );
+                let r2_bits = ty_bits(ctx.input_ty(ext_insn, 0));
+                parts = Some((
+                    r1,
+                    r2,
+                    r2_bits,
+                    /* is_signed = */ op == Opcode::Sextend,
+                ));
+                break;
+            }
+        }
+
+        if let Some((r1, r2, r2_bits, is_signed)) = parts {
+            match (r2_bits, is_signed) {
+                (32, false) => {
+                    return MemArg::RegExtended(r1, r2, ExtendOp::UXTW);
+                }
+                (32, true) => {
+                    return MemArg::RegExtended(r1, r2, ExtendOp::SXTW);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Handle two regs and a zero offset in the general case, if possible.
     if addends.len() == 2 && offset == 0 {
         let ra = input_to_reg(ctx, addends[0], NarrowValueMode::ZeroExtend64);
         let rb = input_to_reg(ctx, addends[1], NarrowValueMode::ZeroExtend64);
@@ -711,7 +760,8 @@ pub fn ty_bits(ty: Type) -> usize {
         B64 | I64 | F64 => 64,
         B128 | I128 => 128,
         IFLAGS | FFLAGS => 32,
-        I8X16 | B8X16 => 128,
+        B8X8 | I8X8 | B16X4 | I16X4 | B32X2 | I32X2 => 64,
+        B8X16 | I8X16 | B16X8 | I16X8 | B32X4 | I32X4 | B64X2 | I64X2 => 128,
         _ => panic!("ty_bits() on unknown type: {:?}", ty),
     }
 }
@@ -719,7 +769,7 @@ pub fn ty_bits(ty: Type) -> usize {
 pub(crate) fn ty_is_int(ty: Type) -> bool {
     match ty {
         B1 | B8 | I8 | B16 | I16 | B32 | I32 | B64 | I64 => true,
-        F32 | F64 | B128 | I128 | I8X16 => false,
+        F32 | F64 | B128 | I128 | I8X8 | I8X16 | I16X4 | I16X8 | I32X2 | I32X4 | I64X2 => false,
         IFLAGS | FFLAGS => panic!("Unexpected flags type"),
         _ => panic!("ty_is_int() on unknown type: {:?}", ty),
     }
@@ -801,6 +851,20 @@ pub(crate) fn maybe_input_insn<C: LowerCtx<I = Inst>>(
         debug!(" -> input inst {:?}", data);
         if data.opcode() == op {
             return Some(src_inst);
+        }
+    }
+    None
+}
+
+/// Checks for an instance of any one of `ops` feeding the given input.
+pub(crate) fn maybe_input_insn_multi<C: LowerCtx<I = Inst>>(
+    c: &mut C,
+    input: InsnInput,
+    ops: &[Opcode],
+) -> Option<(Opcode, IRInst)> {
+    for &op in ops {
+        if let Some(inst) = maybe_input_insn(c, input, op) {
+            return Some((op, inst));
         }
     }
     None

@@ -48,7 +48,7 @@ pub(crate) struct X64ABIBody {
     flags: settings::Flags,
 }
 
-fn in_int_reg(ty: types::Type) -> bool {
+fn use_int_reg(ty: types::Type) -> bool {
     match ty {
         types::I8
         | types::I16
@@ -59,6 +59,13 @@ fn in_int_reg(ty: types::Type) -> bool {
         | types::B16
         | types::B32
         | types::B64 => true,
+        _ => false,
+    }
+}
+
+fn use_flt_reg(ty: types::Type) -> bool {
+    match ty {
+        types::F32 | types::F64 => true,
         _ => false,
     }
 }
@@ -75,10 +82,32 @@ fn get_intreg_for_arg_systemv(idx: usize) -> Option<Reg> {
     }
 }
 
+fn get_fltreg_for_arg_systemv(idx: usize) -> Option<Reg> {
+    match idx {
+        0 => Some(regs::xmm0()),
+        1 => Some(regs::xmm1()),
+        2 => Some(regs::xmm2()),
+        3 => Some(regs::xmm3()),
+        4 => Some(regs::xmm4()),
+        5 => Some(regs::xmm5()),
+        6 => Some(regs::xmm6()),
+        7 => Some(regs::xmm7()),
+        _ => None,
+    }
+}
+
 fn get_intreg_for_retval_systemv(idx: usize) -> Option<Reg> {
     match idx {
         0 => Some(regs::rax()),
         1 => Some(regs::rdx()),
+        _ => None,
+    }
+}
+
+fn get_fltreg_for_retval_systemv(idx: usize) -> Option<Reg> {
+    match idx {
+        0 => Some(regs::xmm0()),
+        1 => Some(regs::xmm1()),
         _ => None,
     }
 }
@@ -90,6 +119,7 @@ fn is_callee_save_systemv(r: RealReg) -> bool {
             ENC_RBX | ENC_RBP | ENC_R12 | ENC_R13 | ENC_R14 | ENC_R15 => true,
             _ => false,
         },
+        RegClass::V128 => false,
         _ => unimplemented!(),
     }
 }
@@ -106,6 +136,7 @@ impl X64ABIBody {
         // Compute args and retvals from signature.
         let mut args = vec![];
         let mut next_int_arg = 0;
+        let mut next_flt_arg = 0;
         for param in &f.signature.params {
             match param.purpose {
                 ir::ArgumentPurpose::VMContext if f.signature.call_conv.extends_baldrdash() => {
@@ -114,15 +145,22 @@ impl X64ABIBody {
                 }
 
                 ir::ArgumentPurpose::Normal | ir::ArgumentPurpose::VMContext => {
-                    if in_int_reg(param.value_type) {
+                    if use_int_reg(param.value_type) {
                         if let Some(reg) = get_intreg_for_arg_systemv(next_int_arg) {
                             args.push(ABIArg::Reg(reg.to_real_reg()));
                         } else {
                             unimplemented!("passing arg on the stack");
                         }
                         next_int_arg += 1;
+                    } else if use_flt_reg(param.value_type) {
+                        if let Some(reg) = get_fltreg_for_arg_systemv(next_flt_arg) {
+                            args.push(ABIArg::Reg(reg.to_real_reg()));
+                        } else {
+                            unimplemented!("passing arg on the stack");
+                        }
+                        next_flt_arg += 1;
                     } else {
-                        unimplemented!("non int normal register")
+                        unimplemented!("non int normal register {:?}", param.value_type)
                     }
                 }
 
@@ -132,16 +170,24 @@ impl X64ABIBody {
 
         let mut rets = vec![];
         let mut next_int_retval = 0;
+        let mut next_flt_retval = 0;
         for ret in &f.signature.returns {
             match ret.purpose {
                 ir::ArgumentPurpose::Normal => {
-                    if in_int_reg(ret.value_type) {
+                    if use_int_reg(ret.value_type) {
                         if let Some(reg) = get_intreg_for_retval_systemv(next_int_retval) {
                             rets.push(ABIRet::Reg(reg.to_real_reg()));
                         } else {
                             unimplemented!("passing return on the stack");
                         }
                         next_int_retval += 1;
+                    } else if use_flt_reg(ret.value_type) {
+                        if let Some(reg) = get_fltreg_for_retval_systemv(next_flt_retval) {
+                            rets.push(ABIRet::Reg(reg.to_real_reg()));
+                        } else {
+                            unimplemented!("passing return on the stack");
+                        }
+                        next_flt_retval += 1;
                     } else {
                         unimplemented!("returning non integer normal value");
                     }
@@ -232,8 +278,11 @@ impl ABIBody for X64ABIBody {
                 if from_reg.get_class() == RegClass::I32 || from_reg.get_class() == RegClass::I64 {
                     // TODO do we need a sign extension if it's I32?
                     return Inst::mov_r_r(/*is64=*/ true, from_reg.to_reg(), to_reg);
+                } else if from_reg.get_class() == RegClass::V128 {
+                    // TODO: How to support Movss. Should is64 always be true?
+                    return Inst::xmm_r_r(SseOpcode::Movsd, from_reg.to_reg(), to_reg);
                 }
-                unimplemented!("moving from non-int arg to vreg");
+                unimplemented!("moving from non-int arg to vreg {:?}", from_reg.get_class());
             }
             ABIArg::_Stack => unimplemented!("moving from stack arg to vreg"),
         }
@@ -266,8 +315,14 @@ impl ABIBody for X64ABIBody {
                         from_reg.to_reg(),
                         Writable::<Reg>::from_reg(to_reg.to_reg()),
                     ))
+                } else if to_reg.get_class() == RegClass::V128 {
+                    ret.push(Inst::xmm_r_r(
+                        SseOpcode::Movsd,
+                        from_reg.to_reg(),
+                        Writable::<Reg>::from_reg(to_reg.to_reg()),
+                    ))
                 } else {
-                    unimplemented!("moving from vreg to non-int return value");
+                    unimplemented!("moving from vreg to unsupported return value");
                 }
             }
 
@@ -333,7 +388,7 @@ impl ABIBody for X64ABIBody {
 
             // The "traditional" pre-preamble
             // RSP before the call will be 0 % 16.  So here, it is 8 % 16.
-            insts.push(Inst::push64(RMI::reg(r_rbp)));
+            insts.push(Inst::push64(RegMemImm::reg(r_rbp)));
             // RSP is now 0 % 16
             insts.push(Inst::mov_r_r(true, r_rsp, w_rbp));
         }
@@ -346,7 +401,7 @@ impl ABIBody for X64ABIBody {
             let r_reg = reg.to_reg();
             match r_reg.get_class() {
                 RegClass::I64 => {
-                    insts.push(Inst::push64(RMI::reg(r_reg.to_reg())));
+                    insts.push(Inst::push64(RegMemImm::reg(r_reg.to_reg())));
                     callee_saved_used += 8;
                 }
                 _ => unimplemented!(),
@@ -379,8 +434,8 @@ impl ABIBody for X64ABIBody {
             if frame_size > 0 {
                 insts.push(Inst::alu_rmi_r(
                     true,
-                    RMI_R_Op::Sub,
-                    RMI::imm(frame_size as u32),
+                    AluRmiROpcode::Sub,
+                    RegMemImm::imm(frame_size as u32),
                     w_rsp,
                 ));
             }
@@ -407,8 +462,8 @@ impl ABIBody for X64ABIBody {
 
                 insts.push(Inst::alu_rmi_r(
                     true,
-                    RMI_R_Op::Add,
-                    RMI::imm(frame_size as u32),
+                    AluRmiROpcode::Add,
+                    RegMemImm::imm(frame_size as u32),
                     w_rsp,
                 ));
             }

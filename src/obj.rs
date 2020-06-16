@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context as _, Result};
-use faerie::Artifact;
+use object::write::Object;
 use target_lexicon::Triple;
 use wasmtime::Strategy;
-use wasmtime_debug::{emit_debugsections, read_debuginfo};
+use wasmtime_debug::{emit_dwarf, read_debuginfo, write_debugsections};
 #[cfg(feature = "lightbeam")]
 use wasmtime_environ::Lightbeam;
 use wasmtime_environ::{
@@ -13,6 +13,42 @@ use wasmtime_environ::{
 use wasmtime_jit::native;
 use wasmtime_obj::emit_module;
 
+fn to_obj_format(
+    triple: &Triple,
+) -> Result<(
+    object::BinaryFormat,
+    object::Architecture,
+    object::Endianness,
+)> {
+    let binary_format = match triple.binary_format {
+        target_lexicon::BinaryFormat::Elf => object::BinaryFormat::Elf,
+        target_lexicon::BinaryFormat::Coff => object::BinaryFormat::Coff,
+        target_lexicon::BinaryFormat::Macho => object::BinaryFormat::MachO,
+        target_lexicon::BinaryFormat::Wasm => {
+            bail!("binary format wasm is unsupported");
+        }
+        target_lexicon::BinaryFormat::Unknown => {
+            bail!("binary format is unknown");
+        }
+    };
+    let architecture = match triple.architecture {
+        target_lexicon::Architecture::I386
+        | target_lexicon::Architecture::I586
+        | target_lexicon::Architecture::I686 => object::Architecture::I386,
+        target_lexicon::Architecture::X86_64 => object::Architecture::X86_64,
+        target_lexicon::Architecture::Arm(_) => object::Architecture::Arm,
+        target_lexicon::Architecture::Aarch64(_) => object::Architecture::Aarch64,
+        architecture => {
+            bail!("target architecture {:?} is unsupported", architecture,);
+        }
+    };
+    let endian = match triple.endianness().unwrap() {
+        target_lexicon::Endianness::Little => object::Endianness::Little,
+        target_lexicon::Endianness::Big => object::Endianness::Big,
+    };
+    Ok((binary_format, architecture, endian))
+}
+
 /// Creates object file from binary wasm data.
 pub fn compile_to_obj(
     wasm: &[u8],
@@ -21,9 +57,8 @@ pub fn compile_to_obj(
     enable_simd: bool,
     opt_level: wasmtime::OptLevel,
     debug_info: bool,
-    artifact_name: String,
     cache_config: &CacheConfig,
-) -> Result<Artifact> {
+) -> Result<Object> {
     let isa_builder = match target {
         Some(target) => native::lookup(target.clone())?,
         None => native::builder(),
@@ -51,7 +86,8 @@ pub fn compile_to_obj(
 
     let isa = isa_builder.finish(settings::Flags::new(flag_builder));
 
-    let mut obj = Artifact::new(isa.triple().clone(), artifact_name);
+    let (obj_format, obj_arch, obj_endian) = to_obj_format(isa.triple())?;
+    let mut obj = Object::new(obj_format, obj_arch, obj_endian);
 
     // TODO: Expose the tunables as command-line flags.
     let mut tunables = Tunables::default();
@@ -63,19 +99,26 @@ pub fn compile_to_obj(
         .translate(wasm)
         .context("failed to translate module")?;
 
-    // TODO: use the traps information
-    let (compilation, relocations, address_transform, value_ranges, stack_slots, _traps) =
-        match strategy {
-            Strategy::Auto | Strategy::Cranelift => {
-                Cranelift::compile_module(&translation, &*isa, cache_config)
-            }
-            #[cfg(feature = "lightbeam")]
-            Strategy::Lightbeam => Lightbeam::compile_module(&translation, &*isa, cache_config),
-            #[cfg(not(feature = "lightbeam"))]
-            Strategy::Lightbeam => bail!("lightbeam support not enabled"),
-            other => bail!("unsupported compilation strategy {:?}", other),
+    // TODO: use the traps and stack maps information.
+    let (
+        compilation,
+        relocations,
+        address_transform,
+        value_ranges,
+        stack_slots,
+        _traps,
+        _stack_maps,
+    ) = match strategy {
+        Strategy::Auto | Strategy::Cranelift => {
+            Cranelift::compile_module(&translation, &*isa, cache_config)
         }
-        .context("failed to compile module")?;
+        #[cfg(feature = "lightbeam")]
+        Strategy::Lightbeam => Lightbeam::compile_module(&translation, &*isa, cache_config),
+        #[cfg(not(feature = "lightbeam"))]
+        Strategy::Lightbeam => bail!("lightbeam support not enabled"),
+        other => bail!("unsupported compilation strategy {:?}", other),
+    }
+    .context("failed to compile module")?;
 
     if compilation.is_empty() {
         bail!("no functions were found/compiled");
@@ -113,16 +156,16 @@ pub fn compile_to_obj(
 
     if debug_info {
         let debug_data = read_debuginfo(wasm).context("failed to emit DWARF")?;
-        emit_debugsections(
-            &mut obj,
-            &module_vmctx_info,
+        let sections = emit_dwarf(
             &*isa,
             &debug_data,
             &address_transform,
+            &module_vmctx_info,
             &value_ranges,
             &compilation,
         )
         .context("failed to emit debug sections")?;
+        write_debugsections(&mut obj, sections).context("failed to emit debug sections")?;
     }
     Ok(obj)
 }

@@ -107,6 +107,12 @@ jobs:
     - run: cargo check --target wasm32-unknown-emscripten -p wasi-common
     - run: cargo check --target armv7-unknown-linux-gnueabihf -p wasi-common
 
+    # Check that codegen and wasm crates typecheck on 1.41.0; this is required
+    # for Firefox.
+    - run: rustup install 1.41.0
+    - run: cargo +1.41.0 check -p cranelift-codegen
+    - run: cargo +1.41.0 check -p cranelift-wasm
+
 
   fuzz_targets:
     name: Fuzz Targets
@@ -117,7 +123,7 @@ jobs:
         submodules: true
     - uses: ./.github/actions/install-rust
       with:
-        toolchain: nightly
+        toolchain: nightly-2020-06-03
     - run: cargo install cargo-fuzz --vers "^0.7"
     - run: cargo fetch
       working-directory: ./fuzz
@@ -225,7 +231,9 @@ jobs:
         RUST_BACKTRACE: 1
 
     # Test debug (DWARF) related functionality.
-    - run: cargo test test_debug_dwarf -- --ignored --test-threads 1
+    - run: |
+        sudo apt-get install -y gdb
+        cargo test test_debug_dwarf -- --ignored --test-threads 1
       if: matrix.os == 'ubuntu-latest'
       env:
         RUST_BACKTRACE: 1
@@ -233,9 +241,9 @@ jobs:
     # Build and test lightbeam if we're using the nightly toolchain. Note that
     # Lightbeam tests fail right now, but we don't want to block on that.
     - run: cargo build --package lightbeam
-      if: matrix.rust == 'nightly-2020-06-03'
+      if: matrix.build == 'nightly'
     - run: cargo test --package lightbeam
-      if: matrix.rust == 'nightly-2020-06-03'
+      if: matrix.build == 'nightly'
       continue-on-error: true
       env:
         RUST_BACKTRACE: 1
@@ -274,7 +282,7 @@ jobs:
         - build: x86_64-mingw
           os: windows-latest
           target: x86_64-pc-windows-gnu
-          rust: nightly     # needs rust-lang/rust#69351 to ride to stable
+          rust: beta        # needs rust-lang/rust#69351 to ride to stable
         - build: aarch64-linux
           os: ubuntu-latest
           rust: stable

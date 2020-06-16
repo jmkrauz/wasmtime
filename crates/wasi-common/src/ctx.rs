@@ -2,7 +2,7 @@ use crate::entry::{Entry, EntryHandle};
 use crate::fdpool::FdPool;
 use crate::handle::Handle;
 use crate::sys::osdir::OsDir;
-use crate::sys::osother::{OsOther, OsOtherExt};
+use crate::sys::stdio::NullDevice;
 use crate::sys::stdio::{Stderr, StderrExt, Stdin, StdinExt, Stdout, StdoutExt};
 use crate::virtfs::{VirtualDir, VirtualDirEntry};
 use crate::wasi::types;
@@ -47,7 +47,7 @@ type WasiCtxBuilderResult<T> = std::result::Result<T, WasiCtxBuilderError>;
 
 enum PendingEntry {
     Thunk(fn() -> io::Result<Box<dyn Handle>>),
-    OsHandle(File),
+    Handle(Box<dyn Handle>),
 }
 
 impl std::fmt::Debug for PendingEntry {
@@ -58,7 +58,7 @@ impl std::fmt::Debug for PendingEntry {
                 "PendingEntry::Thunk({:p})",
                 f as *const fn() -> io::Result<Box<dyn Handle>>
             ),
-            Self::OsHandle(f) => write!(fmt, "PendingEntry::OsHandle({:?})", f),
+            Self::Handle(handle) => write!(fmt, "PendingEntry::Handle({:p})", handle),
         }
     }
 }
@@ -136,9 +136,9 @@ pub struct WasiCtxBuilder {
 impl WasiCtxBuilder {
     /// Builder for a new `WasiCtx`.
     pub fn new() -> Self {
-        let stdin = Some(PendingEntry::Thunk(OsOther::from_null));
-        let stdout = Some(PendingEntry::Thunk(OsOther::from_null));
-        let stderr = Some(PendingEntry::Thunk(OsOther::from_null));
+        let stdin = Some(PendingEntry::Handle(Box::new(NullDevice::new())));
+        let stdout = Some(PendingEntry::Handle(Box::new(NullDevice::new())));
+        let stderr = Some(PendingEntry::Handle(Box::new(NullDevice::new())));
 
         Self {
             stdin,
@@ -247,21 +247,21 @@ impl WasiCtxBuilder {
         self
     }
 
-    /// Provide a File to use as stdin
-    pub fn stdin(&mut self, file: File) -> &mut Self {
-        self.stdin = Some(PendingEntry::OsHandle(file));
+    /// Provide a `Handle` to use as stdin
+    pub fn stdin<T: Handle + 'static>(&mut self, handle: T) -> &mut Self {
+        self.stdin = Some(PendingEntry::Handle(Box::new(handle)));
         self
     }
 
-    /// Provide a File to use as stdout
-    pub fn stdout(&mut self, file: File) -> &mut Self {
-        self.stdout = Some(PendingEntry::OsHandle(file));
+    /// Provide a `Handle` to use as stdout
+    pub fn stdout<T: Handle + 'static>(&mut self, handle: T) -> &mut Self {
+        self.stdout = Some(PendingEntry::Handle(Box::new(handle)));
         self
     }
 
-    /// Provide a File to use as stderr
-    pub fn stderr(&mut self, file: File) -> &mut Self {
-        self.stderr = Some(PendingEntry::OsHandle(file));
+    /// Provide a `Handle` to use as stderr
+    pub fn stderr<T: Handle + 'static>(&mut self, handle: T) -> &mut Self {
+        self.stderr = Some(PendingEntry::Handle(Box::new(handle)));
         self
     }
 
@@ -368,9 +368,8 @@ impl WasiCtxBuilder {
                         .insert(entry)
                         .ok_or(WasiCtxBuilderError::TooManyFilesOpen)?
                 }
-                PendingEntry::OsHandle(f) => {
-                    let handle = OsOther::try_from(f)?;
-                    let handle = EntryHandle::new(handle);
+                PendingEntry::Handle(handle) => {
+                    let handle = EntryHandle::from(handle);
                     let entry = Entry::new(handle);
                     entries
                         .insert(entry)
