@@ -415,6 +415,13 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 _ => unreachable!(),
             };
             assert!(inputs.len() == abi.num_args());
+            for (i, input) in inputs.iter().enumerate() {
+                // ugly
+                if i <= 3 {
+                    let arg_reg = input_to_reg(ctx, *input, NarrowValueMode::None);
+                    abi.emit_copy_reg_to_arg(ctx, i, arg_reg);
+                }
+            }
             abi.emit_call(ctx);
             for (i, output) in outputs.iter().enumerate() {
                 let retval_reg = output_to_reg(ctx, *output);
@@ -455,49 +462,26 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
         };
         match op0 {
             Opcode::Brz | Opcode::Brnz => {
-                let flag_input = InsnInput {
-                    insn: branches[0],
-                    input: 0,
+                let rn = input_to_reg(
+                    ctx,
+                    InsnInput {
+                        insn: branches[0],
+                        input: 0,
+                    },
+                    NarrowValueMode::ZeroExtend,
+                );
+                let kind = match op0 {
+                    Opcode::Brz => CondBrKind::Cond(Cond::Eq),
+                    Opcode::Brnz => CondBrKind::Cond(Cond::Ne),
+                    _ => unreachable!(),
                 };
-                if let Some(icmp_insn) =
-                    maybe_input_insn_via_conv(ctx, flag_input, Opcode::Icmp, Opcode::Bint)
-                {
-                    let condcode = inst_condcode(ctx.data(icmp_insn)).unwrap();
-                    let cond = lower_condcode(condcode);
-                    let is_signed = condcode_is_signed(condcode);
-                    let negated = op0 == Opcode::Brz;
-                    let cond = if negated { cond.invert() } else { cond };
 
-                    lower_icmp_or_ifcmp_to_flags(ctx, icmp_insn, is_signed);
-                    ctx.emit(Inst::CondBr {
-                        taken,
-                        not_taken,
-                        kind: CondBrKind::Cond(cond),
-                    });
-                } else if let Some(_fcmp_insn) =
-                    maybe_input_insn_via_conv(ctx, flag_input, Opcode::Fcmp, Opcode::Bint)
-                {
-                    unimplemented!()
-                } else {
-                    let rt = input_to_reg(
-                        ctx,
-                        InsnInput {
-                            insn: branches[0],
-                            input: 0,
-                        },
-                        NarrowValueMode::ZeroExtend,
-                    );
-                    let kind = match op0 {
-                        Opcode::Brz => CondBrKind::Zero(rt),
-                        Opcode::Brnz => CondBrKind::NotZero(rt),
-                        _ => unreachable!(),
-                    };
-                    ctx.emit(Inst::CondBr {
-                        taken,
-                        not_taken,
-                        kind,
-                    });
-                }
+                ctx.emit(Inst::CmpImm8 { rn, imm8: 0 });
+                ctx.emit(Inst::CondBr {
+                    taken,
+                    not_taken,
+                    kind,
+                });
             }
             Opcode::BrIcmp => unimplemented!(),
             Opcode::Brif => unimplemented!(),

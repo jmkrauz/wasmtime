@@ -84,7 +84,7 @@ fn enc_16_it(cond: Cond, te1: Option<bool>, te2: Option<bool>, te3: Option<bool>
         match te {
             None => 0,
             Some(true) => cond & 0x1,
-            Some(false) => cond ^ 0x1,
+            Some(false) => (cond & 0x1) ^ 0x1,
         }
     }
 
@@ -229,7 +229,7 @@ pub struct EmitState {
 impl MachInstEmit for Inst {
     type State = EmitState;
 
-    fn emit(&self, sink: &mut MachBuffer<Inst>, flags: &settings::Flags, state: &mut EmitState) {
+    fn emit(&self, sink: &mut MachBuffer<Inst>, _flags: &settings::Flags, _state: &mut EmitState) {
         let start_off = sink.cur_offset();
 
         match self {
@@ -564,7 +564,7 @@ impl MachInstEmit for Inst {
                 sink.put4(0);
             }
             &Inst::Ret => {
-                sink.put2(0b010001110_1110_000);    // bx lr
+                sink.put2(0b010001110_1110_000); // bx lr
             }
             &Inst::Jump { ref dest } => {
                 let off = sink.cur_offset();
@@ -595,15 +595,19 @@ impl MachInstEmit for Inst {
                     sink.use_label_at_offset(cond_off, l, label_use);
                     match kind {
                         CondBrKind::Zero(reg) => {
-                            let inverted = enc_16_comp_branch6(reg, false, taken.as_off6().unwrap()).to_le_bytes();
+                            let inverted =
+                                enc_16_comp_branch6(reg, false, taken.as_off6().unwrap())
+                                    .to_le_bytes();
                             sink.add_cond_branch(cond_off, cond_off + 2, l, &inverted[..]);
                         }
                         CondBrKind::NotZero(reg) => {
-                            let inverted = enc_16_comp_branch6(reg, true, taken.as_off6().unwrap()).to_le_bytes();
+                            let inverted = enc_16_comp_branch6(reg, true, taken.as_off6().unwrap())
+                                .to_le_bytes();
                             sink.add_cond_branch(cond_off, cond_off + 2, l, &inverted[..]);
                         }
                         CondBrKind::Cond(c) => {
-                            let inverted = enc_32_cond_branch20(c.invert(), taken.as_off20().unwrap());
+                            let inverted =
+                                enc_32_cond_branch20(c.invert(), taken.as_off20().unwrap());
                             let inverted = u32_swap_halfwords(inverted).to_le_bytes();
                             sink.add_cond_branch(cond_off, cond_off + 4, l, &inverted[..]);
                         }
@@ -633,28 +637,7 @@ impl MachInstEmit for Inst {
                 }
                 emit_32(enc_32_jump24(not_taken.as_off24().unwrap()), sink);
             }
-            &Inst::OneWayCondBr { target, kind } => {
-                unimplemented!()
-                /*if let Some(_l) = target.as_label() {
-                    //unimplemented!()
-                }
-                eprintln!("{:?}", target);
-                let maybe_off6 = target.as_off6();
-                let maybe_off20 = target.as_off20();
-
-                match (kind, maybe_off6, maybe_off20) {
-                    (CondBrKind::Zero(reg), Some(off), _) => {
-                        sink.put2(enc_16_comp_branch6(reg, true, off));
-                    }
-                    (CondBrKind::NotZero(reg), Some(off), _) => {
-                        sink.put2(enc_16_comp_branch6(reg, false, off));
-                    }
-                    (CondBrKind::Cond(c), _, Some(off)) => {
-                        emit_32(enc_32_cond_branch20(c, off), sink);
-                    }
-                    _ => unimplemented!()
-                }*/
-            }
+            &Inst::OneWayCondBr { target: _, kind: _ } => unimplemented!(),
         }
 
         let end_off = sink.cur_offset();

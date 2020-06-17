@@ -9,7 +9,7 @@ use crate::isa::arm32::{self, inst::*};
 use crate::isa::{self, RegUnit};
 use crate::machinst::*;
 use crate::settings;
-use crate::{CodegenError, CodegenResult};
+use crate::CodegenResult;
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -115,7 +115,6 @@ struct ABISig {
     rets: Vec<ABIArg>,
     stack_arg_space: u32,
     stack_ret_space: u32,
-    stack_ret_arg: Option<usize>,
 }
 
 #[rustfmt::skip]
@@ -128,24 +127,11 @@ static CALLEE_SAVED_GPR: &[bool] = &[
     false, false, false, false
 ];
 
-/// Are we computing information about arguments or return values? Much of the
-/// handling is factored out into common routines; this enum allows us to
-/// distinguish which case we're handling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ArgsOrRets {
-    Args,
-    Rets,
-}
-
 /// Process a list of parameters or return values and allocate them to R-regs and stack slots.
 ///
 /// Returns the list of argument locations, and the stack-space used (rounded up
 /// to a 8-byte-aligned boundary).
-fn compute_arg_locs(
-    params: &[ir::AbiParam],
-    args_or_rets: ArgsOrRets,
-    add_ret_area_ptr: bool,
-) -> CodegenResult<(Vec<ABIArg>, u32, Option<usize>)> {
+fn compute_arg_locs(params: &[ir::AbiParam]) -> CodegenResult<(Vec<ABIArg>, u32)> {
     // See AAPCS ABI https://developer.arm.com/docs/ihi0042/latest
     // r9 is an additional callee-saved variable register.
     let mut stack_off: u32 = 0;
@@ -168,6 +154,7 @@ fn compute_arg_locs(
         match param.location {
             ArgumentLoc::Reg(reg) => {
                 let reg: u8 = reg.try_into().unwrap();
+                assert!(reg <= max_rreg);
                 ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty));
                 if next_rreg <= reg {
                     next_rreg += 1;
@@ -186,51 +173,22 @@ fn compute_arg_locs(
         }
     }
 
-    let extra_arg = if add_ret_area_ptr {
-        debug_assert!(args_or_rets == ArgsOrRets::Args);
-        if next_rreg < max_rreg {
-            ret.push(ABIArg::Reg(rreg(next_rreg).to_real_reg(), I32));
-        } else {
-            ret.push(ABIArg::Stack(stack_off as i32 + 4, I32));
-            stack_off += 4;
-        }
-        Some(ret.len() - 1)
-    } else {
-        None
-    };
-
-    // To avoid overflow issues, limit the arg/return size to something
-    // reasonable -- here, 128 MB.
-    if stack_off >= STACK_ARG_RET_SIZE_LIMIT {
-        return Err(CodegenError::ImplLimitExceeded);
-    }
-
     stack_off = (stack_off + 7) & !7;
-
-    Ok((ret, stack_off, extra_arg))
+    Ok((ret, stack_off))
 }
 
 impl ABISig {
     fn from_func_sig(sig: &ir::Signature) -> CodegenResult<ABISig> {
-        // Compute args and retvals from signature. Handle retvals first,
-        // because we may need to add a return-area arg to the args.
-        let (rets, stack_ret_space, _) = compute_arg_locs(
-            &sig.returns,
-            ArgsOrRets::Rets,
-            /* extra ret-area ptr = */ false,
-        )?;
-        let need_stack_return_area = stack_ret_space > 0;
-        let (args, stack_arg_space, stack_ret_arg) =
-            compute_arg_locs(&sig.params, ArgsOrRets::Args, need_stack_return_area)?;
+        let (rets, stack_ret_space) = compute_arg_locs(&sig.returns)?;
+        let (args, stack_arg_space) = compute_arg_locs(&sig.params)?;
 
         trace!(
-            "ABISig: sig {:?} => args = {:?} rets = {:?} arg stack = {} ret stack = {} stack_ret_arg = {:?}",
+            "ABISig: sig {:?} => args = {:?} rets = {:?} arg stack = {} ret stack = {}",
             sig,
             args,
             rets,
             stack_arg_space,
             stack_ret_space,
-            stack_ret_arg
         );
 
         Ok(ABISig {
@@ -238,7 +196,6 @@ impl ABISig {
             rets,
             stack_arg_space,
             stack_ret_space,
-            stack_ret_arg,
         })
     }
 }
@@ -257,8 +214,6 @@ pub struct Arm32ABIBody {
     spillslots: Option<usize>,
     /// Total frame size.
     total_frame_size: Option<u32>,
-    /// The register holding the return-area pointer, if needed.
-    ret_area_ptr: Option<Writable<Reg>>,
     /// The settings controlling this function's compilation.
     flags: settings::Flags,
     /// Whether or not this function is a "leaf", meaning it calls no other
@@ -441,7 +396,6 @@ impl Arm32ABIBody {
             clobbered: Set::empty(),
             spillslots: None,
             total_frame_size: None,
-            ret_area_ptr: None,
             flags,
             is_leaf: f.is_leaf(),
         })
@@ -452,14 +406,11 @@ impl ABIBody for Arm32ABIBody {
     type I = Inst;
 
     fn temp_needed(&self) -> bool {
-        self.sig.stack_ret_arg.is_some()
+        false
     }
 
     fn init(&mut self, maybe_tmp: Option<Writable<Reg>>) {
-        if self.sig.stack_ret_arg.is_some() {
-            assert!(maybe_tmp.is_some());
-            self.ret_area_ptr = maybe_tmp;
-        }
+        assert!(maybe_tmp.is_none());
     }
 
     fn flags(&self) -> &settings::Flags {
@@ -513,18 +464,7 @@ impl ABIBody for Arm32ABIBody {
     }
 
     fn gen_retval_area_setup(&self) -> Option<Inst> {
-        if let Some(i) = self.sig.stack_ret_arg {
-            let inst = self.gen_copy_arg_to_reg(i, self.ret_area_ptr.unwrap());
-            trace!(
-                "gen_retval_area_setup: inst {:?}; ptr reg is {:?}",
-                inst,
-                self.ret_area_ptr.unwrap().to_reg()
-            );
-            Some(inst)
-        } else {
-            trace!("gen_retval_area_setup: not needed");
-            None
-        }
+        None
     }
 
     fn gen_copy_reg_to_retval(
@@ -729,6 +669,7 @@ impl ABIBody for Arm32ABIBody {
                 _ => unimplemented!(),
             }
         }
+        reg_list.reverse();
 
         if !self.is_leaf {
             callee_saved_used += 4;
@@ -877,11 +818,7 @@ impl ABICall for Arm32ABICall {
     type I = Inst;
 
     fn num_args(&self) -> usize {
-        if self.sig.stack_ret_arg.is_some() {
-            self.sig.args.len() - 1
-        } else {
-            self.sig.args.len()
-        }
+        self.sig.args.len()
     }
 
     fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
@@ -908,17 +845,7 @@ impl ABICall for Arm32ABICall {
                 from_reg,
                 ty,
             )),
-            &ABIArg::Stack(off, ty) => {
-                if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), off) {
-                    ctx.emit(store_stack(mem, from_reg, ty));
-                } else {
-                    for inst in Inst::load_constant(writable_ip_reg(), off as u32) {
-                        ctx.emit(inst);
-                    }
-                    let mem = MemArg::reg_plus_reg(sp_reg(), ip_reg(), 0);
-                    ctx.emit(store_stack(mem, from_reg, ty));
-                }
-            }
+            &ABIArg::Stack(_off, _ty) => {}
         }
     }
 

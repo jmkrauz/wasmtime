@@ -369,7 +369,14 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
                 collector.add_def(*reg);
             }
         }
-        &Inst::CallInd { rm, .. } => {
+        &Inst::CallInd {
+            rm,
+            ref uses,
+            ref defs,
+            ..
+        } => {
+            collector.add_uses(uses);
+            collector.add_defs(defs);
             collector.add_use(rm);
         }
         &Inst::LoadExtName { rt, .. } => {
@@ -552,7 +559,18 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_def(mapper, reg);
             }
         }
-        &mut Inst::CallInd { ref mut rm, .. } => {
+        &mut Inst::CallInd {
+            ref mut rm,
+            ref mut uses,
+            ref mut defs,
+            ..
+        } => {
+            for r in uses.iter_mut() {
+                map_use(mapper, r);
+            }
+            for r in defs.iter_mut() {
+                map_def(mapper, r);
+            }
             map_use(mapper, rm);
         }
         &mut Inst::LoadExtName { ref mut rt, .. } => {
