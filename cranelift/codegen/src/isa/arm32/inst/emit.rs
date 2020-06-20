@@ -209,6 +209,47 @@ fn enc_32_cond_branch20(cond: Cond, off20: u32) -> u32 {
         | (s << 26)
 }
 
+fn enc_vfp_reg(v: Reg, precision: Precision) -> (u32, u32) {
+    assert!(v.get_class() == RegClass::F64);
+    let reg: u32 = v.to_real_reg().get_hw_encoding() as u32;
+
+    match precision {
+        Precision::Single => {
+            let reg = reg * 2;
+            ((reg >> 1) & 0x7, reg & 0x1)
+        }
+        Precision::Double => (reg & 0x7, (reg >> 3) & 0x1),
+    }
+}
+
+fn enc_vfp_regs(
+    mut inst: u32,
+    vn: Option<Reg>,
+    vd: Option<Reg>,
+    vm: Option<Reg>,
+    precision: Precision,
+) -> u32 {
+    if precision == Precision::Double {
+        inst |= 1 << 8;
+    }
+    if let Some(vn) = vn {
+        let (vn, n) = enc_vfp_reg(vn, precision);
+        inst |= vn << 16;
+        inst |= n << 7;
+    }
+    if let Some(vd) = vd {
+        let (vd, d) = enc_vfp_reg(vd, precision);
+        inst |= vd << 12;
+        inst |= d << 22;
+    }
+    if let Some(vm) = vm {
+        let (vm, m) = enc_vfp_reg(vm, precision);
+        inst |= vm;
+        inst |= m << 5;
+    }
+    inst
+}
+
 fn u32_swap_halfwords(x: u32) -> u32 {
     (x >> 16) | (x << 16)
 }
@@ -362,6 +403,57 @@ impl MachInstEmit for Inst {
                 let inst = enc_32_regs(inst, None, Some(rd.to_reg()), None, None);
                 emit_32(inst, sink);
             }
+            &Inst::FpuRR {
+                fpu_op,
+                vd,
+                vm,
+                precision,
+            } => {
+                let (bits_20_16, bits_7_6) = match fpu_op {
+                    FPUOp1::Vabs => (0b0000, 0b11),
+                    FPUOp1::Vneg => (0b0001, 0b01),
+                    FPUOp1::Vsqrt => (0b0001, 0b11),
+                };
+                let inst = 0b111011101_0_11_0000_0000_101_0_00_0_0_0000
+                    | (bits_20_16 << 16)
+                    | (bits_7_6 << 6);
+                let inst = enc_vfp_regs(inst, None, Some(vd.to_reg()), Some(vm), precision);
+                emit_32(inst, sink);
+            }
+            &Inst::FpuRRR {
+                fpu_op,
+                vd,
+                vn,
+                vm,
+                precision,
+            } => {
+                let (bits_21_20, bit_6) = match fpu_op {
+                    FPUOp2::Vadd => (0b11, 0b0),
+                    FPUOp2::Vsub => (0b11, 0b1),
+                    FPUOp2::Vmul => (0b10, 0b0),
+                    FPUOp2::Vdiv => (0b00, 0b0),
+                };
+                let inst = 0b111011100_0_00_0000_0000_101_0_0_0_0_0_0000
+                    | (bits_21_20 << 20)
+                    | (bit_6 << 6);
+                let inst = enc_vfp_regs(inst, Some(vn), Some(vd.to_reg()), Some(vm), precision);
+                emit_32(inst, sink);
+            }
+            &Inst::FpuRRROp3 {
+                fpu_op,
+                vd,
+                vn,
+                vm,
+                precision,
+            } => {
+                let bit_6 = match fpu_op {
+                    FPUOp3::Vfma => 0b0,
+                    FPUOp3::Vfms => 0b1,
+                };
+                let inst = 0b111011101_0_10_0000_0000_101_0_0_0_0_0_0000 | (bit_6 << 6);
+                let inst = enc_vfp_regs(inst, Some(vn), Some(vd.to_reg()), Some(vm), precision);
+                emit_32(inst, sink);
+            }
             &Inst::Mov { rd, rm } => {
                 sink.put2(enc_16_mov(rd, rm));
             }
@@ -370,6 +462,23 @@ impl MachInstEmit for Inst {
             }
             &Inst::Movt { rd, imm16 } => {
                 emit_32(enc_32_r_imm16(0b11110_0_101100, rd.to_reg(), imm16), sink);
+            }
+            &Inst::Vmov { vd, vm, precision } => {
+                let inst = 0b111011101_0_11_0000_0000_101_0_01_0_0_0000;
+                let inst = enc_vfp_regs(inst, None, Some(vd.to_reg()), Some(vm), precision);
+                emit_32(inst, sink);
+            }
+            &Inst::MoveGprToFpu { vn, rt } => {
+                let inst = 0b11101110000_0_0000_0000_1010_0_0010000;
+                let inst = enc_32_regs(inst, None, None, Some(rt), None);
+                let inst = enc_vfp_regs(inst, Some(vn.to_reg()), None, None, Precision::Single);
+                emit_32(inst, sink);
+            }
+            &Inst::MoveFpuToGpr { rt, vn } => {
+                let inst = 0b11101110000_1_0000_0000_1010_0_0010000;
+                let inst = enc_32_regs(inst, None, None, Some(rt.to_reg()), None);
+                let inst = enc_vfp_regs(inst, Some(vn), None, None, Precision::Single);
+                emit_32(inst, sink);
             }
             &Inst::Cmp { rn, rm } => {
                 if machreg_is_lo(rn) && machreg_is_lo(rm) {
@@ -381,6 +490,16 @@ impl MachInstEmit for Inst {
             &Inst::CmpImm8 { rn, imm8 } => {
                 let inst = 0b11110_0_011011_0000_0_000_1111_00000000 | u32::from(imm8);
                 let inst = enc_32_regs(inst, None, None, None, Some(rn));
+                emit_32(inst, sink);
+            }
+            &Inst::Vcmp { vd, vm, precision } => {
+                let inst = 0b111011101_0_110100_0000_101_0_0_1_0_0_0000;
+                let inst = enc_vfp_regs(inst, None, Some(vd), Some(vm), precision);
+                emit_32(inst, sink);
+            }
+            &Inst::VcmpZero { vd, precision } => {
+                let inst = 0b111011101_0_110101_0000_101_0_0_1_000000;
+                let inst = enc_vfp_regs(inst, None, Some(vd), None, precision);
                 emit_32(inst, sink);
             }
             &Inst::Store {

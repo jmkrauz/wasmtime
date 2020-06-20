@@ -175,6 +175,70 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 rm,
             });
         }
+        Opcode::Sqrt | Opcode::Fabs | Opcode::Fneg => {
+            let vd = output_to_reg(ctx, outputs[0]);
+            let vm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let precision = match ty.unwrap() {
+                F32 => Precision::Single,
+                F64 => Precision::Double,
+                _ => panic!("Unexpected type {} in lower {}", ty.unwrap(), op),
+            };
+            let fpu_op = match op {
+                Opcode::Fabs => FPUOp1::Vabs,
+                Opcode::Fneg => FPUOp1::Vneg,
+                Opcode::Sqrt => FPUOp1::Vsqrt,
+                _ => unreachable!(),
+            };
+            ctx.emit(Inst::FpuRR {
+                fpu_op,
+                vd,
+                vm,
+                precision,
+            });
+        }
+        Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv => {
+            let vd = output_to_reg(ctx, outputs[0]);
+            let vn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let vm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let precision = match ty.unwrap() {
+                F32 => Precision::Single,
+                F64 => Precision::Double,
+                _ => panic!("Unexpected type {} in lower {}", ty.unwrap(), op),
+            };
+            let fpu_op = match op {
+                Opcode::Fadd => FPUOp2::Vadd,
+                Opcode::Fsub => FPUOp2::Vsub,
+                Opcode::Fmul => FPUOp2::Vmul,
+                Opcode::Fdiv => FPUOp2::Vdiv,
+                _ => unreachable!(),
+            };
+            ctx.emit(Inst::FpuRRR {
+                fpu_op,
+                vd,
+                vn,
+                vm,
+                precision,
+            });
+        }
+        Opcode::Fma => {
+            let vd = output_to_reg(ctx, outputs[0]);
+            let vn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let vm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let temp = input_to_reg(ctx, inputs[2], NarrowValueMode::None);
+            let precision = match ty.unwrap() {
+                F32 => Precision::Single,
+                F64 => Precision::Double,
+                _ => panic!("Unexpected type {} in lower {}", ty.unwrap(), op),
+            };
+            ctx.emit(Inst::Vmov { vd, vm: temp, precision });
+            ctx.emit(Inst::FpuRRROp3 {
+                fpu_op: FPUOp3::Vfma,
+                vd,
+                vn,
+                vm,
+                precision
+            });
+        }
         Opcode::Icmp => {
             let condcode = inst_condcode(ctx.data(insn)).unwrap();
             let cond = lower_condcode(condcode);

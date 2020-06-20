@@ -4,8 +4,7 @@
 #![allow(dead_code)]
 
 use crate::binemit::CodeOffset;
-#[allow(unused)]
-use crate::ir::types::{B1, B16, B32, B64, B8, F32, F64, FFLAGS, I16, I32, I64, I8, IFLAGS};
+use crate::ir::types::{B1, B16, B32, B8, FFLAGS, I16, I32, I8, IFLAGS};
 use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode, Type};
 use crate::machinst::*;
 use crate::{settings, CodegenError, CodegenResult};
@@ -61,6 +60,30 @@ pub enum ALUOp {
     Ror,
 }
 
+/// A FPU operation with one arg.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FPUOp1 {
+    Vabs,
+    Vneg,
+    Vsqrt,
+}
+
+/// A FPU operation with two args.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FPUOp2 {
+    Vadd,
+    Vsub,
+    Vmul,
+    Vdiv,
+}
+
+/// A FPU operation with three args.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FPUOp3 {
+    Vfma,
+    Vfms,
+}
+
 /// Instruction formats.
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -83,7 +106,7 @@ pub enum Inst {
         shift: Option<ShiftOpAndAmt>,
     },
 
-    /// An ALU operation with two register sources, one of which is also a destination register.
+    /// An ALU operation with one register source and one register destination.
     AluRR {
         alu_op: ALUOp,
         rd: Writable<Reg>,
@@ -119,7 +142,33 @@ pub enum Inst {
         imm8: u8,
     },
 
-    /// Move with one register source and one register destination.
+    /// A FPU operation with one register source and one register destination.
+    FpuRR {
+        fpu_op: FPUOp1,
+        vd: Writable<Reg>,
+        vm: Reg,
+        precision: Precision,
+    },
+
+    /// A FPU operation with two register sources and one register destination.
+    FpuRRR {
+        fpu_op: FPUOp2,
+        vd: Writable<Reg>,
+        vn: Reg,
+        vm: Reg,
+        precision: Precision,
+    },
+
+    /// A FPU operation with three register source, one of which is also a destination register.
+    FpuRRROp3 {
+        fpu_op: FPUOp3,
+        vd: Writable<Reg>,
+        vn: Reg,
+        vm: Reg,
+        precision: Precision,
+    },
+
+    /// Move with one GPR source and one GPR destination.
     Mov {
         rd: Writable<Reg>,
         rm: Reg,
@@ -135,6 +184,25 @@ pub enum Inst {
         imm16: u16,
     },
 
+    /// Move with one FPU register source and one FPU register destination.
+    Vmov {
+        vd: Writable<Reg>,
+        vm: Reg,
+        precision: Precision,
+    },
+
+    /// Move a GPR register into an FPU register.
+    MoveGprToFpu {
+        vn: Writable<Reg>,
+        rt: Reg,
+    },
+
+    /// Move an FPU register into a GPR register.
+    MoveFpuToGpr {
+        rt: Writable<Reg>,
+        vn: Reg,
+    },
+
     Cmp {
         rn: Reg,
         rm: Reg,
@@ -143,6 +211,19 @@ pub enum Inst {
     CmpImm8 {
         rn: Reg,
         imm8: u8,
+    },
+
+    /// Compare two FPU registers.
+    Vcmp {
+        vd: Reg,
+        vm: Reg,
+        precision: Precision,
+    },
+
+    /// Compare a FPU register with zero.
+    VcmpZero {
+        vd: Reg,
+        precision: Precision,
     },
 
     Store {
@@ -330,6 +411,20 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::AluRImm8 { rd, .. } => {
             collector.add_def(rd);
         }
+        &Inst::FpuRR { vd, vm, .. } => {
+            collector.add_def(vd);
+            collector.add_use(vm);
+        }
+        &Inst::FpuRRR { vd, vn, vm, .. } => {
+            collector.add_def(vd);
+            collector.add_use(vn);
+            collector.add_use(vm);
+        }
+        &Inst::FpuRRROp3 { vd, vn, vm, .. } => {
+            collector.add_mod(vd);
+            collector.add_use(vn);
+            collector.add_use(vm);
+        }
         &Inst::Mov { rd, rm, .. } => {
             collector.add_def(rd);
             collector.add_use(rm);
@@ -340,12 +435,31 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Movt { rd, .. } => {
             collector.add_def(rd);
         }
+        &Inst::Vmov { vd, vm, .. } => {
+            collector.add_def(vd);
+            collector.add_use(vm);
+        }
+        &Inst::MoveGprToFpu { vn, rt } => {
+            collector.add_def(vn);
+            collector.add_use(rt);
+        }
+        &Inst::MoveFpuToGpr { rt, vn } => {
+            collector.add_def(rt);
+            collector.add_use(vn);
+        }
         &Inst::Cmp { rn, rm } => {
             collector.add_use(rn);
             collector.add_use(rm);
         }
         &Inst::CmpImm8 { rn, .. } => {
             collector.add_use(rn);
+        }
+        &Inst::Vcmp { vd, vm, .. } => {
+            collector.add_use(vd);
+            collector.add_use(vm);
+        }
+        &Inst::VcmpZero { vd, .. } => {
+            collector.add_use(vd);
         }
         &Inst::Store { rt, ref mem, .. } => {
             collector.add_use(rt);
@@ -411,6 +525,13 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
     fn map_def<RUM: RegUsageMapper>(m: &RUM, r: &mut Writable<Reg>) {
         if r.to_reg().is_virtual() {
             let new = m.get_def(r.to_reg().to_virtual_reg()).unwrap().to_reg();
+            *r = Writable::from_reg(new);
+        }
+    }
+
+    fn map_mod<RUM: RegUsageMapper>(m: &RUM, r: &mut Writable<Reg>) {
+        if r.to_reg().is_virtual() {
+            let new = m.get_mod(r.to_reg().to_virtual_reg()).unwrap().to_reg();
             *r = Writable::from_reg(new);
         }
     }
@@ -501,6 +622,34 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         &mut Inst::AluRImm8 { ref mut rd, .. } => {
             map_def(mapper, rd);
         }
+        &mut Inst::FpuRR {
+            ref mut vd,
+            ref mut vm,
+            ..
+        } => {
+            map_def(mapper, vd);
+            map_use(mapper, vm);
+        }
+        &mut Inst::FpuRRR {
+            ref mut vd,
+            ref mut vn,
+            ref mut vm,
+            ..
+        } => {
+            map_def(mapper, vd);
+            map_use(mapper, vn);
+            map_use(mapper, vm);
+        }
+        &mut Inst::FpuRRROp3 {
+            ref mut vd,
+            ref mut vn,
+            ref mut vm,
+            ..
+        } => {
+            map_mod(mapper, vd);
+            map_use(mapper, vn);
+            map_use(mapper, vm);
+        }
         &mut Inst::Mov {
             ref mut rd,
             ref mut rm,
@@ -515,6 +664,22 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         &mut Inst::Movt { ref mut rd, .. } => {
             map_def(mapper, rd);
         }
+        &mut Inst::Vmov {
+            ref mut vd,
+            ref mut vm,
+            ..
+        } => {
+            map_def(mapper, vd);
+            map_use(mapper, vm);
+        }
+        &mut Inst::MoveGprToFpu { ref mut vn, ref mut rt } => {
+            map_def(mapper, vn);
+            map_use(mapper, rt);
+        }
+        &mut Inst::MoveFpuToGpr { ref mut rt, ref mut vn } => {
+            map_def(mapper, rt);
+            map_use(mapper, vn);
+        }
         &mut Inst::Cmp {
             ref mut rn,
             ref mut rm,
@@ -524,6 +689,17 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         }
         &mut Inst::CmpImm8 { ref mut rn, .. } => {
             map_use(mapper, rn);
+        }
+        &mut Inst::Vcmp {
+            ref mut vd,
+            ref mut vm,
+            ..
+        } => {
+            map_use(mapper, vd);
+            map_use(mapper, vm);
+        }
+        &mut Inst::VcmpZero { ref mut vd, .. } => {
+            map_use(mapper, vd);
         }
         &mut Inst::Store {
             ref mut rt,
@@ -820,6 +996,58 @@ impl ShowWithRRU for Inst {
                 let rd = rd.show_rru(mb_rru);
                 format!("{} {}, #{}", op, rd, imm8)
             }
+            &Inst::FpuRR {
+                fpu_op,
+                vd,
+                vm,
+                precision,
+            } => {
+                let op = match fpu_op {
+                    FPUOp1::Vabs => "vabs",
+                    FPUOp1::Vneg => "vneg",
+                    FPUOp1::Vsqrt => "vsqrt",
+                };
+                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
+                let vm = show_freg_with_precision(vm, mb_rru, precision);
+                let precision = precision.show_rru(mb_rru);
+                format!("{}.{} {}, {}", op, precision, vd, vm)
+            }
+            &Inst::FpuRRR {
+                fpu_op,
+                vd,
+                vn,
+                vm,
+                precision,
+            } => {
+                let op = match fpu_op {
+                    FPUOp2::Vadd => "vadd",
+                    FPUOp2::Vsub => "vsub",
+                    FPUOp2::Vmul => "vmul",
+                    FPUOp2::Vdiv => "vdiv",
+                };
+                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
+                let vn = show_freg_with_precision(vn, mb_rru, precision);
+                let vm = show_freg_with_precision(vm, mb_rru, precision);
+                let precision = precision.show_rru(mb_rru);
+                format!("{}.{} {}, {}, {}", op, precision, vd, vn, vm)
+            }
+            &Inst::FpuRRROp3 {
+                fpu_op,
+                vd,
+                vn,
+                vm,
+                precision,
+            } => {
+                let op = match fpu_op {
+                    FPUOp3::Vfma => "vfma",
+                    FPUOp3::Vfms => "vfms",
+                };
+                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
+                let vn = show_freg_with_precision(vn, mb_rru, precision);
+                let vm = show_freg_with_precision(vm, mb_rru, precision);
+                let precision = precision.show_rru(mb_rru);
+                format!("{}.{} {}, {}, {}", op, precision, vd, vn, vm)
+            }
             &Inst::Mov { rd, rm } => {
                 let rd = rd.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
@@ -833,6 +1061,22 @@ impl ShowWithRRU for Inst {
                 let rd = rd.show_rru(mb_rru);
                 format!("movt {}, #{}", rd, imm16)
             }
+            &Inst::Vmov { vd, vm, precision } => {
+                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
+                let vm = show_freg_with_precision(vm, mb_rru, precision);
+                let precision = precision.show_rru(mb_rru);
+                format!("vmov.{} {}, {}", precision, vd, vm)
+            }
+            &Inst::MoveGprToFpu { vn, rt } => {
+                let vn = show_freg_with_precision(vn.to_reg(), mb_rru, Precision::Single);
+                let rt = rt.show_rru(mb_rru);
+                format!("vmov {}, {}", vn, rt)
+            }
+            &Inst::MoveFpuToGpr { rt, vn } => {
+                let rt = rt.show_rru(mb_rru);
+                let vn = show_freg_with_precision(vn, mb_rru, Precision::Single);
+                format!("vmov {}, {}", rt, vn)
+            }
             &Inst::Cmp { rn, rm } => {
                 let rn = rn.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
@@ -841,6 +1085,17 @@ impl ShowWithRRU for Inst {
             &Inst::CmpImm8 { rn, imm8 } => {
                 let rn = rn.show_rru(mb_rru);
                 format!("cmp {}, #{}", rn, imm8)
+            }
+            &Inst::Vcmp { vd, vm, precision } => {
+                let vd = show_freg_with_precision(vd, mb_rru, precision);
+                let vm = show_freg_with_precision(vm, mb_rru, precision);
+                let precision = precision.show_rru(mb_rru);
+                format!("vcmp.{} {}, {}", precision, vd, vm)
+            }
+            &Inst::VcmpZero { vd, precision } => {
+                let vd = show_freg_with_precision(vd, mb_rru, precision);
+                let precision = precision.show_rru(mb_rru);
+                format!("vcmp.{} {}, #0.0", precision, vd)
             }
             &Inst::Store {
                 rt, ref mem, bits, ..
@@ -958,7 +1213,7 @@ impl ShowWithRRU for Inst {
                 let rt = rt.show_rru(mb_rru);
                 format!("ldr {} [pc, #4] ; b 4 ; data {:?} + {}", rt, name, offset)
             }
-            &Inst::Ret => "mov pc, lr".to_string(),
+            &Inst::Ret => "bx lr".to_string(),
             &Inst::EpiloguePlaceholder => "epilogue placeholder".to_string(),
             &Inst::Jump { ref dest } => {
                 let dest = dest.show_rru(mb_rru);

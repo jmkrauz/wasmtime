@@ -1,5 +1,6 @@
 //! Lowering rules for 32-bit ARM.
 
+#[allow(unused)]
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::types::*;
 use crate::ir::Inst as IRInst;
@@ -13,7 +14,6 @@ use crate::isa::arm32::Arm32Backend;
 
 use super::lower_inst;
 
-use log::debug;
 use regalloc::{Reg, RegClass, Writable};
 
 //============================================================================
@@ -34,20 +34,6 @@ pub(crate) struct InsnOutput {
 pub(crate) struct InsnInput {
     pub(crate) insn: IRInst,
     pub(crate) input: usize,
-}
-
-/// Lower an instruction input to a 64-bit constant, if possible.
-pub(crate) fn input_to_const<C: LowerCtx<I = Inst>>(ctx: &mut C, input: InsnInput) -> Option<u64> {
-    let input = ctx.get_input(input.insn, input.input);
-    input.constant
-}
-
-fn get_input<C: LowerCtx<I = Inst>>(ctx: &mut C, output: InsnOutput, num: usize) -> InsnInput {
-    assert!(num <= ctx.num_inputs(output.insn));
-    InsnInput {
-        insn: output.insn,
-        input: num,
-    }
 }
 
 //============================================================================
@@ -286,7 +272,7 @@ pub(crate) fn inst_condcode(data: &InstructionData) -> Option<IntCC> {
     }
 }
 
-pub(crate) fn inst_fp_condcode(data: &InstructionData) -> Option<FloatCC> {
+/*pub(crate) fn inst_fp_condcode(data: &InstructionData) -> Option<FloatCC> {
     match data {
         &InstructionData::BranchFloat { cond, .. }
         | &InstructionData::FloatCompare { cond, .. }
@@ -294,7 +280,7 @@ pub(crate) fn inst_fp_condcode(data: &InstructionData) -> Option<FloatCC> {
         | &InstructionData::FloatCondTrap { cond, .. } => Some(cond),
         _ => None,
     }
-}
+}*/
 
 pub(crate) fn inst_trapcode(data: &InstructionData) -> Option<TrapCode> {
     match data {
@@ -304,81 +290,6 @@ pub(crate) fn inst_trapcode(data: &InstructionData) -> Option<TrapCode> {
         | &InstructionData::FloatCondTrap { code, .. } => Some(code),
         _ => None,
     }
-}
-
-/// Checks for an instance of `op` feeding the given input.
-pub(crate) fn maybe_input_insn<C: LowerCtx<I = Inst>>(
-    c: &mut C,
-    input: InsnInput,
-    op: Opcode,
-) -> Option<IRInst> {
-    let inputs = c.get_input(input.insn, input.input);
-    debug!(
-        "maybe_input_insn: input {:?} has options {:?}; looking for op {:?}",
-        input, inputs, op
-    );
-    if let Some((src_inst, _)) = inputs.inst {
-        let data = c.data(src_inst);
-        debug!(" -> input inst {:?}", data);
-        if data.opcode() == op {
-            return Some(src_inst);
-        }
-    }
-    None
-}
-
-/// Checks for an instance of `op` feeding the given input, possibly via a conversion `conv` (e.g.,
-/// Bint or a bitcast).
-///
-/// FIXME cfallin 2020-03-30: this is really ugly. Factor out tree-matching stuff and make it
-/// a bit more generic.
-pub(crate) fn maybe_input_insn_via_conv<C: LowerCtx<I = Inst>>(
-    c: &mut C,
-    input: InsnInput,
-    op: Opcode,
-    conv: Opcode,
-) -> Option<IRInst> {
-    let inputs = c.get_input(input.insn, input.input);
-    if let Some((src_inst, _)) = inputs.inst {
-        let data = c.data(src_inst);
-        if data.opcode() == op {
-            return Some(src_inst);
-        }
-        if data.opcode() == conv {
-            let inputs = c.get_input(src_inst, 0);
-            if let Some((src_inst, _)) = inputs.inst {
-                let data = c.data(src_inst);
-                if data.opcode() == op {
-                    return Some(src_inst);
-                }
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn lower_icmp_or_ifcmp_to_flags<C: LowerCtx<I = Inst>>(
-    ctx: &mut C,
-    insn: IRInst,
-    is_signed: bool,
-) {
-    let narrow_mode = match is_signed {
-        true => NarrowValueMode::SignExtend,
-        false => NarrowValueMode::ZeroExtend,
-    };
-    let inputs = [
-        InsnInput {
-            insn: insn,
-            input: 0,
-        },
-        InsnInput {
-            insn: insn,
-            input: 1,
-        },
-    ];
-    let rn = input_to_reg(ctx, inputs[0], narrow_mode);
-    let rm = input_to_reg(ctx, inputs[1], narrow_mode);
-    ctx.emit(Inst::Cmp { rn, rm });
 }
 
 //=============================================================================

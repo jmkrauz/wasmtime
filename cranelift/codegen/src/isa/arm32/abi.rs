@@ -20,11 +20,11 @@ use log::{debug, trace};
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
 use smallvec::SmallVec;
 
-static STACK_ARG_RET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
-
 struct Args {
     r_used: u32,
     r_limit: u32,
+    d_used: u32,
+    d_limit: u32,
     stack_offset: u32,
 }
 
@@ -33,6 +33,8 @@ impl Args {
         Self {
             r_used: 0,
             r_limit: 4,
+            d_used: 0,
+            d_limit: 8,
             stack_offset: 0,
         }
     }
@@ -72,18 +74,24 @@ impl ArgAssigner for Args {
         // Try to use a GPR.
         if !ty.is_float() && self.r_used < self.r_limit {
             // Assign to a register.
-            let reg = self.r_used as RegUnit;
+            let reg = (DREG_COUNT as u32 + self.r_used) as RegUnit;
             self.r_used += 1;
             return ArgumentLoc::Reg(reg).into();
         }
 
-        if ty.is_float() {
-            unimplemented!()
+        // Try to use an FPU register.
+        if ty.is_float() && self.d_used < self.d_limit {
+            let reg = self.d_used as RegUnit;
+            self.d_used += 1;
+            return ArgumentLoc::Reg(reg).into();
         }
 
         // Assign a stack location.
+        let bytes = ty.bytes();
+        // align stack
+        self.stack_offset = (self.stack_offset + bytes - 1) & !(bytes - 1);
         let loc = ArgumentLoc::Stack(self.stack_offset as i32);
-        self.stack_offset += 4;
+        self.stack_offset += bytes;
         loc.into()
     }
 }
@@ -117,16 +125,6 @@ struct ABISig {
     stack_ret_space: u32,
 }
 
-#[rustfmt::skip]
-static CALLEE_SAVED_GPR: &[bool] = &[
-    /* r0 - r3 */
-    false, false, false, false,
-    /* r4 - r11*/
-    true, true, true, true, true, true, true, true,
-    /* ip, sp, lr, pc*/
-    false, false, false, false
-];
-
 /// Process a list of parameters or return values and allocate them to R-regs and stack slots.
 ///
 /// Returns the list of argument locations, and the stack-space used (rounded up
@@ -135,10 +133,10 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> CodegenResult<(Vec<ABIArg>, u32)
     // See AAPCS ABI https://developer.arm.com/docs/ihi0042/latest
     // r9 is an additional callee-saved variable register.
     let mut stack_off: u32 = 0;
-    let mut next_rreg: u8 = 0;
     let mut ret = vec![];
 
     let max_rreg: u8 = 3;
+    let max_dreg: u8 = 7;
 
     for param in params {
         // Validate "purpose".
@@ -153,11 +151,16 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> CodegenResult<(Vec<ABIArg>, u32)
         let ty = param.value_type;
         match param.location {
             ArgumentLoc::Reg(reg) => {
-                let reg: u8 = reg.try_into().unwrap();
-                assert!(reg <= max_rreg);
-                ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty));
-                if next_rreg <= reg {
-                    next_rreg += 1;
+                if reg < DREG_COUNT.into() {
+                    assert!(in_float_reg(ty));
+                    let reg: u8 = reg.try_into().unwrap();
+                    assert!(reg <= max_dreg);
+                    ret.push(ABIArg::Reg(dreg(reg).to_real_reg(), ty));
+                } else {
+                    assert!(in_int_reg(ty));
+                    let reg: u8 = (reg - DREG_COUNT as u16).try_into().unwrap();
+                    assert!(reg <= max_rreg);
+                    ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty));
                 }
             }
             ArgumentLoc::Stack(off) => {
@@ -266,12 +269,23 @@ fn store_stack(mem: MemArg, from_reg: Reg, ty: Type) -> Inst {
 }
 
 fn is_callee_save(r: RealReg) -> bool {
+    let enc = r.get_hw_encoding();
     match r.get_class() {
-        RegClass::I32 => match r.get_hw_encoding() as u8 {
-            n if n >= 4 && n <= 11 => true,
-            _ => false,
-        },
-        _ => unimplemented!(),
+        RegClass::I32 => {
+            if 4 <= enc && enc <= 11 {
+                true
+            } else {
+                false
+            }
+        }
+        RegClass::F64 => {
+            if enc < 8 {
+                true
+            } else {
+                false
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -282,14 +296,7 @@ fn get_callee_saves(regs: Vec<Writable<RealReg>>) -> Vec<Writable<RealReg>> {
 }
 
 fn is_caller_save(r: RealReg) -> bool {
-    match r.get_class() {
-        RegClass::I32 => match r.get_hw_encoding() {
-            n if n <= 4 => true,
-            12 => true,
-            _ => false,
-        },
-        _ => panic!("Unexpected RegClass"),
-    }
+    !is_callee_save(r)
 }
 
 fn get_caller_saves() -> Vec<Writable<Reg>> {
@@ -300,67 +307,11 @@ fn get_caller_saves() -> Vec<Writable<Reg>> {
             set.push(r);
         }
     }
+    for i in 0..8 {
+        let d = writable_dreg(i);
+        set.push(d);
+    }
     set
-}
-
-fn gen_stack_limit(f: &ir::Function, abi: &ABISig, gv: ir::GlobalValue) -> (Reg, Vec<Inst>) {
-    let mut insts = Vec::new();
-    let reg = generate_gv(f, abi, gv, &mut insts);
-    return (reg, insts);
-
-    fn generate_gv(
-        f: &ir::Function,
-        abi: &ABISig,
-        gv: ir::GlobalValue,
-        insts: &mut Vec<Inst>,
-    ) -> Reg {
-        match f.global_values[gv] {
-            // Return the direct register the vmcontext is in
-            ir::GlobalValueData::VMContext => {
-                get_special_purpose_param_register(f, abi, ir::ArgumentPurpose::VMContext)
-                    .expect("no vmcontext parameter found")
-            }
-            // Load our base value into a register, then load from that register
-            // in to a temporary register.
-            ir::GlobalValueData::Load {
-                base,
-                offset,
-                global_type: _,
-                readonly: _,
-            } => {
-                let base = generate_gv(f, abi, base, insts);
-                let into_reg = writable_ip_reg();
-                let offset: i32 = offset.into();
-                let mem = if let Some(mem) = MemArg::reg_maybe_offset(base, offset) {
-                    mem
-                } else {
-                    insts.extend(Inst::load_constant(into_reg, offset as u32));
-                    MemArg::reg_plus_reg(base, into_reg.to_reg(), 0)
-                };
-                insts.push(Inst::Load {
-                    rt: into_reg,
-                    mem,
-                    srcloc: None,
-                    bits: 32,
-                    sign_extend: false,
-                });
-                return into_reg.to_reg();
-            }
-            ref other => panic!("global value for stack limit not supported: {}", other),
-        }
-    }
-}
-
-fn get_special_purpose_param_register(
-    f: &ir::Function,
-    abi: &ABISig,
-    purpose: ir::ArgumentPurpose,
-) -> Option<Reg> {
-    let idx = f.signature.special_param_index(purpose)?;
-    match abi.args[idx] {
-        ABIArg::Reg(reg, _) => Some(reg.to_reg()),
-        ABIArg::Stack(..) => None,
-    }
 }
 
 impl Arm32ABIBody {
@@ -611,6 +562,7 @@ impl ABIBody for Arm32ABIBody {
                     reg_list.push(reg.to_reg());
                     callee_saved_used += 4;
                 }
+                RegClass::F64 => {}
                 _ => unimplemented!(),
             }
         }
@@ -666,6 +618,7 @@ impl ABIBody for Arm32ABIBody {
                     reg_list.push(Writable::from_reg(reg.to_reg()));
                     callee_saved_used += 4;
                 }
+                RegClass::F64 => {}
                 _ => unimplemented!(),
             }
         }
@@ -822,13 +775,19 @@ impl ABICall for Arm32ABICall {
     }
 
     fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
-        for inst in adjust_stack(self.sig.stack_arg_space, /* is_sub = */ true) {
+        for inst in adjust_stack(
+            self.sig.stack_arg_space + self.sig.stack_ret_space,
+            /* is_sub = */ true,
+        ) {
             ctx.emit(inst);
         }
     }
 
     fn emit_stack_post_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
-        for inst in adjust_stack(self.sig.stack_arg_space, /* is_sub = */ false) {
+        for inst in adjust_stack(
+            self.sig.stack_arg_space + self.sig.stack_ret_space,
+            /* is_sub = */ false,
+        ) {
             ctx.emit(inst);
         }
     }
