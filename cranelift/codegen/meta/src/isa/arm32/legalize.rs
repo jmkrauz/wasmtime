@@ -24,29 +24,13 @@ pub(crate) fn define(shared: &mut SharedDefinitions) {
 
     // List of instructions.
     let insts = &shared.instructions;
-    let ishl = insts.by_name("ishl");
     let rotl = insts.by_name("rotl");
     let rotr = insts.by_name("rotr");
-    let sdiv = insts.by_name("sdiv");
     let spill = insts.by_name("spill");
-    let srem = insts.by_name("srem");
-    let sshr = insts.by_name("sshr");
-    let udiv = insts.by_name("udiv");
-    let urem = insts.by_name("urem");
-    let ushr = insts.by_name("ushr");
 
     let _imm = &shared.imm;
 
-    // Custom legalization for division and remainder computation.
-    narrow.custom_legalize(udiv, "expand_udiv_urem");
-    narrow.custom_legalize(urem, "expand_udiv_urem");
-    narrow.custom_legalize(sdiv, "expand_sdiv_srem");
-    narrow.custom_legalize(srem, "expand_sdiv_srem");
-
-    // Custom legalization for shifts and rotates.
-    narrow.custom_legalize(ishl, "narrow_ishl");
-    narrow.custom_legalize(ushr, "narrow_ushr");
-    narrow.custom_legalize(sshr, "narrow_sshr");
+    // Custom legalization for rotations.
     narrow.custom_legalize(rotr, "narrow_rotr");
     narrow.custom_legalize(rotl, "narrow_rotl");
 

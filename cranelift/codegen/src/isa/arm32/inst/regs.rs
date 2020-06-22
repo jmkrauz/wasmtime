@@ -137,20 +137,29 @@ pub fn create_reg_universe() -> RealRegUniverse {
     }
 }
 
-/// Show a FPU register.
+/// Show an FPU register.
 pub fn show_freg_with_precision(
     reg: Reg,
     mb_rru: Option<&RealRegUniverse>,
     precision: Precision,
 ) -> String {
-    let mut s = reg.show_rru(mb_rru);
+    let s = reg.show_rru(mb_rru);
     if reg.get_class() != RegClass::F64 {
         return s;
     }
-    let prefix = match precision {
-        Precision::Single => "s",
-        Precision::Double => "d",
+    if precision == Precision::Single && reg.is_real() {
+        format!("s{}", 2 * reg.to_real_reg().get_hw_encoding())
+    } else {
+        s
+    }
+}
+
+/// Show a higher single precision registers from pair that creates `reg`. 
+pub fn show_freg_single_hi(reg: Reg, mb_rru: Option<&RealRegUniverse>) -> String {
+    let s = if reg.is_real() {
+        format!("s{}", 1 + 2 * reg.to_real_reg().get_hw_encoding())
+    } else {
+        format!("{} hi", reg.show_rru(mb_rru))
     };
-    s.replace_range(0..1, prefix);
     s
 }

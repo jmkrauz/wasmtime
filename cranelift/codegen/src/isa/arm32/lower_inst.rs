@@ -45,6 +45,32 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let rd = output_to_reg(ctx, outputs[0]);
             lower_constant_int(ctx, rd, value);
         }
+        Opcode::F32const => {
+            let value = output_to_const(ctx, outputs[0]).unwrap();
+            let vn = output_to_reg(ctx, outputs[0]);
+            lower_constant_int(ctx, writable_ip_reg(), value);
+            ctx.emit(Inst::MoveGprToFpu {
+                vn,
+                rt: ip_reg(),
+                lo: true,
+            });
+        }
+        Opcode::F64const => {
+            let value = output_to_const(ctx, outputs[0]).unwrap();
+            let vn = output_to_reg(ctx, outputs[0]);
+            lower_constant_int(ctx, writable_ip_reg(), value & ((1 << 32) - 1));
+            ctx.emit(Inst::MoveGprToFpu {
+                vn,
+                rt: ip_reg(),
+                lo: true,
+            });
+            lower_constant_int(ctx, writable_ip_reg(), value >> 32);
+            ctx.emit(Inst::MoveGprToFpu {
+                vn,
+                rt: ip_reg(),
+                lo: false,
+            });
+        }
         Opcode::Iadd
         | Opcode::IaddIfcin
         | Opcode::IaddIfcout
@@ -239,6 +265,25 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 precision
             });
         }
+        Opcode::Clz | Opcode::Bitrev => {
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let ty = ctx.output_ty(insn, 0);
+            let bit_op = match op {
+                Opcode::Clz => BitOp::Clz,
+                Opcode::Bitrev => BitOp::Rbit,
+                _ => unreachable!(),
+            };
+
+            if ty != I32 && ty != B32 {
+                unimplemented!()
+            }
+            ctx.emit(Inst::BitOpRR {
+                bit_op,
+                rd,
+                rm
+            });
+        }
         Opcode::Icmp => {
             let condcode = inst_condcode(ctx.data(insn)).unwrap();
             let cond = lower_condcode(condcode);
@@ -260,6 +305,43 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             });
             ctx.emit(Inst::MovImm16 { rd, imm16: 0x1 });
             ctx.emit(Inst::MovImm16 { rd, imm16: 0x0 });
+        }
+        Opcode::Select | Opcode::Selectif => {
+            let cond = if op == Opcode::Select {
+                let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
+                ctx.emit(Inst::CmpImm8 {
+                    rn,
+                    imm8: 0,
+                });
+                Cond::Ne
+            } else {
+                let condcode = inst_condcode(ctx.data(insn)).unwrap();
+                lower_condcode(condcode)
+            };
+            let r1 = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let r2 = input_to_reg(ctx, inputs[2], NarrowValueMode::None);
+            let out_reg = output_to_reg(ctx, outputs[0]);
+            ctx.emit(Inst::It {
+                cond,
+                te1: Some(true),
+                te2: Some(false),
+                te3: None,
+            });
+            let ty = ctx.output_ty(insn, 0);
+            match ty {
+                F32 => {
+                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Single));
+                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Single));
+                }
+                F64 => {
+                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Double));
+                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Double));
+                }
+                _ => {
+                    ctx.emit(Inst::mov(out_reg, r1));
+                    ctx.emit(Inst::mov(out_reg, r2));
+                }
+            }
         }
         Opcode::Store
         | Opcode::Istore8
@@ -336,29 +418,66 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 | Opcode::Sload32Complex => true,
                 _ => false,
             };
-
-            if !ty_is_int(elem_ty) {
-                unimplemented!()
-            }
-
+            let out_reg = output_to_reg(ctx, outputs[0]);
             let mem = lower_address(ctx, elem_ty, &inputs[..], off);
-            let rt = output_to_reg(ctx, outputs[0]);
-
             let memflags = ctx.memflags(insn).expect("memory flags");
             let srcloc = if !memflags.notrap() {
                 Some(ctx.srcloc(insn))
             } else {
                 None
             };
-            let bits = elem_ty.bits() as u8;
 
-            ctx.emit(Inst::Load {
-                rt,
-                mem,
-                srcloc,
-                bits,
-                sign_extend,
-            });
+            if elem_ty == F32 {
+                assert!(op == Opcode::Load);
+                ctx.emit(Inst::Load {
+                    rt: writable_ip_reg(),
+                    mem,
+                    srcloc,
+                    bits: 32,
+                    sign_extend: false,
+                });
+                ctx.emit(Inst::MoveGprToFpu {
+                    vn: out_reg, 
+                    rt: ip_reg(),
+                    lo: true,
+                });
+            } else if elem_ty == F64 {
+                assert!(op == Opcode::Load);
+                ctx.emit(Inst::Load {
+                    rt: writable_ip_reg(),
+                    mem,
+                    srcloc,
+                    bits: 32,
+                    sign_extend: false,
+                });
+                ctx.emit(Inst::MoveGprToFpu {
+                    vn: out_reg, 
+                    rt: ip_reg(),
+                    lo: false,
+                });
+                let mem = lower_address(ctx, elem_ty, &inputs[..], off + 4);
+                ctx.emit(Inst::Load {
+                    rt: writable_ip_reg(),
+                    mem,
+                    srcloc,
+                    bits: 32,
+                    sign_extend: false,
+                });
+                ctx.emit(Inst::MoveGprToFpu {
+                    vn: out_reg,
+                    rt: ip_reg(),
+                    lo: true,
+                });
+            } else {
+                let bits = elem_ty.bits() as u8;
+                ctx.emit(Inst::Load {
+                    rt: out_reg,
+                    mem,
+                    srcloc,
+                    bits,
+                    sign_extend,
+                });
+            }
         }
         Opcode::Uextend | Opcode::Sextend => {
             let output_ty = ty.unwrap();
@@ -401,6 +520,30 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let ty = ctx.input_ty(insn, 0);
             ctx.emit(Inst::gen_move(rd, rn, ty));
+        }
+        Opcode::Bitcast => {
+            let in_reg = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
+            let out_reg = output_to_reg(ctx, outputs[0]);
+            let in_ty = ctx.input_ty(insn, 0);
+            let out_ty = ty.unwrap();
+
+            match (in_ty, out_ty) {
+                (F32, I32) => {
+                    ctx.emit(Inst::MoveFpuToGpr {
+                        rt: out_reg,
+                        vn: in_reg,
+                        lo: true,
+                    })
+                },
+                (I32, F32) => {
+                    ctx.emit(Inst::MoveGprToFpu {
+                        vn: out_reg,
+                        rt: in_reg,
+                        lo: false,
+                    });
+                },
+                _ => panic!("Unexpected in/out types: {}/{}", in_ty, out_ty),
+            }
         }
         Opcode::StackAddr | Opcode::StackLoad => {
             let (stack_slot, offset) = match *ctx.data(insn) {
@@ -446,6 +589,16 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         Opcode::Trap => {
             let trap_info = (ctx.srcloc(insn), inst_trapcode(ctx.data(insn)).unwrap());
             ctx.emit(Inst::Udf { trap_info })
+        }
+        Opcode::Trapif => {
+            let trap_info = (ctx.srcloc(insn), inst_trapcode(ctx.data(insn)).unwrap());
+            let condcode = inst_condcode(ctx.data(insn)).unwrap();
+            let cond = lower_condcode(condcode);
+            ctx.emit(Inst::OneWayCondBr {
+                target: BranchTarget::ResolvedOffset(2),
+                kind: CondBrKind::Cond(cond),
+            });
+            ctx.emit(Inst::Udf { trap_info });
         }
         Opcode::FallthroughReturn | Opcode::Return => {
             for (i, input) in inputs.iter().enumerate() {

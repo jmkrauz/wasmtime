@@ -338,7 +338,7 @@ impl MachInstEmit for Inst {
                 rn,
                 rm,
             } => {
-                let (bits_7_4, bits_22_20) = match alu_op {
+                let (bits_22_20, bits_7_4) = match alu_op {
                     ALUOp::Smull => (0b000, 0b0000),
                     ALUOp::Umull => (0b010, 0b0000),
                     _ => panic!("Invalid ALUOp {:?} in RRRR form!", alu_op),
@@ -454,6 +454,16 @@ impl MachInstEmit for Inst {
                 let inst = enc_vfp_regs(inst, Some(vn), Some(vd.to_reg()), Some(vm), precision);
                 emit_32(inst, sink);
             }
+            &Inst::BitOpRR { bit_op, rd, rm } => {
+                let (bits_22_20, bits_7_4) = match bit_op {
+                    BitOp::Rbit => (0b001, 0b1010),
+                    BitOp::Rev => (0b001, 0b1000),
+                    BitOp::Clz => (0b011, 0b1000),
+                };
+                let inst = 0b111110101_000_0000_1111_0000_0000_0000 | (bits_22_20 << 20) | (bits_7_4 << 4);
+                let inst = enc_32_regs(inst, Some(rm), Some(rd.to_reg()), None, Some(rm));
+                emit_32(inst, sink);
+            }
             &Inst::Mov { rd, rm } => {
                 sink.put2(enc_16_mov(rd, rm));
             }
@@ -468,16 +478,22 @@ impl MachInstEmit for Inst {
                 let inst = enc_vfp_regs(inst, None, Some(vd.to_reg()), Some(vm), precision);
                 emit_32(inst, sink);
             }
-            &Inst::MoveGprToFpu { vn, rt } => {
+            &Inst::MoveGprToFpu { vn, rt, lo } => {
                 let inst = 0b11101110000_0_0000_0000_1010_0_0010000;
                 let inst = enc_32_regs(inst, None, None, Some(rt), None);
-                let inst = enc_vfp_regs(inst, Some(vn.to_reg()), None, None, Precision::Single);
+                let mut inst = enc_vfp_regs(inst, Some(vn.to_reg()), None, None, Precision::Single);
+                if !lo {
+                    inst |= 1 << 7;
+                }
                 emit_32(inst, sink);
             }
-            &Inst::MoveFpuToGpr { rt, vn } => {
+            &Inst::MoveFpuToGpr { rt, vn, lo } => {
                 let inst = 0b11101110000_1_0000_0000_1010_0_0010000;
                 let inst = enc_32_regs(inst, None, None, Some(rt.to_reg()), None);
-                let inst = enc_vfp_regs(inst, Some(vn), None, None, Precision::Single);
+                let mut inst = enc_vfp_regs(inst, Some(vn), None, None, Precision::Single);
+                if !lo {
+                    inst |= 1 << 7;
+                }
                 emit_32(inst, sink);
             }
             &Inst::Cmp { rn, rm } => {
@@ -756,7 +772,22 @@ impl MachInstEmit for Inst {
                 }
                 emit_32(enc_32_jump24(not_taken.as_off24().unwrap()), sink);
             }
-            &Inst::OneWayCondBr { target: _, kind: _ } => unimplemented!(),
+            &Inst::OneWayCondBr { target, kind } => {
+                if let Some(_) = target.as_label() {
+                    unimplemented!()
+                }
+                match kind {
+                    CondBrKind::Zero(reg) => {
+                        sink.put2(enc_16_comp_branch6(reg, true, target.as_off6().unwrap()));
+                    }
+                    CondBrKind::NotZero(reg) => {
+                        sink.put2(enc_16_comp_branch6(reg, false, target.as_off6().unwrap()));
+                    }
+                    CondBrKind::Cond(c) => {
+                        emit_32(enc_32_cond_branch20(c, target.as_off20().unwrap()), sink);
+                    }
+                }
+            }
         }
 
         let end_off = sink.cur_offset();
