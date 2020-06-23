@@ -267,7 +267,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         }
         Opcode::Clz | Opcode::Bitrev => {
             let rd = output_to_reg(ctx, outputs[0]);
-            let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let ty = ctx.output_ty(insn, 0);
             let bit_op = match op {
                 Opcode::Clz => BitOp::Clz,
@@ -719,7 +719,7 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                 });
             }
             Opcode::BrTable => unimplemented!(),
-            _ => panic!("Unknown branch type!"),
+            _ => panic!("Unknown branch type {}!", op),
         }
     }
 

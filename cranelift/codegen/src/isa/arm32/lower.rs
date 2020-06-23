@@ -149,18 +149,19 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
 /// Lower the address of a load or store.
 pub(crate) fn lower_address<C: LowerCtx<I = Inst>>(
     ctx: &mut C,
-    _elem_ty: Type,
+    elem_ty: Type,
     addends: &[InsnInput],
     offset: i32,
 ) -> MemArg {
-    // TODO: support base_reg + scale * index_reg. For this, we would need to pattern-match shl or
-    // mul instructions (Load/StoreComplex don't include scale factors).
-
     // Handle one reg and offset that fits in immediate, if possible.
     if addends.len() == 1 {
         let reg = input_to_reg(ctx, addends[0], NarrowValueMode::ZeroExtend);
         if let Some(memarg) = MemArg::reg_maybe_offset(reg, offset) {
             return memarg;
+        } else {
+            let tmp = ctx.alloc_tmp(RegClass::I32, elem_ty);
+            lower_constant_int(ctx, tmp, offset as u64);
+            return MemArg::reg_plus_reg(reg, tmp.to_reg(), 0);
         }
     }
 

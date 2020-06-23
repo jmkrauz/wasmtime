@@ -866,7 +866,6 @@ impl MachInst for Inst {
                 if value >= (1 << 32) || value < -(1 << 32) {
                     panic!("Cannot load constant value {}", value)
                 }
-                let value: i32 = value.try_into().unwrap();
                 Inst::load_constant(to_reg, value as u32)
             }
             F32 => {
