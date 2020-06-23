@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use crate::binemit::CodeOffset;
-use crate::ir::types::{B1, B16, B32, B8, F32, F64, FFLAGS, I16, I32, I8, IFLAGS};
+use crate::ir::types::{B1, B16, B32, B8, I16, I32, I8, IFLAGS};
 use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode, Type};
 use crate::machinst::*;
 use crate::{settings, CodegenError, CodegenResult};
@@ -14,7 +14,6 @@ use regalloc::{RegUsageCollector, RegUsageMapper};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::convert::TryInto;
 use smallvec::{smallvec, SmallVec};
 use std::string::{String, ToString};
 
@@ -58,30 +57,6 @@ pub enum ALUOp {
     Lsr,
     Asr,
     Ror,
-}
-
-/// A FPU operation with one arg.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum FPUOp1 {
-    Vabs,
-    Vneg,
-    Vsqrt,
-}
-
-/// A FPU operation with two args.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum FPUOp2 {
-    Vadd,
-    Vsub,
-    Vmul,
-    Vdiv,
-}
-
-/// A FPU operation with three args.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum FPUOp3 {
-    Vfma,
-    Vfms,
 }
 
 /// An operation on the bits of a register.
@@ -150,36 +125,10 @@ pub enum Inst {
         imm8: u8,
     },
 
-    /// A FPU operation with one register source and one register destination.
-    FpuRR {
-        fpu_op: FPUOp1,
-        vd: Writable<Reg>,
-        vm: Reg,
-        precision: Precision,
-    },
-
-    /// A FPU operation with two register sources and one register destination.
-    FpuRRR {
-        fpu_op: FPUOp2,
-        vd: Writable<Reg>,
-        vn: Reg,
-        vm: Reg,
-        precision: Precision,
-    },
-
-    /// A FPU operation with three register source, one of which is also a destination register.
-    FpuRRROp3 {
-        fpu_op: FPUOp3,
-        vd: Writable<Reg>,
-        vn: Reg,
-        vm: Reg,
-        precision: Precision,
-    },
-
     BitOpRR {
-        bit_op : BitOp,
+        bit_op: BitOp,
         rd: Writable<Reg>,
-        rm: Reg, 
+        rm: Reg,
     },
 
     /// Move with one GPR source and one GPR destination.
@@ -198,27 +147,6 @@ pub enum Inst {
         imm16: u16,
     },
 
-    /// Move with one FPU register source and one FPU register destination.
-    Vmov {
-        vd: Writable<Reg>,
-        vm: Reg,
-        precision: Precision,
-    },
-
-    /// Move a GPR register into an FPU register.
-    MoveGprToFpu {
-        vn: Writable<Reg>,
-        rt: Reg,
-        lo: bool,
-    },
-
-    /// Move an FPU register into a GPR register.
-    MoveFpuToGpr {
-        rt: Writable<Reg>,
-        vn: Reg,
-        lo: bool,
-    },
-
     Cmp {
         rn: Reg,
         rm: Reg,
@@ -227,19 +155,6 @@ pub enum Inst {
     CmpImm8 {
         rn: Reg,
         imm8: u8,
-    },
-
-    /// Compare two FPU registers.
-    Vcmp {
-        vd: Reg,
-        vm: Reg,
-        precision: Precision,
-    },
-
-    /// Compare a FPU register with zero.
-    VcmpZero {
-        vd: Reg,
-        precision: Precision,
     },
 
     Store {
@@ -352,15 +267,6 @@ impl Inst {
         }
     }
 
-    /// Create a vfp move instruction.
-    pub fn vmov(to_reg: Writable<Reg>, from_reg: Reg, precision: Precision) -> Inst {
-        Inst::Vmov {
-            vd: to_reg,
-            vm: from_reg,
-            precision,
-        }
-    }
-
     /// Create an instruction that loads a constant.
     pub fn load_constant(rd: Writable<Reg>, value: u32) -> SmallVec<[Inst; 4]> {
         let imm16 = (value & 0xffff) as u16;
@@ -436,20 +342,6 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::AluRImm8 { rd, .. } => {
             collector.add_def(rd);
         }
-        &Inst::FpuRR { vd, vm, .. } => {
-            collector.add_def(vd);
-            collector.add_use(vm);
-        }
-        &Inst::FpuRRR { vd, vn, vm, .. } => {
-            collector.add_def(vd);
-            collector.add_use(vn);
-            collector.add_use(vm);
-        }
-        &Inst::FpuRRROp3 { vd, vn, vm, .. } => {
-            collector.add_mod(vd);
-            collector.add_use(vn);
-            collector.add_use(vm);
-        }
         &Inst::BitOpRR { rd, rm, .. } => {
             collector.add_def(rd);
             collector.add_use(rm);
@@ -464,31 +356,12 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Movt { rd, .. } => {
             collector.add_def(rd);
         }
-        &Inst::Vmov { vd, vm, .. } => {
-            collector.add_def(vd);
-            collector.add_use(vm);
-        }
-        &Inst::MoveGprToFpu { vn, rt, .. } => {
-            collector.add_def(vn);
-            collector.add_use(rt);
-        }
-        &Inst::MoveFpuToGpr { rt, vn, .. } => {
-            collector.add_def(rt);
-            collector.add_use(vn);
-        }
         &Inst::Cmp { rn, rm } => {
             collector.add_use(rn);
             collector.add_use(rm);
         }
         &Inst::CmpImm8 { rn, .. } => {
             collector.add_use(rn);
-        }
-        &Inst::Vcmp { vd, vm, .. } => {
-            collector.add_use(vd);
-            collector.add_use(vm);
-        }
-        &Inst::VcmpZero { vd, .. } => {
-            collector.add_use(vd);
         }
         &Inst::Store { rt, ref mem, .. } => {
             collector.add_use(rt);
@@ -651,34 +524,6 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         &mut Inst::AluRImm8 { ref mut rd, .. } => {
             map_def(mapper, rd);
         }
-        &mut Inst::FpuRR {
-            ref mut vd,
-            ref mut vm,
-            ..
-        } => {
-            map_def(mapper, vd);
-            map_use(mapper, vm);
-        }
-        &mut Inst::FpuRRR {
-            ref mut vd,
-            ref mut vn,
-            ref mut vm,
-            ..
-        } => {
-            map_def(mapper, vd);
-            map_use(mapper, vn);
-            map_use(mapper, vm);
-        }
-        &mut Inst::FpuRRROp3 {
-            ref mut vd,
-            ref mut vn,
-            ref mut vm,
-            ..
-        } => {
-            map_mod(mapper, vd);
-            map_use(mapper, vn);
-            map_use(mapper, vm);
-        }
         &mut Inst::BitOpRR {
             ref mut rd,
             ref mut rm,
@@ -701,22 +546,6 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         &mut Inst::Movt { ref mut rd, .. } => {
             map_def(mapper, rd);
         }
-        &mut Inst::Vmov {
-            ref mut vd,
-            ref mut vm,
-            ..
-        } => {
-            map_def(mapper, vd);
-            map_use(mapper, vm);
-        }
-        &mut Inst::MoveGprToFpu { ref mut vn, ref mut rt, .. } => {
-            map_def(mapper, vn);
-            map_use(mapper, rt);
-        }
-        &mut Inst::MoveFpuToGpr { ref mut rt, ref mut vn, .. } => {
-            map_def(mapper, rt);
-            map_use(mapper, vn);
-        }
         &mut Inst::Cmp {
             ref mut rn,
             ref mut rm,
@@ -726,17 +555,6 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         }
         &mut Inst::CmpImm8 { ref mut rn, .. } => {
             map_use(mapper, rn);
-        }
-        &mut Inst::Vcmp {
-            ref mut vd,
-            ref mut vm,
-            ..
-        } => {
-            map_use(mapper, vd);
-            map_use(mapper, vm);
-        }
-        &mut Inst::VcmpZero { ref mut vd, .. } => {
-            map_use(mapper, vd);
         }
         &mut Inst::Store {
             ref mut rt,
@@ -846,43 +664,18 @@ impl MachInst for Inst {
         if from_reg.get_class() == RegClass::I32 {
             Inst::mov(to_reg, from_reg)
         } else {
-            let precision = match ty {
-                F32 => Precision::Single,
-                F64 => Precision::Double,
-                _ => panic!("Unexpected type {} in gen_move", ty),
-            };
-            Inst::Vmov {
-                vd: to_reg,
-                vm: from_reg,
-                precision,
-            }
+            unimplemented!()
         }
     }
 
     fn gen_constant(to_reg: Writable<Reg>, value: u64, ty: Type) -> SmallVec<[Inst; 4]> {
         match ty {
             B1 | I8 | B8 | I16 | B16 | I32 | B32 => {
-                let value: i64 = value as i64;
-                if value >= (1 << 32) || value < -(1 << 32) {
+                let v: i64 = value as i64;
+                if v >= (1 << 32) || v < -(1 << 32) {
                     panic!("Cannot load constant value {}", value)
                 }
                 Inst::load_constant(to_reg, value as u32)
-            }
-            F32 => {
-                if (value >> 32) != 0 {
-                    panic!("Cannot load constant value {}", value)
-                }
-                let value: u32 = (value & 0xffff).try_into().unwrap();
-                let mut insts = Inst::load_constant(writable_ip_reg(), value);
-                insts.push(Inst::MoveGprToFpu {
-                    vn: to_reg,
-                    rt: ip_reg(),
-                    lo: true,
-                });
-                insts
-            }
-            F64 => {
-                unimplemented!()
             }
             _ => unimplemented!(),
         }
@@ -903,8 +696,7 @@ impl MachInst for Inst {
     fn rc_for_type(ty: Type) -> CodegenResult<RegClass> {
         match ty {
             I8 | I16 | I32 | B1 | B8 | B16 | B32 => Ok(RegClass::I32),
-            F32 | F64 => Ok(RegClass::F64),
-            IFLAGS | FFLAGS => Ok(RegClass::I32),
+            IFLAGS => Ok(RegClass::I32),
             _ => Err(CodegenError::Unsupported(format!(
                 "Unexpected SSA-value type: {}",
                 ty
@@ -1058,58 +850,6 @@ impl ShowWithRRU for Inst {
                 let rd = rd.show_rru(mb_rru);
                 format!("{} {}, #{}", op, rd, imm8)
             }
-            &Inst::FpuRR {
-                fpu_op,
-                vd,
-                vm,
-                precision,
-            } => {
-                let op = match fpu_op {
-                    FPUOp1::Vabs => "vabs",
-                    FPUOp1::Vneg => "vneg",
-                    FPUOp1::Vsqrt => "vsqrt",
-                };
-                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
-                let vm = show_freg_with_precision(vm, mb_rru, precision);
-                let precision = precision.show_rru(mb_rru);
-                format!("{}.{} {}, {}", op, precision, vd, vm)
-            }
-            &Inst::FpuRRR {
-                fpu_op,
-                vd,
-                vn,
-                vm,
-                precision,
-            } => {
-                let op = match fpu_op {
-                    FPUOp2::Vadd => "vadd",
-                    FPUOp2::Vsub => "vsub",
-                    FPUOp2::Vmul => "vmul",
-                    FPUOp2::Vdiv => "vdiv",
-                };
-                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
-                let vn = show_freg_with_precision(vn, mb_rru, precision);
-                let vm = show_freg_with_precision(vm, mb_rru, precision);
-                let precision = precision.show_rru(mb_rru);
-                format!("{}.{} {}, {}, {}", op, precision, vd, vn, vm)
-            }
-            &Inst::FpuRRROp3 {
-                fpu_op,
-                vd,
-                vn,
-                vm,
-                precision,
-            } => {
-                let op = match fpu_op {
-                    FPUOp3::Vfma => "vfma",
-                    FPUOp3::Vfms => "vfms",
-                };
-                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
-                let vn = show_freg_with_precision(vn, mb_rru, precision);
-                let vm = show_freg_with_precision(vm, mb_rru, precision);
-                let precision = precision.show_rru(mb_rru);
-                format!("{}.{} {}, {}, {}", op, precision, vd, vn, vm)
-            }
             &Inst::BitOpRR { bit_op, rd, rm } => {
                 let op = match bit_op {
                     BitOp::Rbit => "rbit",
@@ -1133,30 +873,6 @@ impl ShowWithRRU for Inst {
                 let rd = rd.show_rru(mb_rru);
                 format!("movt {}, #{}", rd, imm16)
             }
-            &Inst::Vmov { vd, vm, precision } => {
-                let vd = show_freg_with_precision(vd.to_reg(), mb_rru, precision);
-                let vm = show_freg_with_precision(vm, mb_rru, precision);
-                let precision = precision.show_rru(mb_rru);
-                format!("vmov.{} {}, {}", precision, vd, vm)
-            }
-            &Inst::MoveGprToFpu { vn, rt, lo } => {
-                let rt = rt.show_rru(mb_rru);
-                let vn = if lo {
-                    show_freg_with_precision(vn.to_reg(), mb_rru, Precision::Single)
-                } else {
-                    show_freg_single_hi(vn.to_reg(), mb_rru)
-                };
-                format!("vmov {}, {}", vn, rt)
-            }
-            &Inst::MoveFpuToGpr { rt, vn, lo } => {
-                let rt = rt.show_rru(mb_rru);
-                let vn = if lo {
-                    show_freg_with_precision(vn, mb_rru, Precision::Single)
-                } else {
-                    show_freg_single_hi(vn, mb_rru)
-                };
-                format!("vmov {}, {}", rt, vn)
-            }
             &Inst::Cmp { rn, rm } => {
                 let rn = rn.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
@@ -1165,17 +881,6 @@ impl ShowWithRRU for Inst {
             &Inst::CmpImm8 { rn, imm8 } => {
                 let rn = rn.show_rru(mb_rru);
                 format!("cmp {}, #{}", rn, imm8)
-            }
-            &Inst::Vcmp { vd, vm, precision } => {
-                let vd = show_freg_with_precision(vd, mb_rru, precision);
-                let vm = show_freg_with_precision(vm, mb_rru, precision);
-                let precision = precision.show_rru(mb_rru);
-                format!("vcmp.{} {}, {}", precision, vd, vm)
-            }
-            &Inst::VcmpZero { vd, precision } => {
-                let vd = show_freg_with_precision(vd, mb_rru, precision);
-                let precision = precision.show_rru(mb_rru);
-                format!("vcmp.{} {}, #0.0", precision, vd)
             }
             &Inst::Store {
                 rt, ref mem, bits, ..

@@ -261,12 +261,6 @@ impl BranchTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Precision {
-    Single,
-    Double,
-}
-
 impl ShowWithRRU for ShiftOpAndAmt {
     fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
         format!("{:?} {}", self.op(), self.amt().value())
@@ -307,15 +301,6 @@ impl ShowWithRRU for BranchTarget {
         match self {
             &BranchTarget::Label(label) => format!("label{:?}", label),
             &BranchTarget::ResolvedOffset(off) => format!("{}", off),
-        }
-    }
-}
-
-impl ShowWithRRU for Precision {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        match self {
-            &Precision::Single => "F32".to_string(),
-            &Precision::Double => "F64".to_string(),
         }
     }
 }

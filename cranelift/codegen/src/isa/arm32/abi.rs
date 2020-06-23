@@ -23,8 +23,6 @@ use smallvec::SmallVec;
 struct Args {
     r_used: u32,
     r_limit: u32,
-    d_used: u32,
-    d_limit: u32,
     stack_offset: u32,
 }
 
@@ -33,8 +31,6 @@ impl Args {
         Self {
             r_used: 0,
             r_limit: 4,
-            d_used: 0,
-            d_limit: 8,
             stack_offset: 0,
         }
     }
@@ -48,6 +44,10 @@ impl ArgAssigner for Args {
 
         let ty = arg.value_type;
 
+        if ty.is_float() {
+            panic!("Floats are not supported!")
+        }
+
         // Check for a legal type.
         // SIMD instructions are currently no implemented, so break down vectors
         if ty.is_vector() {
@@ -55,7 +55,7 @@ impl ArgAssigner for Args {
         }
 
         // Large integers and booleans are broken down to fit in a register.
-        if !ty.is_float() && ty.bits() > 32 {
+        if ty.bits() > 32 {
             // Align registers and stack to a multiple of two pointers.
             self.r_used = align(self.r_used, 2);
             self.stack_offset = align(self.stack_offset, 8);
@@ -72,26 +72,16 @@ impl ArgAssigner for Args {
         }
 
         // Try to use a GPR.
-        if !ty.is_float() && self.r_used < self.r_limit {
+        if self.r_used < self.r_limit {
             // Assign to a register.
-            let reg = (DREG_COUNT as u32 + self.r_used) as RegUnit;
+            let reg = self.r_used as RegUnit;
             self.r_used += 1;
             return ArgumentLoc::Reg(reg).into();
         }
 
-        // Try to use an FPU register.
-        if ty.is_float() && self.d_used < self.d_limit {
-            let reg = self.d_used as RegUnit;
-            self.d_used += 1;
-            return ArgumentLoc::Reg(reg).into();
-        }
-
         // Assign a stack location.
-        let bytes = ty.bytes();
-        // align stack
-        self.stack_offset = (self.stack_offset + bytes - 1) & !(bytes - 1);
         let loc = ArgumentLoc::Stack(self.stack_offset as i32);
-        self.stack_offset += bytes;
+        self.stack_offset += ty.bytes();
         loc.into()
     }
 }
@@ -125,7 +115,7 @@ struct ABISig {
     stack_ret_space: u32,
 }
 
-/// Process a list of parameters or return values and allocate them to R-regs and stack slots.
+/// Process a list of parameters or return values and allocate them to GPR and stack slots.
 ///
 /// Returns the list of argument locations, and the stack-space used (rounded up
 /// to a 8-byte-aligned boundary).
@@ -135,8 +125,7 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> CodegenResult<(Vec<ABIArg>, u32)
     let mut stack_off: u32 = 0;
     let mut ret = vec![];
 
-    let max_rreg: u8 = 3;
-    let max_dreg: u8 = 7;
+    let max_reg: u8 = 3;
 
     for param in params {
         // Validate "purpose".
@@ -151,17 +140,10 @@ fn compute_arg_locs(params: &[ir::AbiParam]) -> CodegenResult<(Vec<ABIArg>, u32)
         let ty = param.value_type;
         match param.location {
             ArgumentLoc::Reg(reg) => {
-                if reg < DREG_COUNT.into() {
-                    assert!(in_float_reg(ty));
-                    let reg: u8 = reg.try_into().unwrap();
-                    assert!(reg <= max_dreg);
-                    ret.push(ABIArg::Reg(dreg(reg).to_real_reg(), ty));
-                } else {
-                    assert!(in_int_reg(ty));
-                    let reg: u8 = (reg - DREG_COUNT as u16).try_into().unwrap();
-                    assert!(reg <= max_rreg);
-                    ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty));
-                }
+                let reg: u8 = reg as u8;
+                assert!(in_int_reg(ty));
+                assert!(reg <= max_reg);
+                ret.push(ABIArg::Reg(rreg(reg).to_real_reg(), ty));
             }
             ArgumentLoc::Stack(off) => {
                 ret.push(ABIArg::Stack(off, ty));
@@ -232,13 +214,6 @@ fn in_int_reg(ty: ir::Type) -> bool {
     }
 }
 
-fn in_float_reg(ty: ir::Type) -> bool {
-    match ty {
-        types::F32 | types::F64 => true,
-        _ => false,
-    }
-}
-
 fn load_stack(mem: MemArg, into_reg: Writable<Reg>, ty: Type) -> Inst {
     match ty {
         types::B1 | types::B8 | types::I8 | types::B16 | types::I16 | types::B32 | types::I32 => {
@@ -270,23 +245,7 @@ fn store_stack(mem: MemArg, from_reg: Reg, ty: Type) -> Inst {
 
 fn is_callee_save(r: RealReg) -> bool {
     let enc = r.get_hw_encoding();
-    match r.get_class() {
-        RegClass::I32 => {
-            if 4 <= enc && enc <= 11 {
-                true
-            } else {
-                false
-            }
-        }
-        RegClass::F64 => {
-            if enc < 8 {
-                true
-            } else {
-                false
-            }
-        }
-        _ => unreachable!(),
-    }
+    return 4 <= enc && enc <= 11;
 }
 
 fn get_callee_saves(regs: Vec<Writable<RealReg>>) -> Vec<Writable<RealReg>> {
@@ -306,10 +265,6 @@ fn get_caller_saves() -> Vec<Writable<Reg>> {
         if is_caller_save(r.to_reg().to_real_reg()) {
             set.push(r);
         }
-    }
-    for i in 0..8 {
-        let d = writable_dreg(i);
-        set.push(d);
     }
     set
 }
@@ -557,14 +512,9 @@ impl ABIBody for Arm32ABIBody {
         let clobbered = get_callee_saves(self.clobbered.to_vec());
         for reg in clobbered {
             let reg = reg.to_reg();
-            match reg.get_class() {
-                RegClass::I32 => {
-                    reg_list.push(reg.to_reg());
-                    callee_saved_used += 4;
-                }
-                RegClass::F64 => {}
-                _ => unimplemented!(),
-            }
+            assert!(reg.get_class() == RegClass::I32);
+            reg_list.push(reg.to_reg());
+            callee_saved_used += 4;
         }
 
         if !self.is_leaf {
@@ -613,14 +563,9 @@ impl ABIBody for Arm32ABIBody {
         let clobbered = get_callee_saves(self.clobbered.to_vec());
         for reg in clobbered.into_iter().rev() {
             let reg = reg.to_reg();
-            match reg.get_class() {
-                RegClass::I32 => {
-                    reg_list.push(Writable::from_reg(reg.to_reg()));
-                    callee_saved_used += 4;
-                }
-                RegClass::F64 => {}
-                _ => unimplemented!(),
-            }
+            assert!(reg.get_class() == RegClass::I32);
+            reg_list.push(Writable::from_reg(reg.to_reg()));
+            callee_saved_used += 4;
         }
         reg_list.reverse();
 

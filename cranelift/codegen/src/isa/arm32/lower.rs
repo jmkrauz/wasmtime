@@ -55,8 +55,9 @@ pub(crate) fn output_to_const<C: LowerCtx<I = Inst>>(ctx: &mut C, out: InsnOutpu
                     Some(imm as u64)
                 }
                 &InstructionData::UnaryBool { opcode: _, imm } => Some(u64::from(imm)),
-                &InstructionData::UnaryIeee32 { opcode: _, imm } => Some(u64::from(imm.bits())),
-                &InstructionData::UnaryIeee64 { opcode: _, imm } => Some(imm.bits()),
+                &InstructionData::UnaryIeee32 { .. } | &InstructionData::UnaryIeee64 { .. } => {
+                    unimplemented!()
+                }
                 _ => None,
             }
         }
@@ -160,7 +161,7 @@ pub(crate) fn lower_address<C: LowerCtx<I = Inst>>(
             return memarg;
         } else {
             let tmp = ctx.alloc_tmp(RegClass::I32, elem_ty);
-            lower_constant_int(ctx, tmp, offset as u64);
+            lower_constant(ctx, tmp, offset as u64);
             return MemArg::reg_plus_reg(reg, tmp.to_reg(), 0);
         }
     }
@@ -175,11 +176,7 @@ pub(crate) fn lower_address<C: LowerCtx<I = Inst>>(
     unimplemented!()
 }
 
-pub(crate) fn lower_constant_int<C: LowerCtx<I = Inst>>(
-    ctx: &mut C,
-    rd: Writable<Reg>,
-    value: u64,
-) {
+pub(crate) fn lower_constant<C: LowerCtx<I = Inst>>(ctx: &mut C, rd: Writable<Reg>, value: u64) {
     assert!((value >> 32) == 0x0 || (value >> 32) == (1 << 32) - 1);
 
     for inst in Inst::load_constant(rd, (value & ((1 << 32) - 1)) as u32) {
@@ -273,22 +270,14 @@ pub(crate) fn inst_condcode(data: &InstructionData) -> Option<IntCC> {
     }
 }
 
-/*pub(crate) fn inst_fp_condcode(data: &InstructionData) -> Option<FloatCC> {
-    match data {
-        &InstructionData::BranchFloat { cond, .. }
-        | &InstructionData::FloatCompare { cond, .. }
-        | &InstructionData::FloatCond { cond, .. }
-        | &InstructionData::FloatCondTrap { cond, .. } => Some(cond),
-        _ => None,
-    }
-}*/
-
 pub(crate) fn inst_trapcode(data: &InstructionData) -> Option<TrapCode> {
     match data {
         &InstructionData::Trap { code, .. }
         | &InstructionData::CondTrap { code, .. }
-        | &InstructionData::IntCondTrap { code, .. }
-        | &InstructionData::FloatCondTrap { code, .. } => Some(code),
+        | &InstructionData::IntCondTrap { code, .. } => Some(code),
+        &InstructionData::FloatCondTrap { code, .. } => {
+            panic!("Unexpected float cond trap {:?}", code)
+        }
         _ => None,
     }
 }

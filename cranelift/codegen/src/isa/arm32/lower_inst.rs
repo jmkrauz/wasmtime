@@ -31,7 +31,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         .collect();
     let ty = if outputs.len() > 0 {
         let ty = ctx.output_ty(insn, 0);
-        if ty.bits() > 32 {
+        if ty.bits() > 32 || ty.is_float() {
             panic!("Cannot lower inst with type {}!", ty);
         }
         Some(ty)
@@ -43,33 +43,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         Opcode::Iconst | Opcode::Bconst | Opcode::Null => {
             let value = output_to_const(ctx, outputs[0]).unwrap();
             let rd = output_to_reg(ctx, outputs[0]);
-            lower_constant_int(ctx, rd, value);
-        }
-        Opcode::F32const => {
-            let value = output_to_const(ctx, outputs[0]).unwrap();
-            let vn = output_to_reg(ctx, outputs[0]);
-            lower_constant_int(ctx, writable_ip_reg(), value);
-            ctx.emit(Inst::MoveGprToFpu {
-                vn,
-                rt: ip_reg(),
-                lo: true,
-            });
-        }
-        Opcode::F64const => {
-            let value = output_to_const(ctx, outputs[0]).unwrap();
-            let vn = output_to_reg(ctx, outputs[0]);
-            lower_constant_int(ctx, writable_ip_reg(), value & ((1 << 32) - 1));
-            ctx.emit(Inst::MoveGprToFpu {
-                vn,
-                rt: ip_reg(),
-                lo: true,
-            });
-            lower_constant_int(ctx, writable_ip_reg(), value >> 32);
-            ctx.emit(Inst::MoveGprToFpu {
-                vn,
-                rt: ip_reg(),
-                lo: false,
-            });
+            lower_constant(ctx, rd, value);
         }
         Opcode::Iadd
         | Opcode::IaddIfcin
@@ -201,70 +175,6 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 rm,
             });
         }
-        Opcode::Sqrt | Opcode::Fabs | Opcode::Fneg => {
-            let vd = output_to_reg(ctx, outputs[0]);
-            let vm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
-            let precision = match ty.unwrap() {
-                F32 => Precision::Single,
-                F64 => Precision::Double,
-                _ => panic!("Unexpected type {} in lower {}", ty.unwrap(), op),
-            };
-            let fpu_op = match op {
-                Opcode::Fabs => FPUOp1::Vabs,
-                Opcode::Fneg => FPUOp1::Vneg,
-                Opcode::Sqrt => FPUOp1::Vsqrt,
-                _ => unreachable!(),
-            };
-            ctx.emit(Inst::FpuRR {
-                fpu_op,
-                vd,
-                vm,
-                precision,
-            });
-        }
-        Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv => {
-            let vd = output_to_reg(ctx, outputs[0]);
-            let vn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
-            let vm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
-            let precision = match ty.unwrap() {
-                F32 => Precision::Single,
-                F64 => Precision::Double,
-                _ => panic!("Unexpected type {} in lower {}", ty.unwrap(), op),
-            };
-            let fpu_op = match op {
-                Opcode::Fadd => FPUOp2::Vadd,
-                Opcode::Fsub => FPUOp2::Vsub,
-                Opcode::Fmul => FPUOp2::Vmul,
-                Opcode::Fdiv => FPUOp2::Vdiv,
-                _ => unreachable!(),
-            };
-            ctx.emit(Inst::FpuRRR {
-                fpu_op,
-                vd,
-                vn,
-                vm,
-                precision,
-            });
-        }
-        Opcode::Fma => {
-            let vd = output_to_reg(ctx, outputs[0]);
-            let vn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
-            let vm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
-            let temp = input_to_reg(ctx, inputs[2], NarrowValueMode::None);
-            let precision = match ty.unwrap() {
-                F32 => Precision::Single,
-                F64 => Precision::Double,
-                _ => panic!("Unexpected type {} in lower {}", ty.unwrap(), op),
-            };
-            ctx.emit(Inst::Vmov { vd, vm: temp, precision });
-            ctx.emit(Inst::FpuRRROp3 {
-                fpu_op: FPUOp3::Vfma,
-                vd,
-                vn,
-                vm,
-                precision
-            });
-        }
         Opcode::Clz | Opcode::Bitrev => {
             let rd = output_to_reg(ctx, outputs[0]);
             let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
@@ -278,11 +188,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             if ty != I32 && ty != B32 {
                 unimplemented!()
             }
-            ctx.emit(Inst::BitOpRR {
-                bit_op,
-                rd,
-                rm
-            });
+            ctx.emit(Inst::BitOpRR { bit_op, rd, rm });
         }
         Opcode::Icmp => {
             let condcode = inst_condcode(ctx.data(insn)).unwrap();
@@ -309,10 +215,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         Opcode::Select | Opcode::Selectif => {
             let cond = if op == Opcode::Select {
                 let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
-                ctx.emit(Inst::CmpImm8 {
-                    rn,
-                    imm8: 0,
-                });
+                ctx.emit(Inst::CmpImm8 { rn, imm8: 0 });
                 Cond::Ne
             } else {
                 let condcode = inst_condcode(ctx.data(insn)).unwrap();
@@ -327,21 +230,8 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 te2: Some(false),
                 te3: None,
             });
-            let ty = ctx.output_ty(insn, 0);
-            match ty {
-                F32 => {
-                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Single));
-                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Single));
-                }
-                F64 => {
-                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Double));
-                    ctx.emit(Inst::vmov(out_reg, r1, Precision::Double));
-                }
-                _ => {
-                    ctx.emit(Inst::mov(out_reg, r1));
-                    ctx.emit(Inst::mov(out_reg, r2));
-                }
-            }
+            ctx.emit(Inst::mov(out_reg, r1));
+            ctx.emit(Inst::mov(out_reg, r2));
         }
         Opcode::Store
         | Opcode::Istore8
@@ -418,6 +308,11 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 | Opcode::Sload32Complex => true,
                 _ => false,
             };
+
+            if elem_ty.is_float() {
+                unimplemented!()
+            }
+
             let out_reg = output_to_reg(ctx, outputs[0]);
             let mem = lower_address(ctx, elem_ty, &inputs[..], off);
             let memflags = ctx.memflags(insn).expect("memory flags");
@@ -426,58 +321,14 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             } else {
                 None
             };
-
-            if elem_ty == F32 {
-                assert!(op == Opcode::Load);
-                ctx.emit(Inst::Load {
-                    rt: writable_ip_reg(),
-                    mem,
-                    srcloc,
-                    bits: 32,
-                    sign_extend: false,
-                });
-                ctx.emit(Inst::MoveGprToFpu {
-                    vn: out_reg, 
-                    rt: ip_reg(),
-                    lo: true,
-                });
-            } else if elem_ty == F64 {
-                assert!(op == Opcode::Load);
-                ctx.emit(Inst::Load {
-                    rt: writable_ip_reg(),
-                    mem,
-                    srcloc,
-                    bits: 32,
-                    sign_extend: false,
-                });
-                ctx.emit(Inst::MoveGprToFpu {
-                    vn: out_reg, 
-                    rt: ip_reg(),
-                    lo: false,
-                });
-                let mem = lower_address(ctx, elem_ty, &inputs[..], off + 4);
-                ctx.emit(Inst::Load {
-                    rt: writable_ip_reg(),
-                    mem,
-                    srcloc,
-                    bits: 32,
-                    sign_extend: false,
-                });
-                ctx.emit(Inst::MoveGprToFpu {
-                    vn: out_reg,
-                    rt: ip_reg(),
-                    lo: true,
-                });
-            } else {
-                let bits = elem_ty.bits() as u8;
-                ctx.emit(Inst::Load {
-                    rt: out_reg,
-                    mem,
-                    srcloc,
-                    bits,
-                    sign_extend,
-                });
-            }
+            let bits = elem_ty.bits() as u8;
+            ctx.emit(Inst::Load {
+                rt: out_reg,
+                mem,
+                srcloc,
+                bits,
+                sign_extend,
+            });
         }
         Opcode::Uextend | Opcode::Sextend => {
             let output_ty = ty.unwrap();
@@ -520,30 +371,6 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let ty = ctx.input_ty(insn, 0);
             ctx.emit(Inst::gen_move(rd, rn, ty));
-        }
-        Opcode::Bitcast => {
-            let in_reg = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
-            let out_reg = output_to_reg(ctx, outputs[0]);
-            let in_ty = ctx.input_ty(insn, 0);
-            let out_ty = ty.unwrap();
-
-            match (in_ty, out_ty) {
-                (F32, I32) => {
-                    ctx.emit(Inst::MoveFpuToGpr {
-                        rt: out_reg,
-                        vn: in_reg,
-                        lo: true,
-                    })
-                },
-                (I32, F32) => {
-                    ctx.emit(Inst::MoveGprToFpu {
-                        vn: out_reg,
-                        rt: in_reg,
-                        lo: false,
-                    });
-                },
-                _ => panic!("Unexpected in/out types: {}/{}", in_ty, out_ty),
-            }
         }
         Opcode::StackAddr | Opcode::StackLoad => {
             let (stack_slot, offset) = match *ctx.data(insn) {
