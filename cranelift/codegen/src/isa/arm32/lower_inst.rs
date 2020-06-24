@@ -89,16 +89,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         | Opcode::SsubSat
         | Opcode::Imul
         | Opcode::Udiv
-        | Opcode::Sdiv
-        | Opcode::Ishl
-        | Opcode::Ushr
-        | Opcode::Sshr
-        | Opcode::Rotr => {
-            match ty {
-                Some(I32) | Some(B32) => {}
-                _ => unimplemented!(),
-            }
-
+        | Opcode::Sdiv => {
             let rd = output_to_reg(ctx, outputs[0]);
             let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
@@ -109,6 +100,21 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 Opcode::Imul => ALUOp::Mul,
                 Opcode::Udiv => ALUOp::Udiv,
                 Opcode::Sdiv => ALUOp::Sdiv,
+                _ => unreachable!(),
+            };
+            ctx.emit(Inst::AluRRR { alu_op, rd, rn, rm });
+        }
+        Opcode::Ishl
+        | Opcode::Ushr
+        | Opcode::Sshr
+        | Opcode::Rotr => {
+            if ty.unwrap().bits() != 32 {
+                unimplemented!()
+            }
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let alu_op = match op {
                 Opcode::Ishl => ALUOp::Lsl,
                 Opcode::Ushr => ALUOp::Lsr,
                 Opcode::Sshr => ALUOp::Asr,
@@ -169,10 +175,11 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         Opcode::Bnot => {
             let rd = output_to_reg(ctx, outputs[0]);
             let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
-            ctx.emit(Inst::AluRR {
-                alu_op: ALUOp::Mvn,
+            ctx.emit(Inst::AluRRShift {
+                alu_op: ALUOp1::Mvn,
                 rd,
                 rm,
+                shift: None,
             });
         }
         Opcode::Clz | Opcode::Bitrev => {
@@ -203,14 +210,14 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let rn = input_to_reg(ctx, inputs[0], narrow_mode);
             let rm = input_to_reg(ctx, inputs[1], narrow_mode);
             ctx.emit(Inst::Cmp { rn, rm });
+
+            let mut it_insts = vec![];
+            it_insts.push(CondInst::new(Inst::MovImm16 { rd, imm16: 1 }, true));
+            it_insts.push(CondInst::new(Inst::MovImm16 { rd, imm16: 0 }, false));
             ctx.emit(Inst::It {
                 cond,
-                te1: Some(true),
-                te2: Some(false),
-                te3: None,
+                insts: it_insts,
             });
-            ctx.emit(Inst::MovImm16 { rd, imm16: 0x1 });
-            ctx.emit(Inst::MovImm16 { rd, imm16: 0x0 });
         }
         Opcode::Select | Opcode::Selectif => {
             let cond = if op == Opcode::Select {
@@ -224,14 +231,14 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let r1 = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
             let r2 = input_to_reg(ctx, inputs[2], NarrowValueMode::None);
             let out_reg = output_to_reg(ctx, outputs[0]);
+
+            let mut it_insts = vec![];
+            it_insts.push(CondInst::new(Inst::mov(out_reg, r1), true));
+            it_insts.push(CondInst::new(Inst::mov(out_reg, r2), false));
             ctx.emit(Inst::It {
                 cond,
-                te1: Some(true),
-                te2: Some(false),
-                te3: None,
+                insts: it_insts,
             });
-            ctx.emit(Inst::mov(out_reg, r1));
-            ctx.emit(Inst::mov(out_reg, r2));
         }
         Opcode::Store
         | Opcode::Istore8
@@ -333,8 +340,8 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         Opcode::Uextend | Opcode::Sextend => {
             let output_ty = ty.unwrap();
             let input_ty = ctx.input_ty(insn, 0);
-            let from_bits = ty_bits(input_ty) as u8;
-            let to_bits = ty_bits(output_ty) as u8;
+            let from_bits = input_ty.bits() as u8;
+            let to_bits = output_ty.bits() as u8;
             let signed = op == Opcode::Sextend;
             let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let rd = output_to_reg(ctx, outputs[0]);

@@ -190,9 +190,8 @@ pub enum BranchTarget {
     /// An unresolved reference to a Label, as passed into
     /// `lower_branch_group()`.
     Label(MachLabel),
-    /// A resolved reference to another instruction, after
-    /// `Inst::with_block_offsets()`.
-    ResolvedOffset(isize),
+    /// A fixed PC offset.
+    ResolvedOffset(i32),
 }
 
 impl BranchTarget {
@@ -204,57 +203,49 @@ impl BranchTarget {
         }
     }
 
-    /// Get the offset as 2-byte halfwords. Returns `0` if not
-    /// yet resolved (in that case, we're only computing
-    /// size and the offset doesn't matter).
-    pub fn as_offset_halfwords(&self) -> isize {
+    // Ready for embedding in istruction.
+    fn as_offset(self) -> i32 {
         match self {
-            &BranchTarget::ResolvedOffset(off) => (off - 4) >> 1,
+            // subtract 4 becasuse PC is current inst
+            BranchTarget::ResolvedOffset(off) => ((off - 4) >> 1),
             _ => 0,
         }
     }
 
-    pub fn as_off24(&self) -> Option<u32> {
-        let off = self.as_offset_halfwords();
-        if (off < (1 << 24)) && (off >= -(1 << 24)) {
-            Some((off as u32) & ((1 << 24) - 1))
-        } else {
-            None
-        }
+    // For 32-bit unconditional jump.
+    pub fn as_off24(self) -> u32 {
+        let off = self.as_offset();
+        assert!(off < (1 << 24));
+        assert!(off >= -(1 << 24));
+        (off as u32) & ((1 << 24) - 1)
     }
 
-    pub fn as_off20(&self) -> Option<u32> {
-        let off = self.as_offset_halfwords();
-        if (off < (1 << 20)) && (off >= -(1 << 20)) {
-            Some((off as u32) & ((1 << 20) - 1))
-        } else {
-            None
-        }
+    // For 32-bit conditional jump.
+    pub fn as_off20(self) -> u32 {
+        let off = self.as_offset();
+        assert!(off < (1 << 20));
+        assert!(off >= -(1 << 20));
+        (off as u32) & ((1 << 20) - 1)
     }
 
-    /// Get the offset as a 11-bit offset suitable for an uncoditional jump, or `None` if overflow.
-    pub fn as_off11(&self) -> Option<u16> {
-        let off = self.as_offset_halfwords();
+    // For cbz/cbnz.
+    pub fn as_off6(&self) -> u16 {
+        let off = self.as_offset();
+        assert!(off < (1 << 6));
+        assert!(off >= 0);
+        (off as u16) & ((1 << 6) - 1)
+    }
+
+    // For 16-bit unconditional jump.
+    // Returns Option type to help emit short jump if it is possible.
+    pub fn as_off11(self) -> Option<u16> {
+        if let BranchTarget::Label(_) = self {
+            return None;
+        }
+        let off = self.as_offset();
+
         if (off < (1 << 11)) && (off >= -(1 << 11)) {
             Some((off as u16) & ((1 << 11) - 1))
-        } else {
-            None
-        }
-    }
-
-    pub fn as_off8(&self) -> Option<u16> {
-        let off = self.as_offset_halfwords();
-        if (off < (1 << 8)) && (off >= -(1 << 8)) {
-            Some((off as u16) & ((1 << 8) - 1))
-        } else {
-            None
-        }
-    }
-
-    pub fn as_off6(&self) -> Option<u16> {
-        let off = self.as_offset_halfwords();
-        if (off < (1 << 6)) && (off >= 0) {
-            Some((off as u16) & ((1 << 6) - 1))
         } else {
             None
         }

@@ -1,7 +1,6 @@
 use crate::cursor::{Cursor, FuncCursor};
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::entities::Value;
-#[allow(unused)]
 use crate::ir::{self, InstBuilder, ValueLoc};
 use crate::isa::{self, TargetIsa};
 

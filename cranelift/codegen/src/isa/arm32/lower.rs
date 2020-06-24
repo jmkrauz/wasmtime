@@ -1,7 +1,6 @@
 //! Lowering rules for 32-bit ARM.
 
-#[allow(unused)]
-use crate::ir::condcodes::{FloatCC, IntCC};
+use crate::ir::condcodes::IntCC;
 use crate::ir::types::*;
 use crate::ir::Inst as IRInst;
 use crate::ir::{InstructionData, Opcode, TrapCode, Type};
@@ -39,7 +38,13 @@ pub(crate) struct InsnInput {
 //============================================================================
 // Lowering: convert instruction outputs to result types.
 
-/// Lower an instruction output to a 64-bit constant, if possible.
+/// Lower an instruction input to a 32-bit constant, if possible.
+pub(crate) fn input_to_const<C: LowerCtx<I = Inst>>(ctx: &mut C, input: InsnInput) -> Option<u64> {
+    let input = ctx.get_input(input.insn, input.input);
+    input.constant
+}
+
+/// Lower an instruction output to a 32-bit constant, if possible.
 pub(crate) fn output_to_const<C: LowerCtx<I = Inst>>(ctx: &mut C, out: InsnOutput) -> Option<u64> {
     if out.output > 0 {
         None
@@ -89,7 +94,7 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
     narrow_mode: NarrowValueMode,
 ) -> Reg {
     let ty = ctx.input_ty(input.insn, input.input);
-    let from_bits = ty_bits(ty) as u8;
+    let from_bits = ty.bits() as u8;
     let inputs = ctx.get_input(input.insn, input.input);
     let in_reg = if let Some(c) = inputs.constant {
         // Generate constants fresh at each use to minimize long-range register pressure.
@@ -142,10 +147,6 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
         ),
     }
 }
-
-//============================================================================
-// Lowering: addressing mode support. Takes instruction directly, rather
-// than an `InsnInput`, to do more introspection.
 
 /// Lower the address of a load or store.
 pub(crate) fn lower_address<C: LowerCtx<I = Inst>>(
@@ -205,7 +206,7 @@ pub(crate) fn lower_condcode(cc: IntCC) -> Cond {
 /// unsigned.  See the documentation for the `icmp` instruction in
 /// cranelift-codegen/meta/src/shared/instructions.rs for further insights
 /// into this.
-pub fn condcode_is_signed(cc: IntCC) -> bool {
+pub(crate) fn condcode_is_signed(cc: IntCC) -> bool {
     match cc {
         IntCC::Equal => false,
         IntCC::NotEqual => false,
@@ -224,17 +225,6 @@ pub fn condcode_is_signed(cc: IntCC) -> bool {
 
 //=============================================================================
 // Helpers for instruction lowering.
-pub fn ty_bits(ty: Type) -> usize {
-    match ty {
-        B1 => 1,
-        B8 | I8 => 8,
-        B16 | I16 => 16,
-        B32 | I32 | F32 => 32,
-        B64 | I64 | F64 => 64,
-        B128 | I128 => 128,
-        IFLAGS | FFLAGS | _ => panic!("ty_bits() on unknown type: {:?}", ty),
-    }
-}
 
 pub(crate) fn ty_is_int(ty: Type) -> bool {
     match ty {
@@ -285,7 +275,6 @@ pub(crate) fn inst_trapcode(data: &InstructionData) -> Option<TrapCode> {
 //=============================================================================
 // Lowering-backend trait implementation.
 
-#[allow(unused)]
 impl LowerBackend for Arm32Backend {
     type MInst = Inst;
 

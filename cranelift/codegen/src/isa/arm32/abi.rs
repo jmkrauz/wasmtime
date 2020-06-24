@@ -5,7 +5,7 @@ use crate::ir;
 use crate::ir::types;
 use crate::ir::types::*;
 use crate::ir::{AbiParam, ArgumentExtension, ArgumentLoc, StackSlot};
-use crate::isa::arm32::{self, inst::*};
+use crate::isa::arm32::inst::*;
 use crate::isa::{self, RegUnit};
 use crate::machinst::*;
 use crate::settings;
@@ -382,7 +382,7 @@ impl ABIBody for Arm32ABIBody {
         let mut ret = Vec::new();
         match &self.sig.rets[idx] {
             &ABIArg::Reg(r, ty) => {
-                let from_bits = arm32::lower::ty_bits(ty) as u8;
+                let from_bits = ty.bits() as u8;
                 let dest_reg = Writable::from_reg(r.to_reg());
                 match (ext, from_bits) {
                     (ArgumentExtension::Uext, n) if n < 32 => {
@@ -405,7 +405,7 @@ impl ABIBody for Arm32ABIBody {
                 };
             }
             &ABIArg::Stack(off, ty) => {
-                let from_bits = arm32::lower::ty_bits(ty) as u8;
+                let from_bits = ty.bits() as u8;
                 // Trash the from_reg; it should be its last use.
                 match (ext, from_bits) {
                     (ArgumentExtension::Uext, n) if n < 32 => {

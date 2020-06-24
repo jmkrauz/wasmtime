@@ -1,8 +1,5 @@
 //! This module defines 32-bit ARM specific machine instruction types.
 
-// Some variants are not constructed, but we still want them as options in the future.
-#![allow(dead_code)]
-
 use crate::binemit::CodeOffset;
 use crate::ir::types::{B1, B16, B32, B8, I16, I32, I8, IFLAGS};
 use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode, Type};
@@ -51,12 +48,18 @@ pub enum ALUOp {
     Orr,
     Orn,
     Eor,
-    Mvn,
     Bic,
     Lsl,
     Lsr,
     Asr,
     Ror,
+}
+
+/// An ALU operation with one argument.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ALUOp1 {
+    Mvn,
+    Mov,
 }
 
 /// An operation on the bits of a register.
@@ -72,6 +75,9 @@ pub enum BitOp {
 pub enum Inst {
     /// A no-op of zero size.
     Nop0,
+
+    /// A no-op that is two bytes large.
+    Nop2,
 
     /// An ALU operation with two register sources and one register destination.
     AluRRR {
@@ -90,10 +96,11 @@ pub enum Inst {
     },
 
     /// An ALU operation with one register source and one register destination.
-    AluRR {
-        alu_op: ALUOp,
+    AluRRShift {
+        alu_op: ALUOp1,
         rd: Writable<Reg>,
         rm: Reg,
+        shift: Option<ShiftOpAndAmt>,
     },
 
     AluRRRR {
@@ -120,7 +127,7 @@ pub enum Inst {
     },
 
     AluRImm8 {
-        alu_op: ALUOp,
+        alu_op: ALUOp1,
         rd: Writable<Reg>,
         imm8: u8,
     },
@@ -183,9 +190,7 @@ pub enum Inst {
     // An If-Then instruction, which makes up to four following instructions conditinal.
     It {
         cond: Cond,
-        te1: Option<bool>,
-        te2: Option<bool>,
-        te3: Option<bool>,
+        insts: Vec<CondInst>,
     },
 
     /// A "breakpoint" instruction, used for e.g. traps and debug breakpoints.
@@ -258,6 +263,28 @@ pub enum Inst {
     EpiloguePlaceholder,
 }
 
+/// An instruction occuring in it block.
+#[derive(Clone, Debug)]
+pub struct CondInst {
+    inst: Inst,
+    then: bool,
+}
+
+impl CondInst {
+    pub fn new(inst: Inst, then: bool) -> Self {
+        match inst {
+            Inst::It { .. }
+            | Inst::Ret { .. }
+            | Inst::Jump { .. }
+            | Inst::CondBr { .. }
+            | Inst::OneWayCondBr { .. }
+            | Inst::EpiloguePlaceholder { .. }
+            | Inst::LoadExtName { .. } => panic!("Instruction {:?} cannot occur in it block", inst),
+            _ => Self { inst, then },
+        }
+    }
+}
+
 impl Inst {
     /// Create a move instruction.
     pub fn mov(to_reg: Writable<Reg>, from_reg: Reg) -> Inst {
@@ -298,7 +325,7 @@ fn memarg_regs(memarg: &MemArg, collector: &mut RegUsageCollector) {
 fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
     match inst {
         &Inst::Nop0
-        | &Inst::It { .. }
+        | &Inst::Nop2
         | &Inst::Bkpt
         | &Inst::Udf { .. }
         | &Inst::Ret
@@ -315,7 +342,7 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             collector.add_use(rn);
             collector.add_use(rm);
         }
-        &Inst::AluRR { rd, rm, .. } => {
+        &Inst::AluRRShift { rd, rm, .. } => {
             collector.add_def(rd);
             collector.add_use(rm);
         }
@@ -374,6 +401,11 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Extend { rd, rm, .. } => {
             collector.add_def(rd);
             collector.add_use(rm);
+        }
+        &Inst::It { ref insts, .. } => {
+            for inst in insts.iter() {
+                arm32_get_regs(&inst.inst, collector);
+            }
         }
         &Inst::Push { ref reg_list } => {
             for reg in reg_list {
@@ -458,7 +490,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
 
     match inst {
         &mut Inst::Nop0
-        | &mut Inst::It { .. }
+        | &mut Inst::Nop2
         | &mut Inst::Bkpt
         | &mut Inst::Udf { .. }
         | &mut Inst::Call { .. }
@@ -485,7 +517,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             map_use(mapper, rn);
             map_use(mapper, rm);
         }
-        &mut Inst::AluRR {
+        &mut Inst::AluRRShift {
             ref mut rd,
             ref mut rm,
             ..
@@ -580,6 +612,11 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             map_def(mapper, rd);
             map_use(mapper, rm);
         }
+        &mut Inst::It { ref mut insts, .. } => {
+            for inst in insts.iter_mut() {
+                arm32_map_regs(&mut inst.inst, mapper);
+            }
+        }
         &mut Inst::Push { ref mut reg_list } => {
             for reg in reg_list {
                 map_use(mapper, reg);
@@ -619,7 +656,6 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
 //=============================================================================
 // Instructions: misc functions and external interface
 
-#[allow(unused)]
 impl MachInst for Inst {
     type LabelUse = LabelUse;
 
@@ -686,7 +722,8 @@ impl MachInst for Inst {
     }
 
     fn gen_nop(preferred_size: usize) -> Inst {
-        unimplemented!()
+        assert!(preferred_size >= 2);
+        Inst::Nop2
     }
 
     fn maybe_direct_reload(&self, _reg: VirtualReg, _slot: SpillSlot) -> Option<Inst> {
@@ -715,26 +752,13 @@ impl MachInst for Inst {
     }
 
     fn worst_case_size() -> CodeOffset {
-        // LoadExtName
-        12
+        // It with four 32-bit instructions
+        2 + 4 * 4
     }
 }
 
 //=============================================================================
 // Pretty-printing of instructions.
-fn mem_finalize_for_show(mem: &MemArg, mb_rru: Option<&RealRegUniverse>) -> (String, MemArg) {
-    let (mem_insts, mem) = mem_finalize(0, mem);
-    let mut mem_str = mem_insts
-        .into_iter()
-        .map(|inst| inst.show_rru(mb_rru))
-        .collect::<Vec<_>>()
-        .join(" ; ");
-    if !mem_str.is_empty() {
-        mem_str += " ; ";
-    }
-
-    (mem_str, mem)
-}
 
 impl ShowWithRRU for Inst {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
@@ -760,7 +784,6 @@ impl ShowWithRRU for Inst {
                 ALUOp::Orr => "orr",
                 ALUOp::Orn => "orn",
                 ALUOp::Eor => "eor",
-                ALUOp::Mvn => "mvn",
                 ALUOp::Bic => "bic",
                 ALUOp::Lsl => "lsl",
                 ALUOp::Lsr => "lsr",
@@ -782,6 +805,7 @@ impl ShowWithRRU for Inst {
 
         match self {
             &Inst::Nop0 => "nop-zero-len".to_string(),
+            &Inst::Nop2 => "nop".to_string(),
             &Inst::AluRRR { alu_op, rd, rn, rm } => {
                 let op = op_name(alu_op);
                 let rd = rd.show_rru(mb_rru);
@@ -803,11 +827,15 @@ impl ShowWithRRU for Inst {
                 let shift = reg_shift_str(shift, mb_rru);
                 format!("{} {}, {}, {}{}", op, rd, rn, rm, shift)
             }
-            &Inst::AluRR { alu_op, rd, rm } => {
-                let op = op_name(alu_op);
+            &Inst::AluRRShift { alu_op, rd, rm, ref shift } => {
+                let op = match alu_op {
+                    ALUOp1::Mvn => "mvn",
+                    ALUOp1::Mov => "mov",
+                };
                 let rd = rd.show_rru(mb_rru);
                 let rm = rm.show_rru(mb_rru);
-                format!("{} {}, {}", op, rd, rm)
+                let shift = reg_shift_str(shift, mb_rru);
+                format!("{} {}, {}{}", op, rd, rm, shift)
             }
             &Inst::AluRRRR {
                 alu_op,
@@ -846,7 +874,10 @@ impl ShowWithRRU for Inst {
                 format!("{} {}, {}, #{}", op, rd, rn, imm8)
             }
             &Inst::AluRImm8 { alu_op, rd, imm8 } => {
-                let op = op_name(alu_op);
+                let op = match alu_op {
+                    ALUOp1::Mvn => "mvn",
+                    ALUOp1::Mov => "mov",
+                };
                 let rd = rd.show_rru(mb_rru);
                 format!("{} {}, #{}", op, rd, imm8)
             }
@@ -931,36 +962,17 @@ impl ShowWithRRU for Inst {
                 let rm = rm.show_rru(mb_rru);
                 format!("{} {}, {}", op, rd, rm)
             }
-            &Inst::It {
-                cond,
-                te1,
-                te2,
-                te3,
-            } => {
-                fn show_te(te: Option<bool>) -> &'static str {
-                    match te {
-                        None => "",
-                        Some(true) => "t",
-                        Some(false) => "e",
-                    }
-                }
-
-                match (te1, te2, te3) {
-                    (None, None, None)
-                    | (Some(_), None, None)
-                    | (Some(_), Some(_), None)
-                    | (Some(_), Some(_), Some(_)) => {}
-                    _ => panic!(
-                        "Invalid condition combination {:?} {:?} {:?} in it instruction",
-                        te1, te2, te3
-                    ),
-                }
-
+            &Inst::It { cond, ref insts } => {
+                let te: String = insts
+                    .iter()
+                    .map(|i| if i.then { "t" } else { "e" })
+                    .collect();
                 let cond = cond.show_rru(mb_rru);
-                let te1 = show_te(te1);
-                let te2 = show_te(te2);
-                let te3 = show_te(te3);
-                format!("it{}{}{} {}", te1, te2, te3, cond)
+                let insts: String = insts
+                    .iter()
+                    .map(|i| format!("; {}", i.inst.show_rru(mb_rru)))
+                    .collect();
+                format!("it{} {}{}", te, cond, insts)
             }
             &Inst::Bkpt => "bkpt #0".to_string(),
             &Inst::Udf { .. } => "udf".to_string(),
