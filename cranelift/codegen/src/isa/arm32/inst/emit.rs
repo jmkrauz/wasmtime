@@ -62,12 +62,9 @@ fn enc_16_it(cond: Cond, insts: &Vec<CondInst>) -> u16 {
             mask |= (cond & 0x1) ^ 0x1;
         }
         mask <<= 1;
-        eprintln!("{:#08b}", mask);
     }
     mask |= 0x1;
-    eprintln!("{:#08b}", mask);
     mask <<= 4 - insts.len();
-    eprintln!("{:#08b}", mask);
     0b1011_1111_0000_0000 | (cond << 4) | mask
 }
 
@@ -198,7 +195,7 @@ impl MachInstEmit for Inst {
     type State = EmitState;
 
     fn emit(&self, sink: &mut MachBuffer<Inst>, flags: &settings::Flags, state: &mut EmitState) {
-        let start_off = sink.cur_offset();
+        let mut start_off = sink.cur_offset();
 
         match self {
             &Inst::Nop0 | &Inst::EpiloguePlaceholder => {}
@@ -253,7 +250,12 @@ impl MachInstEmit for Inst {
                 let inst = enc_32_reg_shift(inst, shift);
                 emit_32(inst, sink);
             }
-            &Inst::AluRRShift { alu_op, rd, rm, ref shift } =>  {
+            &Inst::AluRRShift {
+                alu_op,
+                rd,
+                rm,
+                ref shift,
+            } => {
                 let bits_24_21 = match alu_op {
                     ALUOp1::Mvn => 0b0011,
                     ALUOp1::Mov => 0b0010,
@@ -551,6 +553,68 @@ impl MachInstEmit for Inst {
                 sink.add_reloc(srcloc, Reloc::Abs4, name, (offset + 1).into());
                 sink.put4(0);
             }
+            &Inst::JTSequence {
+                ridx,
+                rtmp1,
+                rtmp2,
+                ref info,
+                ..
+            } => {
+                // This sequence is *one* instruction in the vcode, and is expanded only here at
+                // emission time, because we cannot allow the regalloc to insert spills/reloads in
+                // the middle; we depend on hardcoded PC-rel addressing below.
+
+                // Save index in a tmp (the live range of ridx only goes to start of this
+                // sequence; rtmp1 or rtmp2 may overwrite it).
+                let inst = Inst::gen_move(rtmp2, ridx, I32);
+                inst.emit(sink, flags, state);
+                // Load address of jump table
+
+                let inst = Inst::AluRRImm12 {
+                    alu_op: ALUOp::Add,
+                    rd: rtmp1,
+                    rn: pc_reg(),
+                    imm12: 10,
+                };
+                inst.emit(sink, flags, state);
+                // Load value out of jump table
+                let inst = Inst::Load {
+                    rt: rtmp2,
+                    mem: MemArg::reg_plus_reg(rtmp1.to_reg(), rtmp2.to_reg(), 2),
+                    bits: 32,
+                    sign_extend: false,
+                    srcloc: None, // can't cause a user trap.
+                };
+                inst.emit(sink, flags, state);
+                // Add base of jump table to jump-table-sourced block offset
+                let inst = Inst::AluRRRShift {
+                    alu_op: ALUOp::Add,
+                    rd: rtmp1,
+                    rn: rtmp1.to_reg(),
+                    rm: rtmp2.to_reg(),
+                    shift: None,
+                };
+                inst.emit(sink, flags, state);
+                // Branch to computed address. (`targets` here is only used for successor queries
+                // and is not needed for emission.)
+                let inst = Inst::IndirectBr {
+                    rm: rtmp1.to_reg(),
+                    targets: vec![],
+                };
+                inst.emit(sink, flags, state);
+                // Emit jump table (table of 32-bit offsets).
+                let jt_off = sink.cur_offset();
+                for &target in info.targets.iter() {
+                    let word_off = sink.cur_offset();
+                    let off_into_table = word_off - jt_off;
+                    sink.use_label_at_offset(word_off, target.as_label().unwrap(), LabelUse::PCRel);
+                    sink.put4(off_into_table);
+                }
+
+                // Lowering produces an EmitIsland before using a JTSequence, so we can safely
+                // disable the worst-case-size check in this case.
+                start_off = sink.cur_offset();
+            }
             &Inst::Ret => {
                 sink.put2(0b010001110_1110_000); // bx lr
             }
@@ -561,11 +625,7 @@ impl MachInstEmit for Inst {
                     sink.use_label_at_offset(off, l, LabelUse::Branch24);
                     sink.add_uncond_branch(off, off + 4, l);
                 }
-                if let Some(_) = dest.as_off11() {
-                    sink.put2(enc_16_jump(dest));
-                } else {
-                    emit_32(enc_32_jump(dest), sink);
-                }
+                emit_32(enc_32_jump(dest), sink);
             }
             &Inst::CondBr {
                 taken,
@@ -618,8 +678,14 @@ impl MachInstEmit for Inst {
                 emit_32(enc_32_jump(not_taken), sink);
             }
             &Inst::OneWayCondBr { target, kind } => {
-                if let Some(_) = target.as_label() {
-                    unimplemented!()
+                let off = sink.cur_offset();
+                if let Some(l) = target.as_label() {
+                    let label_use = if let CondBrKind::Cond(_) = kind {
+                        LabelUse::Branch20
+                    } else {
+                        LabelUse::Branch6
+                    };
+                    sink.use_label_at_offset(off, l, label_use);
                 }
                 match kind {
                     CondBrKind::Zero(reg) => {
@@ -631,6 +697,21 @@ impl MachInstEmit for Inst {
                     CondBrKind::Cond(c) => {
                         emit_32(enc_32_cond_branch(c, target), sink);
                     }
+                }
+            }
+            &Inst::IndirectBr { rm, .. } => {
+                let inst = 0b010001111_0000_000 | (machreg_to_gpr(rm) << 3);
+                sink.put2(inst);
+            }
+            &Inst::EmitIsland { needed_space } => {
+                if sink.island_needed(needed_space + 4) {
+                    let jump_around_label = sink.get_label();
+                    let jmp = Inst::Jump {
+                        dest: BranchTarget::Label(jump_around_label),
+                    };
+                    jmp.emit(sink, flags, state);
+                    sink.emit_island();
+                    sink.bind_label(jump_around_label);
                 }
             }
         }

@@ -1,5 +1,6 @@
 //! Lower a single Cranelift instruction into vcode.
 
+use crate::binemit::CodeOffset;
 use crate::ir::types::*;
 use crate::ir::Inst as IRInst;
 use crate::ir::{InstructionData, Opcode};
@@ -12,6 +13,8 @@ use crate::isa::arm32::inst::*;
 
 use regalloc::RegClass;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use smallvec::SmallVec;
 
@@ -85,11 +88,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 shift: None,
             });
         }
-        Opcode::SaddSat
-        | Opcode::SsubSat
-        | Opcode::Imul
-        | Opcode::Udiv
-        | Opcode::Sdiv => {
+        Opcode::SaddSat | Opcode::SsubSat | Opcode::Imul | Opcode::Udiv | Opcode::Sdiv => {
             let rd = output_to_reg(ctx, outputs[0]);
             let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
@@ -104,10 +103,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             };
             ctx.emit(Inst::AluRRR { alu_op, rd, rn, rm });
         }
-        Opcode::Ishl
-        | Opcode::Ushr
-        | Opcode::Sshr
-        | Opcode::Rotr => {
+        Opcode::Ishl | Opcode::Ushr | Opcode::Sshr | Opcode::Rotr => {
             if ty.unwrap().bits() != 32 {
                 unimplemented!()
             }
@@ -552,7 +548,72 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                     dest: BranchTarget::Label(targets[0]),
                 });
             }
-            Opcode::BrTable => unimplemented!(),
+            Opcode::BrTable => {
+                // Expand `br_table idx, default, JT` to:
+                //
+                //   emit_island
+                //   cmp idx, #jt_size
+                //   b.hs default
+                //   add vTmp1, PC+16
+                //   ldr vTmp2, [vTmp1, idx, lsl #2]
+                //   add vTmp2, vTmp2, vTmp1
+                //   br vTmp2
+                //   [jumptable offsets relative to JT base]
+                let jt_size = targets.len() - 1;
+                assert!(jt_size <= std::u32::MAX as usize);
+
+                ctx.emit(Inst::EmitIsland {
+                    needed_space: 4 * (6 + jt_size) as CodeOffset,
+                });
+
+                let ridx = input_to_reg(
+                    ctx,
+                    InsnInput {
+                        insn: branches[0],
+                        input: 0,
+                    },
+                    NarrowValueMode::ZeroExtend,
+                );
+
+                let rtmp1 = ctx.alloc_tmp(RegClass::I32, I32);
+                let rtmp2 = ctx.alloc_tmp(RegClass::I32, I32);
+
+                // Bounds-check and branch to default.
+                if jt_size & !0xff == 0 {
+                    ctx.emit(Inst::CmpImm8 {
+                        rn: ridx,
+                        imm8: jt_size as u8,
+                    })
+                } else {
+                    lower_constant(ctx, rtmp1, jt_size as u64);
+                    ctx.emit(Inst::Cmp {
+                        rn: ridx,
+                        rm: rtmp1.to_reg(),
+                    });
+                }
+
+                let default_target = BranchTarget::Label(targets[0]);
+                ctx.emit(Inst::OneWayCondBr {
+                    target: default_target.clone(),
+                    kind: CondBrKind::Cond(Cond::Hs), // unsigned >=
+                });
+
+                let jt_targets: Vec<BranchTarget> = targets
+                    .iter()
+                    .skip(1)
+                    .map(|bix| BranchTarget::Label(*bix))
+                    .collect();
+                let targets_for_term: Vec<MachLabel> = targets.to_vec();
+                ctx.emit(Inst::JTSequence {
+                    ridx,
+                    rtmp1,
+                    rtmp2,
+                    info: Box::new(JTSequenceInfo {
+                        targets: jt_targets,
+                        targets_for_term: targets_for_term,
+                    }),
+                });
+            }
             _ => panic!("Unknown branch type {}!", op),
         }
     }

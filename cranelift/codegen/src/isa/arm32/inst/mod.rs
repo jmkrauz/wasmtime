@@ -70,6 +70,13 @@ pub enum BitOp {
     Clz,
 }
 
+/// Additional information for JTSequence instructions.
+#[derive(Clone, Debug)]
+pub struct JTSequenceInfo {
+    pub targets: Vec<BranchTarget>,
+    pub targets_for_term: Vec<MachLabel>, // needed for MachTerminator.
+}
+
 /// Instruction formats.
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -235,6 +242,14 @@ pub enum Inst {
         offset: i32,
     },
 
+    /// Jump-table sequence, as one compound instruction.
+    JTSequence {
+        info: Box<JTSequenceInfo>,
+        ridx: Reg,
+        rtmp1: Writable<Reg>,
+        rtmp2: Writable<Reg>,
+    },
+
     /// A return instruction is encoded as `mov pc, lr`, however it is more convenient if it is
     /// kept as separate `Inst` entitiy.
     Ret,
@@ -258,9 +273,21 @@ pub enum Inst {
         kind: CondBrKind,
     },
 
+    /// An indirect branch through a register, augmented with set of all
+    /// possible successors.
+    IndirectBr {
+        rm: Reg,
+        targets: Vec<MachLabel>,
+    },
+
     /// A placeholder instruction, generating no code, meaning that a function epilogue must be
     /// inserted there.
     EpiloguePlaceholder,
+
+    EmitIsland {
+        /// The needed space before the next deadline.
+        needed_space: CodeOffset,
+    },
 }
 
 /// An instruction occuring in it block.
@@ -331,6 +358,7 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         | &Inst::Ret
         | &Inst::Call { .. }
         | &Inst::EpiloguePlaceholder
+        | &Inst::EmitIsland { .. }
         | &Inst::Jump { .. } => {}
         &Inst::AluRRR { rd, rn, rm, .. } => {
             collector.add_def(rd);
@@ -430,6 +458,13 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::LoadExtName { rt, .. } => {
             collector.add_def(rt);
         }
+        &Inst::JTSequence {
+            ridx, rtmp1, rtmp2, ..
+        } => {
+            collector.add_use(ridx);
+            collector.add_def(rtmp1);
+            collector.add_def(rtmp2);
+        }
         &Inst::CondBr { ref kind, .. } => match kind {
             CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
                 collector.add_use(*rt);
@@ -442,6 +477,9 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             }
             CondBrKind::Cond(_) => {}
         },
+        &Inst::IndirectBr { rm, .. } => {
+            collector.add_use(rm);
+        }
     }
 }
 
@@ -496,6 +534,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         | &mut Inst::Call { .. }
         | &mut Inst::Ret
         | &mut Inst::EpiloguePlaceholder
+        | &mut Inst::EmitIsland { .. }
         | &mut Inst::Jump { .. } => {}
         &mut Inst::AluRRR {
             ref mut rd,
@@ -644,11 +683,24 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         &mut Inst::LoadExtName { ref mut rt, .. } => {
             map_def(mapper, rt);
         }
+        &mut Inst::JTSequence {
+            ref mut ridx,
+            ref mut rtmp1,
+            ref mut rtmp2,
+            ..
+        } => {
+            map_use(mapper, ridx);
+            map_def(mapper, rtmp1);
+            map_def(mapper, rtmp2);
+        }
         &mut Inst::CondBr { ref mut kind, .. } => {
             map_br(mapper, kind);
         }
         &mut Inst::OneWayCondBr { ref mut kind, .. } => {
             map_br(mapper, kind);
+        }
+        &mut Inst::IndirectBr { ref mut rm, .. } => {
+            map_use(mapper, rm);
         }
     }
 }
@@ -689,6 +741,10 @@ impl MachInst for Inst {
             &Inst::CondBr {
                 taken, not_taken, ..
             } => MachTerminator::Cond(taken.as_label().unwrap(), not_taken.as_label().unwrap()),
+            &Inst::IndirectBr { ref targets, .. } => MachTerminator::Indirect(&targets[..]),
+            &Inst::JTSequence { ref info, .. } => {
+                MachTerminator::Indirect(&info.targets_for_term[..])
+            }
             _ => MachTerminator::None,
         }
     }
@@ -827,7 +883,12 @@ impl ShowWithRRU for Inst {
                 let shift = reg_shift_str(shift, mb_rru);
                 format!("{} {}, {}, {}{}", op, rd, rn, rm, shift)
             }
-            &Inst::AluRRShift { alu_op, rd, rm, ref shift } => {
+            &Inst::AluRRShift {
+                alu_op,
+                rd,
+                rm,
+                ref shift,
+            } => {
                 let op = match alu_op {
                     ALUOp1::Mvn => "mvn",
                     ALUOp1::Mov => "mov",
@@ -1010,8 +1071,30 @@ impl ShowWithRRU for Inst {
                 let rt = rt.show_rru(mb_rru);
                 format!("ldr {} [pc, #4] ; b 4 ; data {:?} + {}", rt, name, offset)
             }
+            &Inst::JTSequence {
+                ref info,
+                ridx,
+                rtmp1,
+                rtmp2,
+                ..
+            } => {
+                let ridx = ridx.show_rru(mb_rru);
+                let rtmp1 = rtmp1.show_rru(mb_rru);
+                let rtmp2 = rtmp2.show_rru(mb_rru);
+                format!(
+                    concat!(
+                        "add {}, pc+16 ; ",
+                        "ldr {}, [{}, {}, LSL #2] ; ",
+                        "add {}, {}, {} ; ",
+                        "br {} ; ",
+                        "jt_entries {:?}"
+                    ),
+                    rtmp1, rtmp2, rtmp1, ridx, rtmp1, rtmp1, rtmp2, rtmp1, info.targets
+                )
+            }
             &Inst::Ret => "bx lr".to_string(),
             &Inst::EpiloguePlaceholder => "epilogue placeholder".to_string(),
+            &Inst::EmitIsland { needed_space } => format!("emit_island {}", needed_space),
             &Inst::Jump { ref dest } => {
                 let dest = dest.show_rru(mb_rru);
                 format!("b {}", dest)
@@ -1058,6 +1141,10 @@ impl ShowWithRRU for Inst {
                     }
                 }
             }
+            &Inst::IndirectBr { rm, .. } => {
+                let rm = rm.show_rru(mb_rru);
+                format!("bx {}", rm)
+            }
         }
     }
 }
@@ -1076,6 +1163,10 @@ pub enum LabelUse {
 
     /// 24-bit branch offset used by 32-bit uncoditional jump instruction.
     Branch24,
+
+    /// 32-bit PC relative constant offset (from address of constant itself),
+    /// signed. Used in jump tables.
+    PCRel,
 }
 
 impl MachInstLabelUse for LabelUse {
@@ -1088,6 +1179,7 @@ impl MachInstLabelUse for LabelUse {
             LabelUse::Branch6 => (1 << 7) + 2,
             LabelUse::Branch20 => (1 << 20) + 2,
             LabelUse::Branch24 => (1 << 24) + 2,
+            LabelUse::PCRel => 0x7fffffff,
         }
     }
 
@@ -1097,6 +1189,7 @@ impl MachInstLabelUse for LabelUse {
             LabelUse::Branch6 => 0,
             LabelUse::Branch20 => (1 << 20) - 4,
             LabelUse::Branch24 => (1 << 24) - 4,
+            LabelUse::PCRel => 0x7fffffff + 1,
         }
     }
 
@@ -1151,26 +1244,46 @@ impl MachInstLabelUse for LabelUse {
                 buffer[0..2].clone_from_slice(&u16::to_le_bytes(insn_fst));
                 buffer[2..4].clone_from_slice(&u16::to_le_bytes(insn_snd));
             }
+            LabelUse::PCRel => {
+                let off = (off + 4) as u32;
+                let insn_word = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+                let insn_word = insn_word.wrapping_add(off);
+                buffer[0..4].clone_from_slice(&u32::to_le_bytes(insn_word));
+            }
         }
     }
 
     fn supports_veneer(self) -> bool {
-        false
+        match self {
+            LabelUse::Branch6 | LabelUse::Branch20 => true,
+            _ => false,
+        }
     }
 
     /// How large is the veneer, if supported?
     fn veneer_size(self) -> CodeOffset {
-        0
+        4
     }
 
     /// Generate a veneer into the buffer, given that this veneer is at `veneer_offset`, and return
     /// an offset and label-use for the veneer's use of the original label.
     fn generate_veneer(
         self,
-        _buffer: &mut [u8],
-        _veneer_offset: CodeOffset,
+        buffer: &mut [u8],
+        veneer_offset: CodeOffset,
     ) -> (CodeOffset, LabelUse) {
-        unimplemented!()
+        match self {
+            LabelUse::Branch6 | LabelUse::Branch20 => {
+                // veneer is a Branch24 (unconditional branch). Just encode directly here -- don't
+                // bother with constructing an Inst.
+                let insn_fst: u16 = 0b1111 << 12;
+                let insn_snd: u16 = 0b1001 << 12;
+                buffer[0..2].clone_from_slice(&u16::to_le_bytes(insn_fst));
+                buffer[2..4].clone_from_slice(&u16::to_le_bytes(insn_snd));
+                (veneer_offset, LabelUse::Branch24)
+            }
+            _ => panic!("Unsupported label-reference type for veneer generation!"),
+        }
     }
 }
 
