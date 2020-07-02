@@ -4,7 +4,6 @@ use crate::isa::arm32::inst::*;
 
 use regalloc::{RealRegUniverse, Reg};
 
-use core::convert::TryInto;
 use std::string::String;
 
 /// A shift operator for a register or immediate.
@@ -77,7 +76,11 @@ pub enum MemArg {
     RegReg(Reg, Reg, u32),
 
     /// Unsigned 12-bit immediate offset from reg.
-    Offset12(Reg, u32),
+    Offset12(Reg, i32),
+
+    SPOffset(i32),
+
+    NominalSPOffset(i32),
 }
 
 impl MemArg {
@@ -86,7 +89,7 @@ impl MemArg {
         if offset >= (1 << 12) || offset < 0 {
             None
         } else {
-            Some(MemArg::Offset12(reg, offset.try_into().unwrap()))
+            Some(MemArg::Offset12(reg, offset))
         }
     }
 
@@ -275,6 +278,7 @@ impl ShowWithRRU for MemArg {
                 )
             }
             &MemArg::Offset12(rn, off) => format!("[{}, #{}]", rn.show_rru(mb_rru), off),
+            &MemArg::SPOffset(_) | &MemArg::NominalSPOffset(_) => panic!("unexpected mem mode"),
         }
     }
 }

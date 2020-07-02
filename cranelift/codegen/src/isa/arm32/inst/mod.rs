@@ -186,6 +186,12 @@ pub enum Inst {
         sign_extend: bool,
     },
 
+    /// Load address referenced by `mem` into `rd`.
+    LoadAddr {
+        rd: Writable<Reg>,
+        mem: MemArg,
+    },
+
     /// A sign- or zero-extend operation.
     Extend {
         rd: Writable<Reg>,
@@ -280,6 +286,11 @@ pub enum Inst {
         targets: Vec<MachLabel>,
     },
 
+    /// Marker, no-op in generated code: SP "virtual offset" is adjusted.
+    VirtualSPOffsetAdj {
+        offset: i32,
+    },
+
     /// A placeholder instruction, generating no code, meaning that a function epilogue must be
     /// inserted there.
     EpiloguePlaceholder,
@@ -346,6 +357,10 @@ fn memarg_regs(memarg: &MemArg, collector: &mut RegUsageCollector) {
         &MemArg::Offset12(rn, ..) => {
             collector.add_use(rn);
         }
+        &MemArg::SPOffset(_)
+        | &MemArg::NominalSPOffset(..) => {
+            collector.add_use(sp_reg());
+        }
     }
 }
 
@@ -357,6 +372,7 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         | &Inst::Udf { .. }
         | &Inst::Ret
         | &Inst::Call { .. }
+        | &Inst::VirtualSPOffsetAdj { .. }
         | &Inst::EpiloguePlaceholder
         | &Inst::EmitIsland { .. }
         | &Inst::Jump { .. } => {}
@@ -425,6 +441,9 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Load { rt, ref mem, .. } => {
             collector.add_def(rt);
             memarg_regs(mem, collector);
+        }
+        &Inst::LoadAddr { rd, mem: _ } => {
+            collector.add_def(rd);
         }
         &Inst::Extend { rd, rm, .. } => {
             collector.add_def(rd);
@@ -515,6 +534,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_use(m, rm);
             }
             &mut MemArg::Offset12(ref mut rn, ..) => map_use(m, rn),
+            &mut MemArg::SPOffset(_) | &mut MemArg::NominalSPOffset(..) => {},
         };
     }
 
@@ -533,6 +553,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         | &mut Inst::Udf { .. }
         | &mut Inst::Call { .. }
         | &mut Inst::Ret
+        | &mut Inst::VirtualSPOffsetAdj { .. }
         | &mut Inst::EpiloguePlaceholder
         | &mut Inst::EmitIsland { .. }
         | &mut Inst::Jump { .. } => {}
@@ -641,6 +662,13 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             ..
         } => {
             map_def(mapper, rt);
+            map_mem(mapper, mem);
+        }
+         &mut Inst::LoadAddr {
+            ref mut rd,
+            ref mut mem,
+        } => {
+            map_def(mapper, rd);
             map_mem(mapper, mem);
         }
         &mut Inst::Extend {
@@ -816,6 +844,20 @@ impl MachInst for Inst {
 //=============================================================================
 // Pretty-printing of instructions.
 
+fn mem_finalize_for_show(mem: &MemArg, mb_rru: Option<&RealRegUniverse>) -> (String, MemArg) {
+    let (mem_insts, mem) = mem_finalize(mem, &mut Default::default());
+    let mut mem_str = mem_insts
+        .into_iter()
+        .map(|inst| inst.show_rru(mb_rru))
+        .collect::<Vec<_>>()
+        .join(" ; ");
+    if !mem_str.is_empty() {
+        mem_str += " ; ";
+    }
+
+    (mem_str, mem)
+}
+
 impl ShowWithRRU for Inst {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
         fn op_name(alu_op: ALUOp) -> &'static str {
@@ -984,8 +1026,9 @@ impl ShowWithRRU for Inst {
                     _ => panic!("Unsupported Store case: {:?}", self),
                 };
                 let rt = rt.show_rru(mb_rru);
+                let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru);
                 let mem = mem.show_rru(mb_rru);
-                format!("{} {}, {}", op, rt, mem)
+                format!("{}{} {}, {}", mem_str, op, rt, mem)
             }
             &Inst::Load {
                 rt,
@@ -1003,8 +1046,43 @@ impl ShowWithRRU for Inst {
                     _ => panic!("Unsupported Load case: {:?}", self),
                 };
                 let rt = rt.show_rru(mb_rru);
+                let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru);
                 let mem = mem.show_rru(mb_rru);
-                format!("{} {}, {}", op, rt, mem)
+                format!("{}{} {}, {}", mem_str, op, rt, mem)
+            }
+            &Inst::LoadAddr {
+                rd,
+                ref mem,
+            } => {
+                let mut ret = String::new();
+                let (mem_insts, mem) = mem_finalize(mem, &EmitState::default());
+                for inst in mem_insts.into_iter() {
+                    ret.push_str(&inst.show_rru(mb_rru));
+                }
+                let inst = match mem {
+                    MemArg::RegReg(reg1, reg2, shift) => {
+                        let shift_amt = ShiftOpShiftImm::maybe_from_shift(shift).unwrap();
+                        let shift = ShiftOpAndAmt::new(ShiftOp::LSL, shift_amt);
+                        Inst::AluRRRShift {
+                            alu_op: ALUOp::Add,
+                            rd,
+                            rn: reg1,
+                            rm: reg2,
+                            shift: Some(shift),
+                        }
+                    }
+                    MemArg::Offset12(reg, off12) => {
+                        Inst::AluRRImm12 {
+                            alu_op: ALUOp::Add,
+                            rd,
+                            rn: reg,
+                            imm12: off12 as u16,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                ret.push_str(&inst.show_rru(mb_rru));
+                ret
             }
             &Inst::Extend {
                 rd,
@@ -1029,11 +1107,11 @@ impl ShowWithRRU for Inst {
                     .map(|i| if i.then { "t" } else { "e" })
                     .collect();
                 let cond = cond.show_rru(mb_rru);
-                let insts: String = insts
-                    .iter()
-                    .map(|i| format!("; {}", i.inst.show_rru(mb_rru)))
-                    .collect();
-                format!("it{} {}{}", te, cond, insts)
+                let mut ret = format!("it{} {}", te, cond);
+                for inst in insts.into_iter() {
+                    ret.push_str(&inst.inst.show_rru(mb_rru));
+                }
+                ret
             }
             &Inst::Bkpt => "bkpt #0".to_string(),
             &Inst::Udf { .. } => "udf".to_string(),
@@ -1093,6 +1171,7 @@ impl ShowWithRRU for Inst {
                 )
             }
             &Inst::Ret => "bx lr".to_string(),
+            &Inst::VirtualSPOffsetAdj { offset } => format!("virtual_sp_offset_adjust {}", offset),
             &Inst::EpiloguePlaceholder => "epilogue placeholder".to_string(),
             &Inst::EmitIsland { needed_space } => format!("emit_island {}", needed_space),
             &Inst::Jump { ref dest } => {

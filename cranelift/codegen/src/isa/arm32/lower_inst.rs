@@ -375,7 +375,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let ty = ctx.input_ty(insn, 0);
             ctx.emit(Inst::gen_move(rd, rn, ty));
         }
-        Opcode::StackAddr | Opcode::StackLoad => {
+        Opcode::StackAddr => {
             let (stack_slot, offset) = match *ctx.data(insn) {
                 InstructionData::StackLoad {
                     opcode: Opcode::StackAddr,
@@ -387,14 +387,10 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let rd = output_to_reg(ctx, outputs[0]);
             let offset: i32 = offset.into();
             let offset = u32::try_from(offset).unwrap();
-            let inst = if op == Opcode::StackAddr {
-                ctx.abi().stackslot_addr(stack_slot, offset, rd)
-            } else {
-                ctx.abi()
-                    .load_stackslot(stack_slot, offset, ty.unwrap(), rd)
-            };
+            let inst = ctx.abi().stackslot_addr(stack_slot, offset, rd);
             ctx.emit(inst);
         }
+        // Spill instructions are legalized to stack_store.
         Opcode::StackStore => {
             let (stack_slot, offset) = match *ctx.data(insn) {
                 InstructionData::StackStore {
@@ -410,7 +406,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let offset: i32 = offset.into();
             let inst =
                 ctx.abi()
-                    .store_stackslot(stack_slot, u32::try_from(offset).unwrap(), ty, rn);
+                    .store_stackslot(stack_slot, offset as u32, ty, rn);
             ctx.emit(inst);
         }
         Opcode::Debugtrap => {
@@ -462,12 +458,10 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 _ => unreachable!(),
             };
             assert!(inputs.len() == abi.num_args());
-            for (i, input) in inputs.iter().enumerate() {
-                // ugly
-                if i <= 3 {
+            // Copy only register args - other were already pushed onto stack by spill insts.
+            for (i, input) in inputs.iter().enumerate().filter(|(i, _)| *i <= 3) {
                     let arg_reg = input_to_reg(ctx, *input, NarrowValueMode::None);
                     abi.emit_copy_reg_to_arg(ctx, i, arg_reg);
-                }
             }
             abi.emit_call(ctx);
             for (i, output) in outputs.iter().enumerate() {

@@ -5,6 +5,42 @@ use crate::isa::arm32::inst::*;
 
 use core::convert::TryFrom;
 
+/// Memory addressing mode finalization: convert "special" modes (e.g.,
+/// nominal stack offset) into real addressing modes, possibly by
+/// emitting some helper instructions that come immediately before the use
+/// of this amode.
+pub fn mem_finalize(
+    mem: &MemArg,
+    state: &EmitState,
+) -> (SmallVec<[Inst; 4]>, MemArg) {
+    match mem {
+        &MemArg::Offset12(_, off)
+        | &MemArg::SPOffset(off)
+        | &MemArg::NominalSPOffset(off) => {
+            let basereg = match mem {
+                &MemArg::Offset12(reg, _) => reg,
+                &MemArg::SPOffset(_)
+                | &MemArg::NominalSPOffset(_) => sp_reg(),
+                _ => unreachable!(),
+            };
+            let adj = match mem {
+                &MemArg::NominalSPOffset(_) => state.virtual_sp_offset,
+                _ => 0,
+            };
+            let off = off + adj;
+
+            if let Some(mem) = MemArg::reg_maybe_offset(basereg, off) {
+                (smallvec![], mem)
+            } else {
+                let tmp = writable_ip_reg();
+                let const_insts = Inst::load_constant(tmp, off as u32);
+                (const_insts, MemArg::reg_plus_reg(basereg, tmp.to_reg(), 0))
+            }
+        }
+        _ => (smallvec![], mem.clone()),
+    }
+}
+
 //=============================================================================
 // Instructions and subcomponents: emission
 
@@ -188,7 +224,7 @@ fn emit_32(inst: u32, sink: &mut MachBuffer<Inst>) {
 /// State carried between emissions of a sequence of instructions.
 #[derive(Default, Clone, Debug)]
 pub struct EmitState {
-    virtual_sp_offset: i64,
+    virtual_sp_offset: i32,
 }
 
 impl MachInstEmit for Inst {
@@ -375,12 +411,16 @@ impl MachInstEmit for Inst {
                 srcloc,
                 bits,
             } => {
+                let (mem_insts, mem) = mem_finalize(mem, state);
+                for inst in mem_insts.into_iter() {
+                    inst.emit(sink, flags, state);
+                }
                 if let Some(srcloc) = srcloc {
                     // Register the offset at which the store instruction starts.
                     sink.add_trap(srcloc, TrapCode::HeapOutOfBounds);
                 }
                 match mem {
-                    &MemArg::RegReg(rn, rm, imm2) => {
+                    MemArg::RegReg(rn, rm, imm2) => {
                         let bits_24_20 = match bits {
                             32 => 0b00100,
                             16 => 0b00010,
@@ -389,15 +429,16 @@ impl MachInstEmit for Inst {
                         };
                         emit_32(enc_32_mem_r(bits_24_20, rt, rn, rm, imm2), sink);
                     }
-                    &MemArg::Offset12(rn, off12) => {
+                    MemArg::Offset12(rn, off12) => {
                         let bits_24_20 = match bits {
                             32 => 0b01100,
                             16 => 0b01010,
                             8 => 0b01000,
                             _ => panic!("Unsupported Store case {:?}", self),
                         };
-                        emit_32(enc_32_mem_off12(bits_24_20, rt, rn, off12), sink);
+                        emit_32(enc_32_mem_off12(bits_24_20, rt, rn, off12 as u32), sink);
                     }
+                    _ => unreachable!()
                 }
             }
             &Inst::Load {
@@ -407,12 +448,16 @@ impl MachInstEmit for Inst {
                 bits,
                 sign_extend,
             } => {
+                let (mem_insts, mem) = mem_finalize(mem, state);
+                for inst in mem_insts.into_iter() {
+                    inst.emit(sink, flags, state);
+                }
                 if let Some(srcloc) = srcloc {
                     // Register the offset at which the load instruction starts.
                     sink.add_trap(srcloc, TrapCode::HeapOutOfBounds);
                 }
                 match mem {
-                    &MemArg::RegReg(rn, rm, imm2) => {
+                    MemArg::RegReg(rn, rm, imm2) => {
                         let bits_24_20 = match (bits, sign_extend) {
                             (32, _) => 0b00101,
                             (16, true) => 0b10011,
@@ -423,7 +468,7 @@ impl MachInstEmit for Inst {
                         };
                         emit_32(enc_32_mem_r(bits_24_20, rt.to_reg(), rn, rm, imm2), sink);
                     }
-                    &MemArg::Offset12(rn, off12) => {
+                    MemArg::Offset12(rn, off12) => {
                         let bits_24_20 = match (bits, sign_extend) {
                             (32, _) => 0b01101,
                             (16, true) => 0b11011,
@@ -432,9 +477,39 @@ impl MachInstEmit for Inst {
                             (8, false) => 0b01001,
                             _ => panic!("Unsupported Load case: {:?}", self),
                         };
-                        emit_32(enc_32_mem_off12(bits_24_20, rt.to_reg(), rn, off12), sink);
+                        emit_32(enc_32_mem_off12(bits_24_20, rt.to_reg(), rn, off12 as u32), sink);
                     }
+                    _ => unreachable!(),
                 }
+            }
+            &Inst::LoadAddr { rd, ref mem } => {
+                let (mem_insts, mem) = mem_finalize(mem, state);
+                for inst in mem_insts.into_iter() {
+                    inst.emit(sink, flags, state);
+                }
+                let inst = match mem {
+                    MemArg::RegReg(reg1, reg2, shift) => {
+                        let shift_amt = ShiftOpShiftImm::maybe_from_shift(shift).unwrap();
+                        let shift = ShiftOpAndAmt::new(ShiftOp::LSL, shift_amt);
+                        Inst::AluRRRShift {
+                            alu_op: ALUOp::Add,
+                            rd,
+                            rn: reg1,
+                            rm: reg2,
+                            shift: Some(shift),
+                        }
+                    }
+                    MemArg::Offset12(reg, off12) => {
+                        Inst::AluRRImm12 {
+                            alu_op: ALUOp::Add,
+                            rd,
+                            rn: reg,
+                            imm12: off12 as u16,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                inst.emit(sink, flags, state);
             }
             &Inst::Extend {
                 rd,
@@ -702,6 +777,9 @@ impl MachInstEmit for Inst {
             &Inst::IndirectBr { rm, .. } => {
                 let inst = 0b010001111_0000_000 | (machreg_to_gpr(rm) << 3);
                 sink.put2(inst);
+            }
+            &Inst::VirtualSPOffsetAdj { offset } => {
+                state.virtual_sp_offset += offset;
             }
             &Inst::EmitIsland { needed_space } => {
                 if sink.island_needed(needed_space + 4) {

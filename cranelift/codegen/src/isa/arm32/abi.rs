@@ -4,7 +4,7 @@ use crate::abi::{legalize_args, ArgAction, ArgAssigner, ValueConversion};
 use crate::ir;
 use crate::ir::types;
 use crate::ir::types::*;
-use crate::ir::{AbiParam, ArgumentExtension, ArgumentLoc, StackSlot};
+use crate::ir::{AbiParam, ArgumentExtension, ArgumentLoc, StackSlot, StackSlotKind};
 use crate::isa::arm32::inst::*;
 use crate::isa::{self, RegUnit};
 use crate::machinst::*;
@@ -287,11 +287,14 @@ impl Arm32ABIBody {
         // Compute stackslot locations and total stackslot size.
         let mut stack_offset: u32 = 0;
         let mut stackslots = vec![];
-        for (stackslot, data) in f.stack_slots.iter() {
+        for (_stackslot, data) in f.stack_slots.iter() {
             let off = stack_offset;
-            stack_offset += data.size;
-            stack_offset = (stack_offset + 3) & !3;
-            assert_eq!(stackslot.as_u32() as usize, stackslots.len());
+            // We don't need incoming arg slots offsetes.
+            if data.kind != StackSlotKind::IncomingArg {
+                stack_offset += data.size;
+                stack_offset = (stack_offset + 3) & !3;
+            }
+            // Keep incoming arg stackslot in order not to invalidate `StackSlot` offsets.
             stackslots.push(off);
         }
 
@@ -359,11 +362,7 @@ impl ABIBody for Arm32ABIBody {
         match &self.sig.args[idx] {
             &ABIArg::Reg(r, ty) => Inst::gen_move(into_reg, r.to_reg(), ty),
             &ABIArg::Stack(off, ty) => {
-                let mem = if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), off) {
-                    mem
-                } else {
-                    unimplemented!()
-                };
+                let mem = MemArg::NominalSPOffset(off);
                 load_stack(mem, into_reg, ty)
             }
         }
@@ -426,8 +425,9 @@ impl ABIBody for Arm32ABIBody {
                     }
                     _ => {}
                 };
+                let mem = MemArg::NominalSPOffset(off);
                 ret.push(store_stack(
-                    MemArg::reg_maybe_offset(sp_reg(), off).unwrap(),
+                    mem,
                     from_reg.to_reg(),
                     ty,
                 ));
@@ -461,81 +461,78 @@ impl ABIBody for Arm32ABIBody {
     ) -> Inst {
         let stack_off = self.stackslots[slot.as_u32() as usize];
         let sp_off = stack_off + offset;
-        if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), sp_off.try_into().unwrap()) {
-            load_stack(mem, into_reg, ty)
-        } else {
-            unimplemented!()
-        }
+        load_stack(MemArg::NominalSPOffset(sp_off as i32), into_reg, ty)
     }
 
+    // Used only by stack_store created from legalizing spill.
     fn store_stackslot(&self, slot: StackSlot, offset: u32, ty: Type, from_reg: Reg) -> Inst {
         let stack_off = self.stackslots[slot.as_u32() as usize];
         let sp_off = stack_off + offset;
-        if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), sp_off.try_into().unwrap()) {
-            store_stack(mem, from_reg, ty)
-        } else {
-            unimplemented!()
-        }
+        // Spill needs sp offset not nominal sp offset. 
+        store_stack(MemArg::SPOffset(sp_off as i32), from_reg, ty)
     }
 
     fn stackslot_addr(&self, slot: StackSlot, offset: u32, into_reg: Writable<Reg>) -> Inst {
         let stack_off = self.stackslots[slot.as_u32() as usize];
         let sp_off = stack_off + offset;
-        if sp_off & !((1 << 12) - 1) == 0 {
-            Inst::AluRRImm12 {
-                alu_op: ALUOp::Add,
-                rd: into_reg,
-                rn: sp_reg(),
-                imm12: sp_off.try_into().unwrap(),
-            }
-        } else {
-            unimplemented!()
+        Inst::LoadAddr {
+            rd: into_reg,
+            mem: MemArg::NominalSPOffset(sp_off as i32),
         }
     }
 
     // Load from a spillslot.
-    fn load_spillslot(&self, _slot: SpillSlot, _ty: Type, _into_reg: Writable<Reg>) -> Inst {
-        unimplemented!()
+    fn load_spillslot(&self, slot: SpillSlot, ty: Type, into_reg: Writable<Reg>) -> Inst {
+        let islot = slot.get();
+        let spill_off = islot * 4;
+        let sp_off = self.stackslots_size + spill_off;
+        load_stack(MemArg::NominalSPOffset(sp_off as i32), into_reg, ty)
     }
 
     // Store to a spillslot.
-    fn store_spillslot(&self, _slot: SpillSlot, _ty: Type, _from_reg: Reg) -> Inst {
-        unimplemented!()
+    fn store_spillslot(&self, slot: SpillSlot, ty: Type, from_reg: Reg) -> Inst {
+        let islot = slot.get();
+        let spill_off = islot * 4;
+        let sp_off = self.stackslots_size + spill_off;
+        store_stack(MemArg::NominalSPOffset(sp_off as i32), from_reg, ty)
     }
 
     fn gen_prologue(&mut self) -> Vec<Inst> {
         let mut insts = vec![];
         let mut reg_list = SmallVec::<[Reg; 16]>::new();
 
-        let mut callee_saved_used = 0;
+        let mut clobber_size = 0;
 
         let clobbered = get_callee_saves(self.clobbered.to_vec());
         for reg in clobbered {
             let reg = reg.to_reg();
             assert!(reg.get_class() == RegClass::I32);
             reg_list.push(reg.to_reg());
-            callee_saved_used += 4;
+            clobber_size += 4;
         }
 
         if !self.is_leaf {
             // For lr
-            callee_saved_used += 4;
+            clobber_size += 4;
         }
 
-        let total_stacksize = self.stackslots_size + 4 * self.spillslots.unwrap() as u32;
-        let frame_size = if total_stacksize == 0 && callee_saved_used % 8 == 4 {
+        let stacksize = self.stackslots_size + 4 * self.spillslots.unwrap() as u32;
+        let frame_size = if stacksize == 0 && clobber_size % 8 == 4 {
             reg_list.push(ip_reg());
             0
-        } else if (total_stacksize + callee_saved_used) % 8 == 0 {
-            total_stacksize
+        } else if (stacksize + clobber_size) % 8 == 0 {
+            stacksize
         } else {
-            total_stacksize + 4
+            stacksize + 4
         };
 
         if !self.is_leaf {
             reg_list.push(lr_reg());
         }
         if !reg_list.is_empty() {
+            insts.push(Inst::VirtualSPOffsetAdj {
+                offset: 4 * reg_list.len() as i32,
+            });
             insts.push(Inst::Push { reg_list });
         }
 
@@ -593,8 +590,12 @@ impl ABIBody for Arm32ABIBody {
             .expect("frame size not computed before prologue generation")
     }
 
-    fn get_spillslot_size(&self, _rc: RegClass, _ty: Type) -> u32 {
-        unimplemented!()
+    fn get_spillslot_size(&self, rc: RegClass, _ty: Type) -> u32 {
+        // Allocate in terms of 8-byte slots.
+        match rc {
+            RegClass::I32 => 1,
+            _ => panic!("Unexpected register class!"),
+        }
     }
 
     fn gen_spill(&self, to_slot: SpillSlot, from_reg: RealReg, ty: Type) -> Inst {
@@ -689,6 +690,16 @@ fn adjust_stack(amount: u32, is_sub: bool) -> Vec<Inst> {
     if amount == 0 {
         return insts;
     }
+
+    let sp_adjustment = if is_sub {
+        amount as i32
+    } else {
+        -(amount as i32)
+    };
+    insts.push(Inst::VirtualSPOffsetAdj {
+        offset: sp_adjustment,
+    });
+
     let alu_op = if is_sub { ALUOp::Sub } else { ALUOp::Add };
     if amount & !((1 << 12) - 1) == 0 {
         insts.push(Inst::AluRRImm12 {
@@ -749,7 +760,7 @@ impl ABICall for Arm32ABICall {
                 from_reg,
                 ty,
             )),
-            &ABIArg::Stack(_off, _ty) => {}
+            &ABIArg::Stack(off, ty) => ctx.emit(store_stack(MemArg::SPOffset(off), from_reg, ty)),
         }
     }
 
@@ -762,15 +773,8 @@ impl ABICall for Arm32ABICall {
         match &self.sig.rets[idx] {
             &ABIArg::Reg(reg, ty) => ctx.emit(Inst::gen_move(into_reg, reg.to_reg(), ty)),
             &ABIArg::Stack(off, ty) => {
-                if let Some(mem) = MemArg::reg_maybe_offset(sp_reg(), off) {
-                    ctx.emit(load_stack(mem, into_reg, ty));
-                } else {
-                    for inst in Inst::load_constant(writable_ip_reg(), off as u32) {
-                        ctx.emit(inst);
-                    }
-                    let mem = MemArg::reg_plus_reg(sp_reg(), ip_reg(), 0);
-                    ctx.emit(load_stack(mem, into_reg, ty));
-                }
+                let mem = MemArg::SPOffset(off);
+                ctx.emit(load_stack(mem, into_reg, ty));
             }
         }
     }
