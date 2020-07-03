@@ -184,14 +184,29 @@ macro_rules! getters {
             // object since our `transmute` below should be safe!
             Ok(move |$($args: $args),*| -> Result<R, Trap> {
                 unsafe {
-                    let fnptr = mem::transmute::<
-                        *const VMFunctionBody,
-                        unsafe extern "C" fn(
-                            *mut VMContext,
-                            *mut VMContext,
-                            $($args,)*
-                        ) -> R,
-                    >(export.address);
+                    let fnptr = {
+                        cfg_if::cfg_if! {
+                            if #[cfg(target_arch = "arm")] {
+                                mem::transmute::<
+                                    usize,
+                                    unsafe extern "C" fn(
+                                        *mut VMContext,
+                                        *mut VMContext,
+                                        $($args,)*
+                                    ) -> R,
+                                >(export.address as usize | 1)
+                            } else {
+                                 mem::transmute::<
+                                    *const VMFunctionBody,
+                                    unsafe extern "C" fn(
+                                        *mut VMContext,
+                                        *mut VMContext,
+                                        $($args,)*
+                                    ) -> R,
+                                >(export.address)
+                            }
+                        }
+                    };
                     let mut ret = None;
                     $(let $args = $args.into_abi();)*
 
@@ -554,12 +569,26 @@ impl Func {
 
         // Call the trampoline.
         invoke_wasm_and_catch_traps(self.export.vmctx, &self.instance.store, || unsafe {
-            (self.trampoline)(
-                self.export.vmctx,
-                ptr::null_mut(),
-                self.export.address,
-                values_vec.as_mut_ptr(),
-            )
+            cfg_if::cfg_if! {
+                if #[cfg(target_arch = "arm")] {
+                    let trampoline =
+                        mem::transmute::<usize, VMTrampoline>(self.trampoline as usize | 1);
+                    let addr = (self.export.address as usize | 1) as *const VMFunctionBody;
+                    (trampoline)(
+                        self.export.vmctx,
+                        ptr::null_mut(),
+                        addr,
+                        values_vec.as_mut_ptr(),
+                    )
+                } else {
+                    (self.trampoline)(
+                        self.export.vmctx,
+                        ptr::null_mut(),
+                        self.export.address,
+                        values_vec.as_mut_ptr(),
+                    )
+                }
+            }
         })?;
 
         // Load the return values out of `values_vec`.

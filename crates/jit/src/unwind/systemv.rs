@@ -16,20 +16,21 @@ pub struct UnwindRegistry {
     published: bool,
 }
 
-#[cfg(not(target_arch = "arm"))]
-extern "C" {
-    // libunwind import
-    fn __register_frame(fde: *const u8);
-    fn __deregister_frame(fde: *const u8);
-}
-
-#[cfg(target_arch = "arm")]
-unsafe fn __register_frame(_fde: *const u8) {
-    unimplemented!()
-}
-#[cfg(target_arch = "arm")]
-unsafe fn __deregister_frame(_fde: *const u8) {
-    unimplemented!()
+cfg_if::cfg_if! {
+    if #[cfg(target_arch = "arm")] {
+        unsafe fn __register_frame(_fde: *const u8) {
+            unimplemented!()
+        }
+        unsafe fn __deregister_frame(_fde: *const u8) {
+            unimplemented!()
+        }
+    } else {
+        extern "C" {
+            // libunwind import
+            fn __register_frame(fde: *const u8);
+            fn __deregister_frame(fde: *const u8);
+        }
+    }
 }
 
 impl UnwindRegistry {

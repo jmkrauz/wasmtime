@@ -396,20 +396,7 @@ where
     where
         F: FnMut(),
     {
-        //#[cfg(not(target_arch = "arm"))]
         unsafe { (*(payload as *mut F))() }
-
-        /*#[cfg(target_arch = "arm")]
-        {
-            extern "C" {
-                fn call_thumb(payload: *mut u8);
-            }
-
-            unsafe {
-                unimplemented!()
-                //call_thumb(**(payload as *mut *mut *mut u8));
-            }
-        }*/
     }
 }
 

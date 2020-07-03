@@ -92,22 +92,20 @@ fn instantiate(
         let vmctx_ptr = instance.handle.vmctx_ptr();
         unsafe {
             super::func::invoke_wasm_and_catch_traps(vmctx_ptr, store, || {
-                #[cfg(not(target_arch = "arm"))]
-                {
-                    mem::transmute::<
-                        *const VMFunctionBody,
-                        unsafe extern "C" fn(*mut VMContext, *mut VMContext),
-                    >(f.address)(f.vmctx, vmctx_ptr)
-                }
-
-                #[cfg(target_arch = "arm")]
-                {
-                    mem::transmute::<
+                cfg_if::cfg_if! {
+                    if #[cfg(target_arch = "arm")] {
+                        mem::transmute::<
                         *const VMFunctionBody,
                         unsafe extern "C" fn(*mut VMContext, *mut VMContext),
                     >((f.address as usize | 1) as *const VMFunctionBody)(
                         f.vmctx, vmctx_ptr
                     )
+                    } else {
+                        mem::transmute::<
+                        *const VMFunctionBody,
+                        unsafe extern "C" fn(*mut VMContext, *mut VMContext),
+                    >(f.address)(f.vmctx, vmctx_ptr)
+                    }
                 }
             })?;
         }
