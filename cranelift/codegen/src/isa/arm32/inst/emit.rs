@@ -9,18 +9,12 @@ use core::convert::TryFrom;
 /// nominal stack offset) into real addressing modes, possibly by
 /// emitting some helper instructions that come immediately before the use
 /// of this amode.
-pub fn mem_finalize(
-    mem: &MemArg,
-    state: &EmitState,
-) -> (SmallVec<[Inst; 4]>, MemArg) {
+pub fn mem_finalize(mem: &MemArg, state: &EmitState) -> (SmallVec<[Inst; 4]>, MemArg) {
     match mem {
-        &MemArg::Offset12(_, off)
-        | &MemArg::SPOffset(off)
-        | &MemArg::NominalSPOffset(off) => {
+        &MemArg::Offset12(_, off) | &MemArg::SPOffset(off) | &MemArg::NominalSPOffset(off) => {
             let basereg = match mem {
                 &MemArg::Offset12(reg, _) => reg,
-                &MemArg::SPOffset(_)
-                | &MemArg::NominalSPOffset(_) => sp_reg(),
+                &MemArg::SPOffset(_) | &MemArg::NominalSPOffset(_) => sp_reg(),
                 _ => unreachable!(),
             };
             let adj = match mem {
@@ -438,7 +432,7 @@ impl MachInstEmit for Inst {
                         };
                         emit_32(enc_32_mem_off12(bits_24_20, rt, rn, off12 as u32), sink);
                     }
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 }
             }
             &Inst::Load {
@@ -477,7 +471,10 @@ impl MachInstEmit for Inst {
                             (8, false) => 0b01001,
                             _ => panic!("Unsupported Load case: {:?}", self),
                         };
-                        emit_32(enc_32_mem_off12(bits_24_20, rt.to_reg(), rn, off12 as u32), sink);
+                        emit_32(
+                            enc_32_mem_off12(bits_24_20, rt.to_reg(), rn, off12 as u32),
+                            sink,
+                        );
                     }
                     _ => unreachable!(),
                 }
@@ -499,14 +496,12 @@ impl MachInstEmit for Inst {
                             shift: Some(shift),
                         }
                     }
-                    MemArg::Offset12(reg, off12) => {
-                        Inst::AluRRImm12 {
-                            alu_op: ALUOp::Add,
-                            rd,
-                            rn: reg,
-                            imm12: off12 as u16,
-                        }
-                    }
+                    MemArg::Offset12(reg, off12) => Inst::AluRRImm12 {
+                        alu_op: ALUOp::Add,
+                        rd,
+                        rn: reg,
+                        imm12: off12 as u16,
+                    },
                     _ => unreachable!(),
                 };
                 inst.emit(sink, flags, state);

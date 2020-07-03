@@ -119,6 +119,35 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             };
             ctx.emit(Inst::AluRRR { alu_op, rd, rn, rm });
         }
+        Opcode::Rotl => {
+            if ty.unwrap().bits() != 32 {
+                unimplemented!()
+            }
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            let rm = input_to_reg(ctx, inputs[1], NarrowValueMode::None);
+            let tmp = ctx.alloc_tmp(RegClass::I32, I32);
+
+            // ROR rd, rn, 32 - (rm & 31)
+            ctx.emit(Inst::AluRRImm8 {
+                alu_op: ALUOp::And,
+                rd: tmp,
+                rn: rm,
+                imm8: 31,
+            });
+            ctx.emit(Inst::AluRRImm8 {
+                alu_op: ALUOp::Rsb,
+                rd: tmp,
+                rn: tmp.to_reg(),
+                imm8: 32,
+            });
+            ctx.emit(Inst::AluRRR {
+                alu_op: ALUOp::Ror,
+                rd,
+                rn,
+                rm: tmp.to_reg(),
+            });
+        }
         Opcode::Smulhi | Opcode::Umulhi => {
             let ty = ty.unwrap();
             let is_signed = op == Opcode::Smulhi;
@@ -404,9 +433,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let ty = ctx.input_ty(insn, 0);
             let offset: i32 = offset.into();
-            let inst =
-                ctx.abi()
-                    .store_stackslot(stack_slot, offset as u32, ty, rn);
+            let inst = ctx.abi().store_stackslot(stack_slot, offset as u32, ty, rn);
             ctx.emit(inst);
         }
         Opcode::Debugtrap => {
@@ -460,8 +487,8 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             assert!(inputs.len() == abi.num_args());
             // Copy only register args - other were already pushed onto stack by spill insts.
             for (i, input) in inputs.iter().enumerate().filter(|(i, _)| *i <= 3) {
-                    let arg_reg = input_to_reg(ctx, *input, NarrowValueMode::None);
-                    abi.emit_copy_reg_to_arg(ctx, i, arg_reg);
+                let arg_reg = input_to_reg(ctx, *input, NarrowValueMode::None);
+                abi.emit_copy_reg_to_arg(ctx, i, arg_reg);
             }
             abi.emit_call(ctx);
             for (i, output) in outputs.iter().enumerate() {
@@ -469,7 +496,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 abi.emit_copy_retval_to_reg(ctx, i, retval_reg);
             }
         }
-        _ => panic!("Lowering {} unimplemented!", op),
+        _ => panic!("lowering {} unimplemented!", op),
     }
 
     Ok(())

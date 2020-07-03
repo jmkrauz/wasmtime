@@ -34,6 +34,9 @@ pub fn legalize_inst(
         | ir::Opcode::UshrImm
         | ir::Opcode::IcmpImm
         | ir::Opcode::Spill
+        | ir::Opcode::Uload32
+        | ir::Opcode::Sload32
+        | ir::Opcode::Istore32
         | ir::Opcode::Ireduce => return Some(arm32_expand),
         op if op.is_ghost() => return None,
         _ => {}

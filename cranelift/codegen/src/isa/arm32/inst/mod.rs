@@ -357,8 +357,7 @@ fn memarg_regs(memarg: &MemArg, collector: &mut RegUsageCollector) {
         &MemArg::Offset12(rn, ..) => {
             collector.add_use(rn);
         }
-        &MemArg::SPOffset(_)
-        | &MemArg::NominalSPOffset(..) => {
+        &MemArg::SPOffset(_) | &MemArg::NominalSPOffset(..) => {
             collector.add_use(sp_reg());
         }
     }
@@ -534,7 +533,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_use(m, rm);
             }
             &mut MemArg::Offset12(ref mut rn, ..) => map_use(m, rn),
-            &mut MemArg::SPOffset(_) | &mut MemArg::NominalSPOffset(..) => {},
+            &mut MemArg::SPOffset(_) | &mut MemArg::NominalSPOffset(..) => {}
         };
     }
 
@@ -664,7 +663,7 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             map_def(mapper, rt);
             map_mem(mapper, mem);
         }
-         &mut Inst::LoadAddr {
+        &mut Inst::LoadAddr {
             ref mut rd,
             ref mut mem,
         } => {
@@ -1050,10 +1049,7 @@ impl ShowWithRRU for Inst {
                 let mem = mem.show_rru(mb_rru);
                 format!("{}{} {}, {}", mem_str, op, rt, mem)
             }
-            &Inst::LoadAddr {
-                rd,
-                ref mem,
-            } => {
+            &Inst::LoadAddr { rd, ref mem } => {
                 let mut ret = String::new();
                 let (mem_insts, mem) = mem_finalize(mem, &EmitState::default());
                 for inst in mem_insts.into_iter() {
@@ -1071,14 +1067,12 @@ impl ShowWithRRU for Inst {
                             shift: Some(shift),
                         }
                     }
-                    MemArg::Offset12(reg, off12) => {
-                        Inst::AluRRImm12 {
-                            alu_op: ALUOp::Add,
-                            rd,
-                            rn: reg,
-                            imm12: off12 as u16,
-                        }
-                    }
+                    MemArg::Offset12(reg, off12) => Inst::AluRRImm12 {
+                        alu_op: ALUOp::Add,
+                        rd,
+                        rn: reg,
+                        imm12: off12 as u16,
+                    },
                     _ => unreachable!(),
                 };
                 ret.push_str(&inst.show_rru(mb_rru));

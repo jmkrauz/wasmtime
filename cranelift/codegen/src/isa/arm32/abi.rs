@@ -426,11 +426,7 @@ impl ABIBody for Arm32ABIBody {
                     _ => {}
                 };
                 let mem = MemArg::NominalSPOffset(off);
-                ret.push(store_stack(
-                    mem,
-                    from_reg.to_reg(),
-                    ty,
-                ));
+                ret.push(store_stack(mem, from_reg.to_reg(), ty));
             }
         }
         ret
@@ -468,7 +464,7 @@ impl ABIBody for Arm32ABIBody {
     fn store_stackslot(&self, slot: StackSlot, offset: u32, ty: Type, from_reg: Reg) -> Inst {
         let stack_off = self.stackslots[slot.as_u32() as usize];
         let sp_off = stack_off + offset;
-        // Spill needs sp offset not nominal sp offset. 
+        // Spill needs sp offset not nominal sp offset.
         store_stack(MemArg::SPOffset(sp_off as i32), from_reg, ty)
     }
 
