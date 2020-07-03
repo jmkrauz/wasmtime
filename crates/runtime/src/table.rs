@@ -6,6 +6,7 @@ use crate::vmcontext::{VMCallerCheckedAnyfunc, VMTableDefinition};
 use crate::{Trap, VMExternRef};
 use std::cell::RefCell;
 use std::convert::{TryFrom, TryInto};
+use std::ptr;
 use wasmtime_environ::wasm::TableElementType;
 use wasmtime_environ::{ir, TablePlan, TableStyle};
 
@@ -20,40 +21,41 @@ pub struct Table {
 #[derive(Clone, Debug)]
 pub enum TableElement {
     /// A `funcref`.
-    FuncRef(VMCallerCheckedAnyfunc),
+    FuncRef(*mut VMCallerCheckedAnyfunc),
     /// An `exrernref`.
     ExternRef(Option<VMExternRef>),
 }
 
 #[derive(Debug)]
 enum TableElements {
-    FuncRefs(Vec<VMCallerCheckedAnyfunc>),
+    FuncRefs(Vec<*mut VMCallerCheckedAnyfunc>),
     ExternRefs(Vec<Option<VMExternRef>>),
 }
 
 impl Table {
     /// Create a new table instance with specified minimum and maximum number of elements.
     pub fn new(plan: &TablePlan) -> Self {
-        let elements =
-            RefCell::new(match plan.table.ty {
-                TableElementType::Func => TableElements::FuncRefs(vec![
-                    VMCallerCheckedAnyfunc::default();
-                    usize::try_from(plan.table.minimum).unwrap()
-                ]),
-                TableElementType::Val(ty)
-                    if (cfg!(target_pointer_width = "64") && ty == ir::types::R64)
-                        || (cfg!(target_pointer_width = "32") && ty == ir::types::R32) =>
-                {
-                    let min = usize::try_from(plan.table.minimum).unwrap();
-                    TableElements::ExternRefs(vec![None; min])
-                }
-                TableElementType::Val(ty) => unimplemented!("unsupported table type ({})", ty),
-            });
+        let min = usize::try_from(plan.table.minimum).unwrap();
+        let elements = RefCell::new(match plan.table.ty {
+            TableElementType::Func => TableElements::FuncRefs(vec![ptr::null_mut(); min]),
+            TableElementType::Val(ty) => {
+                debug_assert_eq!(ty, crate::ref_type());
+                TableElements::ExternRefs(vec![None; min])
+            }
+        });
         match plan.style {
             TableStyle::CallerChecksSignature => Self {
                 elements,
                 maximum: plan.table.maximum,
             },
+        }
+    }
+
+    /// Returns the type of the elements in this table.
+    pub fn element_type(&self) -> TableElementType {
+        match &*self.elements.borrow() {
+            TableElements::FuncRefs(_) => TableElementType::Func,
+            TableElements::ExternRefs(_) => TableElementType::Val(crate::ref_type()),
         }
     }
 
@@ -67,29 +69,42 @@ impl Table {
 
     /// Grow table by the specified amount of elements.
     ///
-    /// Returns `None` if table can't be grown by the specified amount
-    /// of elements. Returns the previous size of the table if growth is
-    /// successful.
-    pub fn grow(&self, delta: u32) -> Option<u32> {
+    /// Returns the previous size of the table if growth is successful.
+    ///
+    /// Returns `None` if table can't be grown by the specified amount of
+    /// elements, or if the `init_value` is the wrong kind of table element.
+    ///
+    /// # Unsafety
+    ///
+    /// Resizing the table can reallocate its internal elements buffer. This
+    /// table's instance's `VMContext` has raw pointers to the elements buffer
+    /// that are used by Wasm, and they need to be fixed up before we call into
+    /// Wasm again. Failure to do so will result in use-after-free inside Wasm.
+    ///
+    /// Generally, prefer using `InstanceHandle::table_grow`, which encapsulates
+    /// this unsafety.
+    pub unsafe fn grow(&self, delta: u32, init_value: TableElement) -> Option<u32> {
         let size = self.size();
-        let new_len = match size.checked_add(delta) {
-            Some(len) => {
-                if let Some(max) = self.maximum {
-                    if len > max {
-                        return None;
-                    }
-                }
-                len
-            }
-            None => {
+
+        let new_len = size.checked_add(delta)?;
+        if let Some(max) = self.maximum {
+            if new_len > max {
                 return None;
             }
-        };
-        let new_len = usize::try_from(new_len).unwrap();
-        match &mut *self.elements.borrow_mut() {
-            TableElements::FuncRefs(x) => x.resize(new_len, VMCallerCheckedAnyfunc::default()),
-            TableElements::ExternRefs(x) => x.resize(new_len, None),
         }
+        let new_len = usize::try_from(new_len).unwrap();
+
+        match &mut *self.elements.borrow_mut() {
+            TableElements::FuncRefs(x) => {
+                let init_value = init_value.try_into().ok()?;
+                x.resize(new_len, init_value)
+            }
+            TableElements::ExternRefs(x) => {
+                let init_value = init_value.try_into().ok()?;
+                x.resize(new_len, init_value)
+            }
+        }
+
         Some(size)
     }
 
@@ -186,7 +201,7 @@ impl Table {
     }
 }
 
-impl TryFrom<TableElement> for VMCallerCheckedAnyfunc {
+impl TryFrom<TableElement> for *mut VMCallerCheckedAnyfunc {
     type Error = TableElement;
 
     fn try_from(e: TableElement) -> Result<Self, Self::Error> {
@@ -205,5 +220,23 @@ impl TryFrom<TableElement> for Option<VMExternRef> {
             TableElement::ExternRef(x) => Ok(x),
             _ => Err(e),
         }
+    }
+}
+
+impl From<*mut VMCallerCheckedAnyfunc> for TableElement {
+    fn from(f: *mut VMCallerCheckedAnyfunc) -> TableElement {
+        TableElement::FuncRef(f)
+    }
+}
+
+impl From<Option<VMExternRef>> for TableElement {
+    fn from(x: Option<VMExternRef>) -> TableElement {
+        TableElement::ExternRef(x)
+    }
+}
+
+impl From<VMExternRef> for TableElement {
+    fn from(x: VMExternRef) -> TableElement {
+        TableElement::ExternRef(Some(x))
     }
 }

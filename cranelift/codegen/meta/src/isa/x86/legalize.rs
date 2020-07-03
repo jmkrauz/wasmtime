@@ -379,9 +379,12 @@ fn define_simd(
     let bnot = insts.by_name("bnot");
     let bxor = insts.by_name("bxor");
     let extractlane = insts.by_name("extractlane");
+    let fabs = insts.by_name("fabs");
     let fcmp = insts.by_name("fcmp");
     let fcvt_from_uint = insts.by_name("fcvt_from_uint");
-    let fabs = insts.by_name("fabs");
+    let fcvt_to_sint_sat = insts.by_name("fcvt_to_sint_sat");
+    let fmax = insts.by_name("fmax");
+    let fmin = insts.by_name("fmin");
     let fneg = insts.by_name("fneg");
     let iadd_imm = insts.by_name("iadd_imm");
     let icmp = insts.by_name("icmp");
@@ -402,6 +405,7 @@ fn define_simd(
     let uadd_sat = insts.by_name("uadd_sat");
     let umax = insts.by_name("umax");
     let umin = insts.by_name("umin");
+    let snarrow = insts.by_name("snarrow");
     let ushr_imm = insts.by_name("ushr_imm");
     let ushr = insts.by_name("ushr");
     let vconst = insts.by_name("vconst");
@@ -409,7 +413,6 @@ fn define_simd(
     let vany_true = insts.by_name("vany_true");
     let vselect = insts.by_name("vselect");
 
-    let x86_packss = x86_instructions.by_name("x86_packss");
     let x86_pmaxs = x86_instructions.by_name("x86_pmaxs");
     let x86_pmaxu = x86_instructions.by_name("x86_pmaxu");
     let x86_pmins = x86_instructions.by_name("x86_pmins");
@@ -572,7 +575,7 @@ fn define_simd(
                 def!(g = raw_bitcast_i16x8_again(f)),
                 def!(h = x86_psra(g, b)),
                 // Re-pack the vector.
-                def!(z = x86_packss(e, h)),
+                def!(z = snarrow(e, h)),
             ],
         );
     }
@@ -788,6 +791,9 @@ fn define_simd(
     narrow.custom_legalize(ineg, "convert_ineg");
     narrow.custom_legalize(ushr, "convert_ushr");
     narrow.custom_legalize(ishl, "convert_ishl");
+    narrow.custom_legalize(fcvt_to_sint_sat, "expand_fcvt_to_sint_sat_vector");
+    narrow.custom_legalize(fmin, "expand_minmax_vector");
+    narrow.custom_legalize(fmax, "expand_minmax_vector");
 
     narrow_avx.custom_legalize(imul, "convert_i64x2_imul");
     narrow_avx.custom_legalize(fcvt_from_uint, "expand_fcvt_from_uint_vector");

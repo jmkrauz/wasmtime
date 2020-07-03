@@ -7,6 +7,8 @@ use crate::{
     ValType,
 };
 use anyhow::{anyhow, bail, Result};
+use std::mem;
+use std::ptr;
 use std::slice;
 use wasmtime_environ::wasm;
 use wasmtime_runtime::{self as runtime, InstanceHandle};
@@ -205,7 +207,7 @@ impl Global {
 
     /// Returns the value type of this `global`.
     pub fn val_type(&self) -> ValType {
-        ValType::from_wasmtime_type(self.wasmtime_export.global.ty)
+        ValType::from_wasm_type(&self.wasmtime_export.global.wasm_ty)
             .expect("core wasm type should be supported")
     }
 
@@ -227,6 +229,15 @@ impl Global {
                 ValType::I64 => Val::from(*definition.as_i64()),
                 ValType::F32 => Val::F32(*definition.as_u32()),
                 ValType::F64 => Val::F64(*definition.as_u64()),
+                ValType::ExternRef => Val::ExternRef(
+                    definition
+                        .as_externref()
+                        .clone()
+                        .map(|inner| ExternRef { inner }),
+                ),
+                ValType::FuncRef => {
+                    from_checked_anyfunc(definition.as_anyfunc() as *mut _, &self.instance.store)
+                }
                 ty => unimplemented!("Global::get for {:?}", ty),
             }
         }
@@ -256,6 +267,19 @@ impl Global {
                 Val::I64(i) => *definition.as_i64_mut() = i,
                 Val::F32(f) => *definition.as_u32_mut() = f,
                 Val::F64(f) => *definition.as_u64_mut() = f,
+                Val::FuncRef(f) => {
+                    *definition.as_anyfunc_mut() = f.map_or(ptr::null(), |f| {
+                        f.caller_checked_anyfunc().as_ptr() as *const _
+                    });
+                }
+                Val::ExternRef(x) => {
+                    // In case the old value's `Drop` implementation is
+                    // re-entrant and tries to touch this global again, do a
+                    // replace, and then drop. This way no one can observe a
+                    // halfway-deinitialized value.
+                    let old = mem::replace(definition.as_externref_mut(), x.map(|x| x.inner));
+                    drop(old);
+                }
                 _ => unimplemented!("Global::set for {:?}", val.ty()),
             }
         }
@@ -298,14 +322,10 @@ fn set_table_item(
     instance: &InstanceHandle,
     table_index: wasm::DefinedTableIndex,
     item_index: u32,
-    item: wasmtime_runtime::VMCallerCheckedAnyfunc,
+    item: *mut wasmtime_runtime::VMCallerCheckedAnyfunc,
 ) -> Result<()> {
     instance
-        .table_set(
-            table_index,
-            item_index,
-            runtime::TableElement::FuncRef(item),
-        )
+        .table_set(table_index, item_index, item.into())
         .map_err(|()| anyhow!("table element index out of bounds"))
 }
 
@@ -329,7 +349,7 @@ impl Table {
         let definition = unsafe { &*wasmtime_export.definition };
         let index = instance.table_index(definition);
         for i in 0..definition.current_elements {
-            set_table_item(&instance, index, i, item.clone())?;
+            set_table_item(&instance, index, i, item)?;
         }
 
         Ok(Table {
@@ -356,13 +376,12 @@ impl Table {
         let item = self.instance.table_get(table_index, index)?;
         match item {
             runtime::TableElement::FuncRef(f) => {
-                Some(from_checked_anyfunc(f, &self.instance.store))
+                Some(unsafe { from_checked_anyfunc(f, &self.instance.store) })
             }
             runtime::TableElement::ExternRef(None) => Some(Val::ExternRef(None)),
-            runtime::TableElement::ExternRef(Some(x)) => Some(Val::ExternRef(Some(ExternRef {
-                inner: x,
-                store: self.instance.store.weak(),
-            }))),
+            runtime::TableElement::ExternRef(Some(x)) => {
+                Some(Val::ExternRef(Some(ExternRef { inner: x })))
+            }
         }
     }
 
@@ -395,12 +414,27 @@ impl Table {
     /// error if `init` is not of the right type.
     pub fn grow(&self, delta: u32, init: Val) -> Result<u32> {
         let index = self.wasmtime_table_index();
-        let item = into_checked_anyfunc(init, &self.instance.store)?;
-        if let Some(len) = self.instance.table_grow(index, delta) {
-            for i in 0..delta {
-                set_table_item(&self.instance, index, len + i, item.clone())?;
+        let orig_size = match self.ty().element() {
+            ValType::FuncRef => {
+                let init = into_checked_anyfunc(init, &self.instance.store)?;
+                self.instance.defined_table_grow(index, delta, init.into())
             }
-            Ok(len)
+            ValType::ExternRef => {
+                let init = match init {
+                    Val::ExternRef(Some(x)) => Some(x.inner),
+                    Val::ExternRef(None) => None,
+                    _ => bail!("incorrect init value for growing table"),
+                };
+                self.instance.defined_table_grow(
+                    index,
+                    delta,
+                    runtime::TableElement::ExternRef(init),
+                )
+            }
+            _ => unreachable!("only `funcref` and `externref` tables are supported"),
+        };
+        if let Some(size) = orig_size {
+            Ok(size)
         } else {
             bail!("failed to grow table by `{}`", delta)
         }

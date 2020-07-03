@@ -10,7 +10,7 @@ use wast::{
 };
 
 /// Translate from a `script::Value` to a `RuntimeValue`.
-fn runtime_value(store: &Store, v: &wast::Expression<'_>) -> Result<Val> {
+fn runtime_value(v: &wast::Expression<'_>) -> Result<Val> {
     use wast::Instruction::*;
 
     if v.instrs.len() != 1 {
@@ -23,7 +23,8 @@ fn runtime_value(store: &Store, v: &wast::Expression<'_>) -> Result<Val> {
         F64Const(x) => Val::F64(x.bits),
         V128Const(x) => Val::V128(u128::from_le_bytes(x.to_le_bytes())),
         RefNull(RefType::Extern) => Val::ExternRef(None),
-        RefExtern(x) => Val::ExternRef(Some(ExternRef::new(store, *x))),
+        RefNull(RefType::Func) => Val::FuncRef(None),
+        RefExtern(x) => Val::ExternRef(Some(ExternRef::new(*x))),
         other => bail!("couldn't convert {:?} to a runtime value", other),
     })
 }
@@ -119,7 +120,7 @@ impl WastContext {
         let values = exec
             .args
             .iter()
-            .map(|v| runtime_value(&self.store, v))
+            .map(|v| runtime_value(v))
             .collect::<Result<Vec<_>>>()?;
         self.invoke(exec.module.map(|i| i.name()), exec.name, &values)
     }
@@ -420,6 +421,7 @@ fn val_matches(actual: &Val, expected: &wast::AssertExpression) -> Result<bool> 
                 false
             }
         }
+        (Val::FuncRef(x), wast::AssertExpression::RefNull(wast::RefType::Func)) => x.is_none(),
         _ => bail!(
             "don't know how to compare {:?} and {:?} yet",
             actual,

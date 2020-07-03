@@ -225,6 +225,12 @@ pub enum VecALUOp {
     Cmhs,
     /// Compare unsigned higher or same
     Cmhi,
+    /// Floating-point compare equal
+    Fcmeq,
+    /// Floating-point compare greater than
+    Fcmgt,
+    /// Floating-point compare greater than or equal
+    Fcmge,
     /// Bitwise and
     And,
     /// Bitwise bit clear
@@ -235,13 +241,30 @@ pub enum VecALUOp {
     Eor,
     /// Bitwise select
     Bsl,
+    /// Unsigned maximum pairwise
+    Umaxp,
+    /// Add
+    Add,
+    /// Subtract
+    Sub,
+    /// Multiply
+    Mul,
 }
 
 /// A Vector miscellaneous operation with two registers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum VecMisc2 {
-    /// Bitwise NOT.
+    /// Bitwise NOT
     Not,
+    /// Negate
+    Neg,
+}
+
+/// An operation across the lanes of vectors.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum VecLanesOp {
+    /// Unsigned minimum across a vector
+    Uminv,
 }
 
 /// An operation on the bits of a register. This can be paired with several instruction formats
@@ -319,6 +342,7 @@ pub struct CallIndInfo {
 #[derive(Clone, Debug)]
 pub struct JTSequenceInfo {
     pub targets: Vec<BranchTarget>,
+    pub default_target: BranchTarget,
     pub targets_for_term: Vec<MachLabel>, // needed for MachTerminator.
 }
 
@@ -743,6 +767,14 @@ pub enum Inst {
         ty: Type,
     },
 
+    /// Vector instruction across lanes.
+    VecLanes {
+        op: VecLanesOp,
+        rd: Writable<Reg>,
+        rn: Reg,
+        ty: Type,
+    },
+
     /// Move to the NZCV flags (actually a `MSR NZCV, Xn` insn).
     MovToNZCV {
         rn: Reg,
@@ -794,20 +826,17 @@ pub enum Inst {
         kind: CondBrKind,
     },
 
-    /// A one-way conditional branch, invisible to the CFG processing; used *only* as part of
-    /// straight-line sequences in code to be emitted.
+    /// A conditional trap: execute a `udf` if the condition is true. This is
+    /// one VCode instruction because it uses embedded control flow; it is
+    /// logically a single-in, single-out region, but needs to appear as one
+    /// unit to the register allocator.
     ///
-    /// In more detail:
-    /// - This branch is lowered to a branch at the machine-code level, but does not end a basic
-    ///   block, and does not create edges in the CFG seen by regalloc.
-    /// - Thus, it is *only* valid to use as part of a single-in, single-out sequence that is
-    ///   lowered from a single CLIF instruction. For example, certain arithmetic operations may
-    ///   use these branches to handle certain conditions, such as overflows, traps, etc.
-    ///
-    /// See, e.g., the lowering of `trapif` (conditional trap) for an example.
-    OneWayCondBr {
-        target: BranchTarget,
+    /// The `CondBrKind` gives the conditional-branch condition that will
+    /// *execute* the embedded `Inst`. (In the emitted code, we use the inverse
+    /// of this condition in a branch that skips the trap instruction.)
+    TrapIf {
         kind: CondBrKind,
+        trap_info: (SourceLoc, TrapCode),
     },
 
     /// An indirect branch through a register, augmented with set of all
@@ -876,7 +905,7 @@ pub enum Inst {
     },
 
     /// Marker, no-op in generated code: SP "virtual offset" is adjusted. This
-    /// controls MemArg::NominalSPOffset args are lowered.
+    /// controls how MemArg::NominalSPOffset args are lowered.
     VirtualSPOffsetAdj {
         offset: i64,
     },
@@ -1214,6 +1243,11 @@ fn aarch64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             collector.add_def(rd);
             collector.add_use(rn);
         }
+
+        &Inst::VecLanes { rd, rn, .. } => {
+            collector.add_def(rd);
+            collector.add_use(rn);
+        }
         &Inst::FpuCmp32 { rn, rm } | &Inst::FpuCmp64 { rn, rm } => {
             collector.add_use(rn);
             collector.add_use(rm);
@@ -1318,7 +1352,7 @@ fn aarch64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             collector.add_defs(&*info.defs);
             collector.add_use(info.rn);
         }
-        &Inst::CondBr { ref kind, .. } | &Inst::OneWayCondBr { ref kind, .. } => match kind {
+        &Inst::CondBr { ref kind, .. } => match kind {
             CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
                 collector.add_use(*rt);
             }
@@ -1330,6 +1364,12 @@ fn aarch64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         &Inst::Nop0 | Inst::Nop4 => {}
         &Inst::Brk => {}
         &Inst::Udf { .. } => {}
+        &Inst::TrapIf { ref kind, .. } => match kind {
+            CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
+                collector.add_use(*rt);
+            }
+            CondBrKind::Cond(_) => {}
+        },
         &Inst::Adr { rd, .. } => {
             collector.add_def(rd);
         }
@@ -1708,6 +1748,14 @@ fn aarch64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             map_def(mapper, rd);
             map_use(mapper, rn);
         }
+        &mut Inst::VecLanes {
+            ref mut rd,
+            ref mut rn,
+            ..
+        } => {
+            map_def(mapper, rd);
+            map_use(mapper, rn);
+        }
         &mut Inst::FpuCmp32 {
             ref mut rn,
             ref mut rm,
@@ -1913,13 +1961,16 @@ fn aarch64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             }
             map_use(mapper, &mut info.rn);
         }
-        &mut Inst::CondBr { ref mut kind, .. } | &mut Inst::OneWayCondBr { ref mut kind, .. } => {
+        &mut Inst::CondBr { ref mut kind, .. } => {
             map_br(mapper, kind);
         }
         &mut Inst::IndirectBr { ref mut rn, .. } => {
             map_use(mapper, rn);
         }
         &mut Inst::Nop0 | &mut Inst::Nop4 | &mut Inst::Brk | &mut Inst::Udf { .. } => {}
+        &mut Inst::TrapIf { ref mut kind, .. } => {
+            map_br(mapper, kind);
+        }
         &mut Inst::Adr { ref mut rd, .. } => {
             map_def(mapper, rd);
         }
@@ -1990,10 +2041,6 @@ impl MachInst for Inst {
             &Inst::CondBr {
                 taken, not_taken, ..
             } => MachTerminator::Cond(taken.as_label().unwrap(), not_taken.as_label().unwrap()),
-            &Inst::OneWayCondBr { .. } => {
-                // Explicitly invisible to CFG processing.
-                MachTerminator::None
-            }
             &Inst::IndirectBr { ref targets, .. } => MachTerminator::Indirect(&targets[..]),
             &Inst::JTSequence { ref info, .. } => {
                 MachTerminator::Indirect(&info.targets_for_term[..])
@@ -2055,7 +2102,9 @@ impl MachInst for Inst {
             I8 | I16 | I32 | I64 | B1 | B8 | B16 | B32 | B64 => Ok(RegClass::I64),
             F32 | F64 => Ok(RegClass::V128),
             IFLAGS | FFLAGS => Ok(RegClass::I64),
-            B8X16 | I8X16 | B16X8 | I16X8 | B32X4 | I32X4 | B64X2 | I64X2 => Ok(RegClass::V128),
+            B8X16 | I8X16 | B16X8 | I16X8 | B32X4 | I32X4 | B64X2 | I64X2 | F32X4 | F64X2 => {
+                Ok(RegClass::V128)
+            }
             _ => Err(CodegenError::Unsupported(format!(
                 "Unexpected SSA-value type: {}",
                 ty
@@ -2482,7 +2531,7 @@ impl ShowWithRRU for Inst {
                 let show_vreg_fn: fn(Reg, Option<&RealRegUniverse>) -> String = if vector {
                     |reg, mb_rru| show_vreg_vector(reg, mb_rru, F32X2)
                 } else {
-                    show_vreg_scalar
+                    |reg, mb_rru| show_vreg_scalar(reg, mb_rru, F64)
                 };
                 let rd = show_vreg_fn(rd.to_reg(), mb_rru);
                 let rn = show_vreg_fn(rn, mb_rru);
@@ -2690,17 +2739,24 @@ impl ShowWithRRU for Inst {
                     VecALUOp::Cmgt => ("cmgt", true, ty),
                     VecALUOp::Cmhs => ("cmhs", true, ty),
                     VecALUOp::Cmhi => ("cmhi", true, ty),
+                    VecALUOp::Fcmeq => ("fcmeq", true, ty),
+                    VecALUOp::Fcmgt => ("fcmgt", true, ty),
+                    VecALUOp::Fcmge => ("fcmge", true, ty),
                     VecALUOp::And => ("and", true, I8X16),
                     VecALUOp::Bic => ("bic", true, I8X16),
                     VecALUOp::Orr => ("orr", true, I8X16),
                     VecALUOp::Eor => ("eor", true, I8X16),
                     VecALUOp::Bsl => ("bsl", true, I8X16),
+                    VecALUOp::Umaxp => ("umaxp", true, ty),
+                    VecALUOp::Add => ("add", true, ty),
+                    VecALUOp::Sub => ("sub", true, ty),
+                    VecALUOp::Mul => ("mul", true, ty),
                 };
 
                 let show_vreg_fn: fn(Reg, Option<&RealRegUniverse>, Type) -> String = if vector {
                     |reg, mb_rru, ty| show_vreg_vector(reg, mb_rru, ty)
                 } else {
-                    |reg, mb_rru, _ty| show_vreg_scalar(reg, mb_rru)
+                    |reg, mb_rru, _ty| show_vreg_scalar(reg, mb_rru, I64)
                 };
 
                 let rd = show_vreg_fn(rd.to_reg(), mb_rru, ty);
@@ -2708,17 +2764,22 @@ impl ShowWithRRU for Inst {
                 let rm = show_vreg_fn(rm, mb_rru, ty);
                 format!("{} {}, {}, {}", op, rd, rn, rm)
             }
-            &Inst::VecMisc {
-                op,
-                rd,
-                rn,
-                ty: _ty,
-            } => {
+            &Inst::VecMisc { op, rd, rn, ty } => {
                 let (op, ty) = match op {
                     VecMisc2::Not => ("mvn", I8X16),
+                    VecMisc2::Neg => ("neg", ty),
                 };
 
                 let rd = show_vreg_vector(rd.to_reg(), mb_rru, ty);
+                let rn = show_vreg_vector(rn, mb_rru, ty);
+                format!("{} {}, {}", op, rd, rn)
+            }
+            &Inst::VecLanes { op, rd, rn, ty } => {
+                let op = match op {
+                    VecLanesOp::Uminv => "uminv",
+                };
+
+                let rd = show_vreg_scalar(rd.to_reg(), mb_rru, ty);
                 let rn = show_vreg_vector(rn, mb_rru, ty);
                 format!("{} {}, {}", op, rd, rn)
             }
@@ -2829,32 +2890,26 @@ impl ShowWithRRU for Inst {
                     }
                 }
             }
-            &Inst::OneWayCondBr {
-                ref target,
-                ref kind,
-            } => {
-                let target = target.show_rru(mb_rru);
-                match kind {
-                    &CondBrKind::Zero(reg) => {
-                        let reg = reg.show_rru(mb_rru);
-                        format!("cbz {}, {}", reg, target)
-                    }
-                    &CondBrKind::NotZero(reg) => {
-                        let reg = reg.show_rru(mb_rru);
-                        format!("cbnz {}, {}", reg, target)
-                    }
-                    &CondBrKind::Cond(c) => {
-                        let c = c.show_rru(mb_rru);
-                        format!("b.{} {}", c, target)
-                    }
-                }
-            }
             &Inst::IndirectBr { rn, .. } => {
                 let rn = rn.show_rru(mb_rru);
                 format!("br {}", rn)
             }
             &Inst::Brk => "brk #0".to_string(),
             &Inst::Udf { .. } => "udf".to_string(),
+            &Inst::TrapIf { ref kind, .. } => match kind {
+                &CondBrKind::Zero(reg) => {
+                    let reg = reg.show_rru(mb_rru);
+                    format!("cbnz {}, 8 ; udf", reg)
+                }
+                &CondBrKind::NotZero(reg) => {
+                    let reg = reg.show_rru(mb_rru);
+                    format!("cbz {}, 8 ; udf", reg)
+                }
+                &CondBrKind::Cond(c) => {
+                    let c = c.invert().show_rru(mb_rru);
+                    format!("b.{} 8 ; udf", c)
+                }
+            },
             &Inst::Adr { rd, off } => {
                 let rd = rd.show_rru(mb_rru);
                 format!("adr {}, pc+{}", rd, off)
@@ -2871,15 +2926,26 @@ impl ShowWithRRU for Inst {
                 let ridx = ridx.show_rru(mb_rru);
                 let rtmp1 = rtmp1.show_rru(mb_rru);
                 let rtmp2 = rtmp2.show_rru(mb_rru);
+                let default_target = info.default_target.show_rru(mb_rru);
                 format!(
                     concat!(
+                        "b.hs {} ; ",
                         "adr {}, pc+16 ; ",
                         "ldrsw {}, [{}, {}, LSL 2] ; ",
                         "add {}, {}, {} ; ",
                         "br {} ; ",
                         "jt_entries {:?}"
                     ),
-                    rtmp1, rtmp2, rtmp1, ridx, rtmp1, rtmp1, rtmp2, rtmp1, info.targets
+                    default_target,
+                    rtmp1,
+                    rtmp2,
+                    rtmp1,
+                    ridx,
+                    rtmp1,
+                    rtmp1,
+                    rtmp2,
+                    rtmp1,
+                    info.targets
                 )
             }
             &Inst::LoadConst64 { rd, const_data } => {

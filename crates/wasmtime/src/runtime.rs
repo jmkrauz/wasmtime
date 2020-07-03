@@ -1,12 +1,9 @@
 use crate::externals::MemoryCreator;
-use crate::r#ref::ExternRef;
 use crate::trampoline::{MemoryCreatorProxy, StoreInstanceHandle};
 use crate::Module;
 use anyhow::{bail, Result};
-use std::any::Any;
 use std::cell::RefCell;
 use std::cmp;
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -14,8 +11,8 @@ use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use wasmparser::{OperatorValidatorConfig, ValidatingParserConfig};
-use wasmtime_environ::settings::{self, Configurable};
-use wasmtime_environ::{ir, isa::TargetIsa, wasm, CacheConfig, Tunables};
+use wasmtime_environ::settings::{self, Configurable, SetError};
+use wasmtime_environ::{ir, isa, isa::TargetIsa, wasm, CacheConfig, Tunables};
 use wasmtime_jit::{native, CompilationStrategy, Compiler};
 use wasmtime_profiling::{JitDumpAgent, NullProfilerAgent, ProfilingAgent, VTuneAgent};
 use wasmtime_runtime::{
@@ -36,6 +33,7 @@ use wasmtime_runtime::{
 #[derive(Clone)]
 pub struct Config {
     pub(crate) flags: settings::Builder,
+    pub(crate) isa_flags: isa::Builder,
     pub(crate) validating_config: ValidatingParserConfig,
     pub(crate) tunables: Tunables,
     pub(crate) strategy: CompilationStrategy,
@@ -91,9 +89,11 @@ impl Config {
                     enable_simd: false,
                     enable_multi_value: true,
                     enable_tail_call: false,
+                    enable_module_linking: false,
                 },
             },
             flags,
+            isa_flags: native::builder(),
             strategy: CompilationStrategy::Auto,
             cache_config: CacheConfig::new_cache_disabled(),
             profiler: Arc::new(NullProfilerAgent),
@@ -377,7 +377,15 @@ impl Config {
     /// This method can fail if the flag's name does not exist, or the value is not appropriate for
     /// the flag type.
     pub unsafe fn cranelift_other_flag(&mut self, name: &str, value: &str) -> Result<&mut Self> {
-        self.flags.set(name, value)?;
+        if let Err(err) = self.flags.set(name, value) {
+            match err {
+                SetError::BadName(_) => {
+                    // Try the target-specific flags.
+                    self.isa_flags.set(name, value)?;
+                }
+                _ => bail!(err),
+            }
+        }
         Ok(self)
     }
 
@@ -600,7 +608,9 @@ impl Config {
     }
 
     pub(crate) fn target_isa(&self) -> Box<dyn TargetIsa> {
-        native::builder().finish(settings::Flags::new(self.flags.clone()))
+        self.isa_flags
+            .clone()
+            .finish(settings::Flags::new(self.flags.clone()))
     }
 
     fn build_compiler(&self) -> Compiler {
@@ -774,11 +784,25 @@ impl Default for Engine {
 
 // Store
 
-/// A `Store` is a shared cache of information between WebAssembly modules.
+/// A `Store` is a collection of WebAssembly instances and host-defined items.
 ///
-/// Each `Module` is compiled into a `Store` and a `Store` is associated with an
-/// [`Engine`]. You'll use a `Store` to attach to a number of global items in
-/// the production of various items for wasm modules.
+/// All WebAssembly instances and items will be attached to and refer to a
+/// `Store`. For example instances, functions, globals, and tables are all
+/// attached to a `Store`. Instances are created by instantiating a [`Module`]
+/// within a `Store`.
+///
+/// `Store` is not thread-safe and cannot be sent to other threads. All items
+/// which refer to a `Store` additionally are not threadsafe and can only be
+/// used on the original thread that they were created on.
+///
+/// A `Store` is not intended to be a long-lived object in a program. No form of
+/// GC is implemented at this time so once an instance is created within a
+/// `Store` it will not be deallocated until all references to the `Store` have
+/// gone away (this includes all references to items in the store). This makes
+/// `Store` unsuitable for creating an unbounded number of instances in it
+/// because `Store` will never release this memory. It's instead recommended to
+/// have a long-lived [`Engine`] and instead create a `Store` for a more scoped
+/// portion of your application.
 ///
 /// # Stores and `Clone`
 ///
@@ -803,9 +827,8 @@ pub(crate) struct StoreInner {
     instances: RefCell<Vec<InstanceHandle>>,
     signal_handler: RefCell<Option<Box<SignalHandler<'static>>>>,
     jit_code_ranges: RefCell<Vec<(usize, usize)>>,
-    host_info: RefCell<HashMap<HostInfoKey, Rc<RefCell<dyn Any>>>>,
-    externref_activations_table: Rc<VMExternRefActivationsTable>,
-    stack_map_registry: Rc<StackMapRegistry>,
+    externref_activations_table: VMExternRefActivationsTable,
+    stack_map_registry: StackMapRegistry,
 }
 
 struct HostInfoKey(VMExternRef);
@@ -845,9 +868,8 @@ impl Store {
                 instances: RefCell::new(Vec::new()),
                 signal_handler: RefCell::new(None),
                 jit_code_ranges: RefCell::new(Vec::new()),
-                host_info: RefCell::new(HashMap::new()),
-                externref_activations_table: Rc::new(VMExternRefActivationsTable::new()),
-                stack_map_registry: Rc::new(StackMapRegistry::default()),
+                externref_activations_table: VMExternRefActivationsTable::new(),
+                stack_map_registry: StackMapRegistry::default(),
             }),
         }
     }
@@ -875,6 +897,17 @@ impl Store {
             .signatures
             .borrow()
             .lookup_wasm(sig_index)
+            .expect("failed to lookup signature")
+    }
+
+    pub(crate) fn lookup_wasm_and_native_signatures(
+        &self,
+        sig_index: VMSharedSignatureIndex,
+    ) -> (wasm::WasmFuncType, ir::Signature) {
+        self.inner
+            .signatures
+            .borrow()
+            .lookup_wasm_and_native_signatures(sig_index)
             .expect("failed to lookup signature")
     }
 
@@ -966,32 +999,6 @@ impl Store {
     pub(crate) fn upgrade(weak: &Weak<StoreInner>) -> Option<Self> {
         let inner = weak.upgrade()?;
         Some(Self { inner })
-    }
-
-    pub(crate) fn host_info(&self, externref: &ExternRef) -> Option<Rc<RefCell<dyn Any>>> {
-        debug_assert!(
-            std::rc::Weak::ptr_eq(&self.weak(), &externref.store),
-            "externref must be from this store"
-        );
-        let infos = self.inner.host_info.borrow();
-        infos.get(&HostInfoKey(externref.inner.clone())).cloned()
-    }
-
-    pub(crate) fn set_host_info(
-        &self,
-        externref: &ExternRef,
-        info: Option<Rc<RefCell<dyn Any>>>,
-    ) -> Option<Rc<RefCell<dyn Any>>> {
-        debug_assert!(
-            std::rc::Weak::ptr_eq(&self.weak(), &externref.store),
-            "externref must be from this store"
-        );
-        let mut infos = self.inner.host_info.borrow_mut();
-        if let Some(info) = info {
-            infos.insert(HostInfoKey(externref.inner.clone()), info)
-        } else {
-            infos.remove(&HostInfoKey(externref.inner.clone()))
-        }
     }
 
     pub(crate) fn signal_handler(&self) -> std::cell::Ref<'_, Option<Box<SignalHandler<'static>>>> {
@@ -1109,11 +1116,11 @@ impl Store {
         }
     }
 
-    pub(crate) fn externref_activations_table(&self) -> &Rc<VMExternRefActivationsTable> {
+    pub(crate) fn externref_activations_table(&self) -> &VMExternRefActivationsTable {
         &self.inner.externref_activations_table
     }
 
-    pub(crate) fn stack_map_registry(&self) -> &Rc<StackMapRegistry> {
+    pub(crate) fn stack_map_registry(&self) -> &StackMapRegistry {
         &self.inner.stack_map_registry
     }
 
@@ -1124,8 +1131,8 @@ impl Store {
         // used with this store in `self.inner.stack_map_registry`.
         unsafe {
             wasmtime_runtime::gc(
-                &*self.inner.stack_map_registry,
-                &*self.inner.externref_activations_table,
+                &self.inner.stack_map_registry,
+                &self.inner.externref_activations_table,
             );
         }
     }

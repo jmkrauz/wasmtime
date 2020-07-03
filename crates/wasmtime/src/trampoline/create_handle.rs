@@ -7,10 +7,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime_environ::entity::PrimaryMap;
-use wasmtime_environ::wasm::DefinedFuncIndex;
+use wasmtime_environ::wasm::{DefinedFuncIndex, FuncIndex};
 use wasmtime_environ::Module;
 use wasmtime_runtime::{
-    Imports, InstanceHandle, VMFunctionBody, VMSharedSignatureIndex, VMTrampoline,
+    Imports, InstanceHandle, StackMapRegistry, VMExternRefActivationsTable, VMFunctionBody,
+    VMFunctionImport, VMSharedSignatureIndex, VMTrampoline,
 };
 
 pub(crate) fn create_handle(
@@ -19,9 +20,10 @@ pub(crate) fn create_handle(
     finished_functions: PrimaryMap<DefinedFuncIndex, *mut [VMFunctionBody]>,
     trampolines: HashMap<VMSharedSignatureIndex, VMTrampoline>,
     state: Box<dyn Any>,
+    func_imports: PrimaryMap<FuncIndex, VMFunctionImport>,
 ) -> Result<StoreInstanceHandle> {
     let imports = Imports::new(
-        PrimaryMap::new(),
+        func_imports,
         PrimaryMap::new(),
         PrimaryMap::new(),
         PrimaryMap::new(),
@@ -46,8 +48,8 @@ pub(crate) fn create_handle(
             signatures.into_boxed_slice(),
             state,
             store.interrupts().clone(),
-            &*store.externref_activations_table() as *const _ as *mut _,
-            &*store.stack_map_registry() as *const _ as *mut _,
+            store.externref_activations_table() as *const VMExternRefActivationsTable as *mut _,
+            store.stack_map_registry() as *const StackMapRegistry as *mut _,
         )?;
         Ok(store.add_instance(handle))
     }

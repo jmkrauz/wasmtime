@@ -5,7 +5,9 @@ use std::any::Any;
 use std::mem;
 use wasmtime_environ::EntityIndex;
 use wasmtime_jit::{CompiledModule, Resolver};
-use wasmtime_runtime::{InstantiationError, VMContext, VMFunctionBody};
+use wasmtime_runtime::{
+    InstantiationError, StackMapRegistry, VMContext, VMExternRefActivationsTable, VMFunctionBody,
+};
 
 struct SimpleResolver<'a> {
     imports: &'a [Extern],
@@ -50,8 +52,8 @@ fn instantiate(
             config.memory_creator.as_ref().map(|a| a as _),
             store.interrupts().clone(),
             host,
-            &*store.externref_activations_table() as *const _ as *mut _,
-            &*store.stack_map_registry() as *const _ as *mut _,
+            store.externref_activations_table() as *const VMExternRefActivationsTable as *mut _,
+            store.stack_map_registry() as *const StackMapRegistry as *mut _,
         )?;
 
         // After we've created the `InstanceHandle` we still need to run
@@ -92,19 +94,20 @@ fn instantiate(
         let vmctx_ptr = instance.handle.vmctx_ptr();
         unsafe {
             super::func::invoke_wasm_and_catch_traps(vmctx_ptr, store, || {
+                let anyfunc = f.anyfunc.as_ref();
                 cfg_if::cfg_if! {
                     if #[cfg(target_arch = "arm")] {
                         mem::transmute::<
                         *const VMFunctionBody,
                         unsafe extern "C" fn(*mut VMContext, *mut VMContext),
-                    >((f.address as usize | 1) as *const VMFunctionBody)(
-                        f.vmctx, vmctx_ptr
+                    >((anyfunc.func_ptr.as_ptr() as usize | 1) as *const VMFunctionBody)(
+                        anyfunc.vmctx, vmctx_ptr
                     )
                     } else {
                         mem::transmute::<
                         *const VMFunctionBody,
                         unsafe extern "C" fn(*mut VMContext, *mut VMContext),
-                    >(f.address)(f.vmctx, vmctx_ptr)
+                    >(anyfunc.func_ptr.as_ptr())(anyfunc.vmctx, vmctx_ptr)
                     }
                 }
             })?;

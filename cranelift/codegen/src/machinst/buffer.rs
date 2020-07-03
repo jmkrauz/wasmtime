@@ -12,13 +12,13 @@
 //!   from the branch itself.
 //!
 //! - The lowering of control flow from the CFG-with-edges produced by
-//!   [BlockLoweringOrder], combined with many empty edge blocks when the register
-//!   allocator does not need to insert any spills/reloads/moves in edge blocks,
-//!   results in many suboptimal branch patterns. The lowering also pays no
-//!   attention to block order, and so two-target conditional forms (cond-br
-//!   followed by uncond-br) can often by avoided because one of the targets is
-//!   the fallthrough. There are several cases here where we can simplify to use
-//!   fewer branches.
+//!   [BlockLoweringOrder](super::BlockLoweringOrder), combined with many empty
+//!   edge blocks when the register allocator does not need to insert any
+//!   spills/reloads/moves in edge blocks, results in many suboptimal branch
+//!   patterns. The lowering also pays no attention to block order, and so
+//!   two-target conditional forms (cond-br followed by uncond-br) can often by
+//!   avoided because one of the targets is the fallthrough. There are several
+//!   cases here where we can simplify to use fewer branches.
 //!
 //! This "buffer" implements a single-pass code emission strategy (with a later
 //! "fixup" pass, but only through recorded fixups, not all instructions). The
@@ -41,7 +41,7 @@
 //!   by the emitter (e.g., vcode iterating over instruction structs). The emitter
 //!   has some awareness of this: it either asks for an island between blocks, so
 //!   it is not accidentally executed, or else it emits a branch around the island
-//!   when all other options fail (see [Inst::EmitIsland] meta-instruction).
+//!   when all other options fail (see `Inst::EmitIsland` meta-instruction).
 //!
 //! - A "veneer" is an instruction (or sequence of instructions) in an "island"
 //!   that implements a longer-range reference to a label. The idea is that, for
@@ -1024,7 +1024,7 @@ impl<I: VCodeInst> MachBuffer<I> {
                 let veneer_offset = self.cur_offset();
                 trace!("making a veneer at {}", veneer_offset);
                 let slice = &mut self.data[start..end];
-                // Patch the original label use to refer to teh veneer.
+                // Patch the original label use to refer to the veneer.
                 trace!(
                     "patching original at offset {} to veneer offset {}",
                     offset,
@@ -1390,7 +1390,9 @@ mod test {
         inst.emit(&mut buf, &flags, &mut state);
 
         buf.bind_label(label(1));
-        let inst = Inst::Nop4;
+        let inst = Inst::Udf {
+            trap_info: (SourceLoc::default(), TrapCode::Interrupt),
+        };
         inst.emit(&mut buf, &flags, &mut state);
 
         buf.bind_label(label(2));
@@ -1403,13 +1405,12 @@ mod test {
 
         let mut buf2 = MachBuffer::new();
         let mut state = Default::default();
-        let inst = Inst::OneWayCondBr {
-            kind: CondBrKind::Zero(xreg(0)),
-            target: BranchTarget::ResolvedOffset(8),
+        let inst = Inst::TrapIf {
+            kind: CondBrKind::NotZero(xreg(0)),
+            trap_info: (SourceLoc::default(), TrapCode::Interrupt),
         };
         inst.emit(&mut buf2, &flags, &mut state);
         let inst = Inst::Nop4;
-        inst.emit(&mut buf2, &flags, &mut state);
         inst.emit(&mut buf2, &flags, &mut state);
 
         let buf2 = buf2.finish();

@@ -181,9 +181,16 @@ fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
         },
         "Cranelift" => match (testsuite, testname) {
             ("simd", "simd_address") => return false,
+            ("simd", "simd_align") => return false,
             ("simd", "simd_bitwise") => return false,
+            ("simd", "simd_boolean") => return false,
+            ("simd", "simd_f32x4_cmp") => return false,
+            ("simd", "simd_f64x2_cmp") => return false,
+            ("simd", "simd_i8x16_arith") => return false,
             ("simd", "simd_i8x16_cmp") => return false,
+            ("simd", "simd_i16x8_arith") => return false,
             ("simd", "simd_i16x8_cmp") => return false,
+            ("simd", "simd_i32x4_arith") => return false,
             ("simd", "simd_i32x4_cmp") => return false,
             ("simd", "simd_load_extend") => return false,
             ("simd", "simd_load_splat") => return false,
@@ -193,31 +200,19 @@ fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
             ("simd", _) if target.contains("aarch64") => return true,
 
             ("simd", "simd_conversions") => return true, // FIXME Unsupported feature: proposed SIMD operator I32x4TruncSatF32x4S
-            ("simd", "simd_f32x4") => return true, // FIXME expected V128(F32x4([CanonicalNan, CanonicalNan, Value(Float32 { bits: 0 }), Value(Float32 { bits: 0 })])), got V128(18428729675200069632)
-            ("simd", "simd_f64x2") => return true, // FIXME expected V128(F64x2([Value(Float64 { bits: 9221120237041090560 }), Value(Float64 { bits: 0 })])), got V128(0)
-            ("simd", "simd_f64x2_arith") => return true, // FIXME expected V128(F64x2([Value(Float64 { bits: 9221120237041090560 }), Value(Float64 { bits: 13835058055282163712 })])), got V128(255211775190703847615975447847722024960)
             ("simd", "simd_load") => return true, // FIXME Unsupported feature: proposed SIMD operator I32x4TruncSatF32x4S
             ("simd", "simd_splat") => return true, // FIXME Unsupported feature: proposed SIMD operator I32x4TruncSatF32x4S
 
-            // not parsed in wasmparser yet
-            ("simd", "simd_i32x4_arith2") => return true,
-            ("simd", "simd_i16x8_arith2") => return true,
-            ("simd", "simd_i8x16_arith2") => return true,
-
-            // waiting for the upstream spec to get updated with new binary
-            // encodings of operations and for that to propagate to the
-            // testsuite repo.
-            ("simd", "simd_const") => return true,
-
-            ("reference_types", "table_copy_on_imported_tables")
-            | ("reference_types", "externref_id_function") => {
-                // Ignore if this isn't x64, because Cranelift only supports
-                // reference types on x64.
-                return env::var("CARGO_CFG_TARGET_ARCH").unwrap() != "x86_64";
+            // Still working on implementing these. See #929.
+            ("reference_types", "table_fill") => {
+                return true;
             }
 
-            // Still working on implementing these. See #929.
-            ("reference_types", _) => return true,
+            // TODO(#1886): Ignore reference types tests if this isn't x64,
+            // because Cranelift only supports reference types on x64.
+            ("reference_types", _) => {
+                return env::var("CARGO_CFG_TARGET_ARCH").unwrap() != "x86_64";
+            }
 
             _ => {}
         },

@@ -1,10 +1,12 @@
 //! This file declares `VMContext` and several related structs which contain
 //! fields that compiled wasm code accesses directly.
 
+use crate::externref::VMExternRef;
 use crate::instance::Instance;
 use std::any::Any;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::{ptr, u32};
+use std::u32;
 use wasmtime_environ::BuiltinFunctionIndex;
 
 /// An imported function.
@@ -12,7 +14,7 @@ use wasmtime_environ::BuiltinFunctionIndex;
 #[repr(C)]
 pub struct VMFunctionImport {
     /// A pointer to the imported function body.
-    pub body: *const VMFunctionBody,
+    pub body: NonNull<VMFunctionBody>,
 
     /// A pointer to the `VMContext` that owns the function.
     pub vmctx: *mut VMContext,
@@ -266,6 +268,7 @@ pub struct VMGlobalDefinition {
 #[cfg(test)]
 mod test_vmglobal_definition {
     use super::VMGlobalDefinition;
+    use crate::externref::VMExternRef;
     use more_asserts::assert_ge;
     use std::mem::{align_of, size_of};
     use wasmtime_environ::{Module, VMOffsets};
@@ -294,6 +297,11 @@ mod test_vmglobal_definition {
         let module = Module::new();
         let offsets = VMOffsets::new(size_of::<*mut u8>() as u8, &module.local);
         assert_eq!(offsets.vmctx_globals_begin() % 16, 0);
+    }
+
+    #[test]
+    fn check_vmglobal_can_contain_externref() {
+        assert!(size_of::<VMExternRef>() <= size_of::<VMGlobalDefinition>());
     }
 }
 
@@ -422,6 +430,30 @@ impl VMGlobalDefinition {
     pub unsafe fn as_u128_bits_mut(&mut self) -> &mut [u8; 16] {
         &mut *(self.storage.as_mut().as_mut_ptr() as *mut [u8; 16])
     }
+
+    /// Return a reference to the value as an externref.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub unsafe fn as_externref(&self) -> &Option<VMExternRef> {
+        &*(self.storage.as_ref().as_ptr() as *const Option<VMExternRef>)
+    }
+
+    /// Return a mutable reference to the value as an externref.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub unsafe fn as_externref_mut(&mut self) -> &mut Option<VMExternRef> {
+        &mut *(self.storage.as_mut().as_mut_ptr() as *mut Option<VMExternRef>)
+    }
+
+    /// Return a reference to the value as an anyfunc.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub unsafe fn as_anyfunc(&self) -> *const VMCallerCheckedAnyfunc {
+        *(self.storage.as_ref().as_ptr() as *const *const VMCallerCheckedAnyfunc)
+    }
+
+    /// Return a mutable reference to the value as an anyfunc.
+    #[allow(clippy::cast_ptr_alignment)]
+    pub unsafe fn as_anyfunc_mut(&mut self) -> &mut *const VMCallerCheckedAnyfunc {
+        &mut *(self.storage.as_mut().as_mut_ptr() as *mut *const VMCallerCheckedAnyfunc)
+    }
 }
 
 /// An index into the shared signature registry, usable for checking signatures
@@ -475,7 +507,7 @@ impl Default for VMSharedSignatureIndex {
 #[repr(C)]
 pub struct VMCallerCheckedAnyfunc {
     /// Function body.
-    pub func_ptr: *const VMFunctionBody,
+    pub func_ptr: NonNull<VMFunctionBody>,
     /// Function signature id.
     pub type_index: VMSharedSignatureIndex,
     /// Function `VMContext`.
@@ -513,16 +545,6 @@ mod test_vmcaller_checked_anyfunc {
     }
 }
 
-impl Default for VMCallerCheckedAnyfunc {
-    fn default() -> Self {
-        Self {
-            func_ptr: ptr::null_mut(),
-            type_index: Default::default(),
-            vmctx: ptr::null_mut(),
-        }
-    }
-}
-
 /// An array that stores addresses of builtin functions. We translate code
 /// to use indirect calls. This way, we don't have to patch the code.
 #[repr(C)]
@@ -540,39 +562,44 @@ impl VMBuiltinFunctionsArray {
 
         let mut ptrs = [0; Self::len()];
 
-        ptrs[BuiltinFunctionIndex::get_memory32_grow_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::memory32_grow().index() as usize] =
             wasmtime_memory32_grow as usize;
-        ptrs[BuiltinFunctionIndex::get_imported_memory32_grow_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::imported_memory32_grow().index() as usize] =
             wasmtime_imported_memory32_grow as usize;
-
-        ptrs[BuiltinFunctionIndex::get_memory32_size_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::memory32_size().index() as usize] =
             wasmtime_memory32_size as usize;
-        ptrs[BuiltinFunctionIndex::get_imported_memory32_size_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::imported_memory32_size().index() as usize] =
             wasmtime_imported_memory32_size as usize;
-
-        ptrs[BuiltinFunctionIndex::get_table_copy_index().index() as usize] =
-            wasmtime_table_copy as usize;
-
-        ptrs[BuiltinFunctionIndex::get_table_init_index().index() as usize] =
-            wasmtime_table_init as usize;
-        ptrs[BuiltinFunctionIndex::get_elem_drop_index().index() as usize] =
-            wasmtime_elem_drop as usize;
-
-        ptrs[BuiltinFunctionIndex::get_defined_memory_copy_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::table_copy().index() as usize] = wasmtime_table_copy as usize;
+        ptrs[BuiltinFunctionIndex::table_grow_funcref().index() as usize] =
+            wasmtime_table_grow as usize;
+        ptrs[BuiltinFunctionIndex::table_grow_externref().index() as usize] =
+            wasmtime_table_grow as usize;
+        ptrs[BuiltinFunctionIndex::table_init().index() as usize] = wasmtime_table_init as usize;
+        ptrs[BuiltinFunctionIndex::elem_drop().index() as usize] = wasmtime_elem_drop as usize;
+        ptrs[BuiltinFunctionIndex::defined_memory_copy().index() as usize] =
             wasmtime_defined_memory_copy as usize;
-        ptrs[BuiltinFunctionIndex::get_imported_memory_copy_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::imported_memory_copy().index() as usize] =
             wasmtime_imported_memory_copy as usize;
-        ptrs[BuiltinFunctionIndex::get_memory_fill_index().index() as usize] =
-            wasmtime_memory_fill as usize;
-        ptrs[BuiltinFunctionIndex::get_imported_memory_fill_index().index() as usize] =
+        ptrs[BuiltinFunctionIndex::memory_fill().index() as usize] = wasmtime_memory_fill as usize;
+        ptrs[BuiltinFunctionIndex::imported_memory_fill().index() as usize] =
             wasmtime_imported_memory_fill as usize;
-        ptrs[BuiltinFunctionIndex::get_memory_init_index().index() as usize] =
-            wasmtime_memory_init as usize;
-        ptrs[BuiltinFunctionIndex::get_data_drop_index().index() as usize] =
-            wasmtime_data_drop as usize;
+        ptrs[BuiltinFunctionIndex::memory_init().index() as usize] = wasmtime_memory_init as usize;
+        ptrs[BuiltinFunctionIndex::data_drop().index() as usize] = wasmtime_data_drop as usize;
+        ptrs[BuiltinFunctionIndex::drop_externref().index() as usize] =
+            wasmtime_drop_externref as usize;
+        ptrs[BuiltinFunctionIndex::activations_table_insert_with_gc().index() as usize] =
+            wasmtime_activations_table_insert_with_gc as usize;
+        ptrs[BuiltinFunctionIndex::externref_global_get().index() as usize] =
+            wasmtime_externref_global_get as usize;
+        ptrs[BuiltinFunctionIndex::externref_global_set().index() as usize] =
+            wasmtime_externref_global_set as usize;
 
-        debug_assert!(ptrs.iter().cloned().all(|p| p != 0));
-
+        if cfg!(debug_assertions) {
+            for i in 0..ptrs.len() {
+                debug_assert!(ptrs[i] != 0, "index {} is not initialized", i);
+            }
+        }
         Self { ptrs }
     }
 }

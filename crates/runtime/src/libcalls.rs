@@ -31,11 +31,41 @@
 //!       }
 //!   }
 //!   ```
+//!
+//! * When receiving a raw `*mut u8` that is actually a `VMExternRef` reference,
+//!   convert it into a proper `VMExternRef` with `VMExternRef::clone_from_raw`
+//!   as soon as apossible. Any GC before raw pointer is converted into a
+//!   reference can potentially collect the referenced object, which could lead
+//!   to use after free. Avoid this by eagerly converting into a proper
+//!   `VMExternRef`!
+//!
+//!   ```ignore
+//!   pub unsafe extern "C" my_lib_takes_ref(raw_extern_ref: *mut u8) {
+//!       // Before `clone_from_raw`, `raw_extern_ref` is potentially unrooted,
+//!       // and doing GC here could lead to use after free!
+//!
+//!       let my_extern_ref = if raw_extern_ref.is_null() {
+//!           None
+//!       } else {
+//!           Some(VMExternRef::clone_from_raw(raw_extern_ref))
+//!       };
+//!
+//!       // Now that we did `clone_from_raw`, it is safe to do a GC (or do
+//!       // anything else that might transitively GC, like call back into
+//!       // Wasm!)
+//!   }
+//!   ```
 
+use crate::externref::VMExternRef;
 use crate::table::Table;
 use crate::traphandlers::raise_lib_trap;
-use crate::vmcontext::VMContext;
-use wasmtime_environ::wasm::{DataIndex, DefinedMemoryIndex, ElemIndex, MemoryIndex, TableIndex};
+use crate::vmcontext::{VMCallerCheckedAnyfunc, VMContext};
+use std::mem;
+use std::ptr::{self, NonNull};
+use wasmtime_environ::wasm::{
+    DataIndex, DefinedMemoryIndex, ElemIndex, GlobalIndex, MemoryIndex, TableElementType,
+    TableIndex,
+};
 
 /// Implementation of f32.ceil
 pub extern "C" fn wasmtime_f32_ceil(x: f32) -> f32 {
@@ -201,6 +231,40 @@ pub unsafe extern "C" fn wasmtime_imported_memory32_size(
     instance.imported_memory_size(memory_index)
 }
 
+/// Implementation of `table.grow`.
+pub unsafe extern "C" fn wasmtime_table_grow(
+    vmctx: *mut VMContext,
+    table_index: u32,
+    delta: u32,
+    // NB: we don't know whether this is a pointer to a `VMCallerCheckedAnyfunc`
+    // or is a `VMExternRef` until we look at the table type.
+    init_value: *mut u8,
+) -> u32 {
+    let instance = (&mut *vmctx).instance();
+    let table_index = TableIndex::from_u32(table_index);
+    match instance.table_element_type(table_index) {
+        TableElementType::Func => {
+            let func = init_value as *mut VMCallerCheckedAnyfunc;
+            instance
+                .table_grow(table_index, delta, func.into())
+                .unwrap_or(-1_i32 as u32)
+        }
+        TableElementType::Val(ty) => {
+            debug_assert_eq!(ty, crate::ref_type());
+
+            let init_value = if init_value.is_null() {
+                None
+            } else {
+                Some(VMExternRef::clone_from_raw(init_value))
+            };
+
+            instance
+                .table_grow(table_index, delta, init_value.into())
+                .unwrap_or(-1_i32 as u32)
+        }
+    }
+}
+
 /// Implementation of `table.copy`.
 pub unsafe extern "C" fn wasmtime_table_copy(
     vmctx: *mut VMContext,
@@ -347,4 +411,68 @@ pub unsafe extern "C" fn wasmtime_data_drop(vmctx: *mut VMContext, data_index: u
     let data_index = DataIndex::from_u32(data_index);
     let instance = (&mut *vmctx).instance();
     instance.data_drop(data_index)
+}
+
+/// Drop a `VMExternRef`.
+pub unsafe extern "C" fn wasmtime_drop_externref(externref: *mut u8) {
+    let externref = externref as *mut crate::externref::VMExternData;
+    let externref = NonNull::new(externref).unwrap();
+    crate::externref::VMExternData::drop_and_dealloc(externref);
+}
+
+/// Do a GC and insert the given `externref` into the
+/// `VMExternRefActivationsTable`.
+pub unsafe extern "C" fn wasmtime_activations_table_insert_with_gc(
+    vmctx: *mut VMContext,
+    externref: *mut u8,
+) {
+    let externref = VMExternRef::clone_from_raw(externref);
+    let instance = (&mut *vmctx).instance();
+    let activations_table = &**instance.externref_activations_table();
+    let registry = &**instance.stack_map_registry();
+    activations_table.insert_with_gc(externref, registry);
+}
+
+/// Perform a Wasm `global.get` for `externref` globals.
+pub unsafe extern "C" fn wasmtime_externref_global_get(
+    vmctx: *mut VMContext,
+    index: u32,
+) -> *mut u8 {
+    let index = GlobalIndex::from_u32(index);
+    let instance = (&mut *vmctx).instance();
+    let global = instance.defined_or_imported_global_ptr(index);
+    match (*global).as_externref().clone() {
+        None => ptr::null_mut(),
+        Some(externref) => {
+            let raw = externref.as_raw();
+            let activations_table = &**instance.externref_activations_table();
+            let registry = &**instance.stack_map_registry();
+            activations_table.insert_with_gc(externref, registry);
+            raw
+        }
+    }
+}
+
+/// Perform a Wasm `global.set` for `externref` globals.
+pub unsafe extern "C" fn wasmtime_externref_global_set(
+    vmctx: *mut VMContext,
+    index: u32,
+    externref: *mut u8,
+) {
+    let externref = if externref.is_null() {
+        None
+    } else {
+        Some(VMExternRef::clone_from_raw(externref))
+    };
+
+    let index = GlobalIndex::from_u32(index);
+    let instance = (&mut *vmctx).instance();
+    let global = instance.defined_or_imported_global_ptr(index);
+
+    // Swap the new `externref` value into the global before we drop the old
+    // value. This protects against an `externref` with a `Drop` implementation
+    // that calls back into Wasm and touches this global again (we want to avoid
+    // it observing a halfway-deinitialized value).
+    let old = mem::replace((*global).as_externref_mut(), externref);
+    drop(old);
 }
