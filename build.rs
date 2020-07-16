@@ -183,13 +183,16 @@ fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
             ("simd", "simd_address") => return false,
             ("simd", "simd_align") => return false,
             ("simd", "simd_bitwise") => return false,
+            ("simd", "simd_bit_shift") => return false,
             ("simd", "simd_boolean") => return false,
             ("simd", "simd_f32x4_cmp") => return false,
             ("simd", "simd_f64x2_cmp") => return false,
             ("simd", "simd_i8x16_arith") => return false,
             ("simd", "simd_i8x16_cmp") => return false,
+            ("simd", "simd_i8x16_sat_arith") => return false,
             ("simd", "simd_i16x8_arith") => return false,
             ("simd", "simd_i16x8_cmp") => return false,
+            ("simd", "simd_i16x8_sat_arith") => return false,
             ("simd", "simd_i32x4_arith") => return false,
             ("simd", "simd_i32x4_cmp") => return false,
             ("simd", "simd_load_extend") => return false,
@@ -198,15 +201,6 @@ fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
             // Most simd tests are known to fail on aarch64 for now, it's going
             // to be a big chunk of work to implement them all there!
             ("simd", _) if target.contains("aarch64") => return true,
-
-            ("simd", "simd_conversions") => return true, // FIXME Unsupported feature: proposed SIMD operator I32x4TruncSatF32x4S
-            ("simd", "simd_load") => return true, // FIXME Unsupported feature: proposed SIMD operator I32x4TruncSatF32x4S
-            ("simd", "simd_splat") => return true, // FIXME Unsupported feature: proposed SIMD operator I32x4TruncSatF32x4S
-
-            // Still working on implementing these. See #929.
-            ("reference_types", "table_fill") => {
-                return true;
-            }
 
             // TODO(#1886): Ignore reference types tests if this isn't x64,
             // because Cranelift only supports reference types on x64.

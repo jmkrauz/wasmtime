@@ -1155,6 +1155,55 @@ fn test_x64_emit() {
     ));
 
     // ========================================================
+    // Div
+    insns.push((
+        Inst::div(
+            4,
+            true, /*signed*/
+            RegMem::reg(regs::rsi()),
+            SourceLoc::default(),
+        ),
+        "F7FE",
+        "idiv    %esi",
+    ));
+    insns.push((
+        Inst::div(
+            8,
+            true, /*signed*/
+            RegMem::reg(regs::r15()),
+            SourceLoc::default(),
+        ),
+        "49F7FF",
+        "idiv    %r15",
+    ));
+    insns.push((
+        Inst::div(
+            4,
+            false, /*signed*/
+            RegMem::reg(regs::r14()),
+            SourceLoc::default(),
+        ),
+        "41F7F6",
+        "div     %r14d",
+    ));
+    insns.push((
+        Inst::div(
+            8,
+            false, /*signed*/
+            RegMem::reg(regs::rdi()),
+            SourceLoc::default(),
+        ),
+        "48F7F7",
+        "div     %rdi",
+    ));
+
+    // ========================================================
+    // cdq family: SignExtendRaxRdx
+    insns.push((Inst::sign_extend_rax_to_rdx(2), "6699", "cwd"));
+    insns.push((Inst::sign_extend_rax_to_rdx(4), "99", "cdq"));
+    insns.push((Inst::sign_extend_rax_to_rdx(8), "4899", "cqo"));
+
+    // ========================================================
     // Imm_R
     //
     insns.push((
@@ -1528,6 +1577,19 @@ fn test_x64_emit() {
         Inst::lea(Amode::imm_reg_reg_shift(179, r10, r9, 0), w_r8),
         "4F8D840AB3000000",
         "lea     179(%r10,%r9,1), %r8",
+    ));
+    insns.push((
+        Inst::lea(Amode::rip_relative(BranchTarget::ResolvedOffset(0)), w_rdi),
+        "488D3D00000000",
+        "lea     0(%rip), %rdi",
+    ));
+    insns.push((
+        Inst::lea(
+            Amode::rip_relative(BranchTarget::ResolvedOffset(1337)),
+            w_r15,
+        ),
+        "4C8D3D39050000",
+        "lea     1337(%rip), %r15",
     ));
 
     // ========================================================
@@ -2480,6 +2542,44 @@ fn test_x64_emit() {
     insns.push((Inst::setcc(CC::NLE, w_rsi), "400F9FC6", "setnle  %sil"));
     insns.push((Inst::setcc(CC::Z, w_r14), "410F94C6", "setz    %r14b"));
     insns.push((Inst::setcc(CC::LE, w_r14), "410F9EC6", "setle   %r14b"));
+
+    // ========================================================
+    // Cmove
+    insns.push((
+        Inst::cmove(2, CC::O, RegMem::reg(rdi), w_rsi),
+        "660F40F7",
+        "cmovow  %di, %si",
+    ));
+    insns.push((
+        Inst::cmove(
+            2,
+            CC::NO,
+            RegMem::mem(Amode::imm_reg_reg_shift(37, rdi, rsi, 2)),
+            w_r15,
+        ),
+        "66440F417CB725",
+        "cmovnow 37(%rdi,%rsi,4), %r15w",
+    ));
+    insns.push((
+        Inst::cmove(4, CC::LE, RegMem::reg(rdi), w_rsi),
+        "0F4EF7",
+        "cmovlel %edi, %esi",
+    ));
+    insns.push((
+        Inst::cmove(4, CC::NLE, RegMem::mem(Amode::imm_reg(0, r15)), w_rsi),
+        "410F4F37",
+        "cmovnlel 0(%r15), %esi",
+    ));
+    insns.push((
+        Inst::cmove(8, CC::Z, RegMem::reg(rdi), w_r14),
+        "4C0F44F7",
+        "cmovzq  %rdi, %r14",
+    ));
+    insns.push((
+        Inst::cmove(8, CC::NZ, RegMem::mem(Amode::imm_reg(13, rdi)), w_r14),
+        "4C0F45770D",
+        "cmovnzq 13(%rdi), %r14",
+    ));
 
     // ========================================================
     // Push64

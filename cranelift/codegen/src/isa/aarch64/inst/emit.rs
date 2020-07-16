@@ -1,6 +1,6 @@
 //! AArch64 ISA: binary code emission.
 
-use crate::binemit::{CodeOffset, Reloc};
+use crate::binemit::{CodeOffset, Reloc, Stackmap};
 use crate::ir::constant::ConstantData;
 use crate::ir::types::*;
 use crate::ir::TrapCode;
@@ -282,14 +282,13 @@ fn enc_csel(rd: Writable<Reg>, rn: Reg, rm: Reg, cond: Cond) -> u32 {
         | (cond.bits() << 12)
 }
 
-fn enc_fcsel(rd: Writable<Reg>, rn: Reg, rm: Reg, cond: Cond, size: InstSize) -> u32 {
-    let ty_bit = if size.is32() { 0 } else { 1 };
+fn enc_fcsel(rd: Writable<Reg>, rn: Reg, rm: Reg, cond: Cond, size: ScalarSize) -> u32 {
     0b000_11110_00_1_00000_0000_11_00000_00000
+        | (size.ftype() << 22)
         | (machreg_to_vec(rm) << 16)
         | (machreg_to_vec(rn) << 5)
         | machreg_to_vec(rd.to_reg())
         | (cond.bits() << 12)
-        | (ty_bit << 22)
 }
 
 fn enc_cset(rd: Writable<Reg>, cond: Cond) -> u32 {
@@ -298,7 +297,7 @@ fn enc_cset(rd: Writable<Reg>, cond: Cond) -> u32 {
         | (cond.invert().bits() << 12)
 }
 
-fn enc_ccmp_imm(size: InstSize, rn: Reg, imm: UImm5, nzcv: NZCV, cond: Cond) -> u32 {
+fn enc_ccmp_imm(size: OperandSize, rn: Reg, imm: UImm5, nzcv: NZCV, cond: Cond) -> u32 {
     0b0_1_1_11010010_00000_0000_10_00000_0_0000
         | size.sf_bit() << 31
         | imm.bits() << 16
@@ -334,13 +333,11 @@ fn enc_fpurrrr(top17: u32, rd: Writable<Reg>, rn: Reg, rm: Reg, ra: Reg) -> u32 
         | machreg_to_vec(rd.to_reg())
 }
 
-fn enc_fcmp(size: InstSize, rn: Reg, rm: Reg) -> u32 {
-    let bits = if size.is32() {
-        0b000_11110_00_1_00000_00_1000_00000_00000
-    } else {
-        0b000_11110_01_1_00000_00_1000_00000_00000
-    };
-    bits | (machreg_to_vec(rm) << 16) | (machreg_to_vec(rn) << 5)
+fn enc_fcmp(size: ScalarSize, rn: Reg, rm: Reg) -> u32 {
+    0b000_11110_00_1_00000_00_1000_00000_00000
+        | (size.ftype() << 22)
+        | (machreg_to_vec(rm) << 16)
+        | (machreg_to_vec(rn) << 5)
 }
 
 fn enc_fputoint(top16: u32, rd: Writable<Reg>, rn: Reg) -> u32 {
@@ -379,7 +376,37 @@ fn enc_vec_lanes(q: u32, u: u32, size: u32, opcode: u32, rd: Writable<Reg>, rn: 
 /// State carried between emissions of a sequence of instructions.
 #[derive(Default, Clone, Debug)]
 pub struct EmitState {
-    virtual_sp_offset: i64,
+    /// Addend to convert nominal-SP offsets to real-SP offsets at the current
+    /// program point.
+    pub(crate) virtual_sp_offset: i64,
+    /// Offset of FP from nominal-SP.
+    pub(crate) nominal_sp_to_fp: i64,
+    /// Safepoint stackmap for upcoming instruction, as provided to `pre_safepoint()`.
+    stackmap: Option<Stackmap>,
+}
+
+impl MachInstEmitState<Inst> for EmitState {
+    fn new(abi: &dyn ABIBody<I = Inst>) -> Self {
+        EmitState {
+            virtual_sp_offset: 0,
+            nominal_sp_to_fp: abi.frame_size() as i64,
+            stackmap: None,
+        }
+    }
+
+    fn pre_safepoint(&mut self, stackmap: Stackmap) {
+        self.stackmap = Some(stackmap);
+    }
+}
+
+impl EmitState {
+    fn take_stackmap(&mut self) -> Option<Stackmap> {
+        self.stackmap.take()
+    }
+
+    fn clear_post_insn(&mut self) {
+        self.stackmap = None;
+    }
 }
 
 impl MachInstEmit for Inst {
@@ -534,8 +561,16 @@ impl MachInstEmit for Inst {
                     ALUOp::Lsr64 => (0b1101001101, u32::from(amt), 0b111111),
                     ALUOp::Asr32 => (0b0001001100, u32::from(amt), 0b011111),
                     ALUOp::Asr64 => (0b1001001101, u32::from(amt), 0b111111),
-                    ALUOp::Lsl32 => (0b0101001100, u32::from(32 - amt), u32::from(31 - amt)),
-                    ALUOp::Lsl64 => (0b1101001101, u32::from(64 - amt), u32::from(63 - amt)),
+                    ALUOp::Lsl32 => (
+                        0b0101001100,
+                        u32::from((32 - amt) % 32),
+                        u32::from(31 - amt),
+                    ),
+                    ALUOp::Lsl64 => (
+                        0b1101001101,
+                        u32::from((64 - amt) % 64),
+                        u32::from(63 - amt),
+                    ),
                     _ => unimplemented!("{:?}", alu_op),
                 };
                 sink.put4(
@@ -605,7 +640,7 @@ impl MachInstEmit for Inst {
             }
 
             &Inst::BitRR { op, rd, rn, .. } => {
-                let size = if op.inst_size().is32() { 0b0 } else { 0b1 };
+                let size = if op.operand_size().is32() { 0b0 } else { 0b1 };
                 let (op1, op2) = match op {
                     BitOp::RBit32 | BitOp::RBit64 => (0b00000, 0b000000),
                     BitOp::Clz32 | BitOp::Clz64 => (0b00000, 0b000100),
@@ -971,10 +1006,10 @@ impl MachInstEmit for Inst {
             &Inst::FpuMove128 { rd, rn } => {
                 sink.put4(enc_vecmov(/* 16b = */ true, rd, rn));
             }
-            &Inst::FpuMoveFromVec { rd, rn, idx, ty } => {
-                let (imm5, shift, mask) = match ty {
-                    F32 => (0b00100, 3, 0b011),
-                    F64 => (0b01000, 4, 0b001),
+            &Inst::FpuMoveFromVec { rd, rn, idx, size } => {
+                let (imm5, shift, mask) = match size.lane_size() {
+                    ScalarSize::Size32 => (0b00100, 3, 0b011),
+                    ScalarSize::Size64 => (0b01000, 4, 0b001),
                     _ => unimplemented!(),
                 };
                 debug_assert_eq!(idx & mask, idx);
@@ -1013,6 +1048,10 @@ impl MachInstEmit for Inst {
                     FPUOp2::Max64 => 0b000_11110_01_1_00000_010010,
                     FPUOp2::Min32 => 0b000_11110_00_1_00000_010110,
                     FPUOp2::Min64 => 0b000_11110_01_1_00000_010110,
+                    FPUOp2::Sqadd64 => 0b010_11110_11_1_00000_000011,
+                    FPUOp2::Uqadd64 => 0b011_11110_11_1_00000_000011,
+                    FPUOp2::Sqsub64 => 0b010_11110_11_1_00000_001011,
+                    FPUOp2::Uqsub64 => 0b011_11110_11_1_00000_001011,
                 };
                 sink.put4(enc_fpurrr(top22, rd, rn, rm));
             }
@@ -1067,31 +1106,25 @@ impl MachInstEmit for Inst {
                 };
                 sink.put4(enc_fpurrrr(top17, rd, rn, rm, ra));
             }
-            &Inst::VecMisc { op, rd, rn, ty } => {
-                let enc_size = match ty {
-                    I8X16 => 0b00,
-                    I16X8 => 0b01,
-                    I32X4 => 0b10,
-                    I64X2 => 0b11,
-                    _ => 0,
+            &Inst::VecMisc { op, rd, rn, size } => {
+                let enc_size = match size {
+                    VectorSize::Size8x16 => 0b00,
+                    VectorSize::Size16x8 => 0b01,
+                    VectorSize::Size32x4 => 0b10,
+                    VectorSize::Size64x2 => 0b11,
+                    _ => unimplemented!(),
                 };
                 let (bits_12_16, size) = match op {
-                    VecMisc2::Not => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b00101, 0b00)
-                    }
-                    VecMisc2::Neg => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b01011, enc_size)
-                    }
+                    VecMisc2::Not => (0b00101, 0b00),
+                    VecMisc2::Neg => (0b01011, enc_size),
                 };
                 sink.put4(enc_vec_rr_misc(size, bits_12_16, rd, rn));
             }
-            &Inst::VecLanes { op, rd, rn, ty } => {
-                let (q, size) = match ty {
-                    I8X16 => (0b1, 0b00),
-                    I16X8 => (0b1, 0b01),
-                    I32X4 => (0b1, 0b10),
+            &Inst::VecLanes { op, rd, rn, size } => {
+                let (q, size) = match size {
+                    VectorSize::Size8x16 => (0b1, 0b00),
+                    VectorSize::Size16x8 => (0b1, 0b01),
+                    VectorSize::Size32x4 => (0b1, 0b10),
                     _ => unreachable!(),
                 };
                 let (u, opcode) = match op {
@@ -1100,10 +1133,10 @@ impl MachInstEmit for Inst {
                 sink.put4(enc_vec_lanes(q, u, size, opcode, rd, rn));
             }
             &Inst::FpuCmp32 { rn, rm } => {
-                sink.put4(enc_fcmp(InstSize::Size32, rn, rm));
+                sink.put4(enc_fcmp(ScalarSize::Size32, rn, rm));
             }
             &Inst::FpuCmp64 { rn, rm } => {
-                sink.put4(enc_fcmp(InstSize::Size64, rn, rm));
+                sink.put4(enc_fcmp(ScalarSize::Size64, rn, rm));
             }
             &Inst::FpuToInt { op, rd, rn } => {
                 let top16 = match op {
@@ -1190,10 +1223,10 @@ impl MachInstEmit for Inst {
                 }
             }
             &Inst::FpuCSel32 { rd, rn, rm, cond } => {
-                sink.put4(enc_fcsel(rd, rn, rm, cond, InstSize::Size32));
+                sink.put4(enc_fcsel(rd, rn, rm, cond, ScalarSize::Size32));
             }
             &Inst::FpuCSel64 { rd, rn, rm, cond } => {
-                sink.put4(enc_fcsel(rd, rn, rm, cond, InstSize::Size64));
+                sink.put4(enc_fcsel(rd, rn, rm, cond, ScalarSize::Size64));
             }
             &Inst::FpuRound { op, rd, rn } => {
                 let top22 = match op {
@@ -1215,12 +1248,12 @@ impl MachInstEmit for Inst {
                         | machreg_to_vec(rd.to_reg()),
                 );
             }
-            &Inst::MovFromVec { rd, rn, idx, ty } => {
-                let (q, imm5, shift, mask) = match ty {
-                    I8 => (0b0, 0b00001, 1, 0b1111),
-                    I16 => (0b0, 0b00010, 2, 0b0111),
-                    I32 => (0b0, 0b00100, 3, 0b0011),
-                    I64 => (0b1, 0b01000, 4, 0b0001),
+            &Inst::MovFromVec { rd, rn, idx, size } => {
+                let (q, imm5, shift, mask) = match size {
+                    VectorSize::Size8x16 => (0b0, 0b00001, 1, 0b1111),
+                    VectorSize::Size16x8 => (0b0, 0b00010, 2, 0b0111),
+                    VectorSize::Size32x4 => (0b0, 0b00100, 3, 0b0011),
+                    VectorSize::Size64x2 => (0b1, 0b01000, 4, 0b0001),
                     _ => unreachable!(),
                 };
                 debug_assert_eq!(idx & mask, idx);
@@ -1233,12 +1266,12 @@ impl MachInstEmit for Inst {
                         | machreg_to_gpr(rd.to_reg()),
                 );
             }
-            &Inst::VecDup { rd, rn, ty } => {
-                let imm5 = match ty {
-                    I8 => 0b00001,
-                    I16 => 0b00010,
-                    I32 => 0b00100,
-                    I64 => 0b01000,
+            &Inst::VecDup { rd, rn, size } => {
+                let imm5 = match size {
+                    VectorSize::Size8x16 => 0b00001,
+                    VectorSize::Size16x8 => 0b00010,
+                    VectorSize::Size32x4 => 0b00100,
+                    VectorSize::Size64x2 => 0b01000,
                     _ => unimplemented!(),
                 };
                 sink.put4(
@@ -1248,10 +1281,10 @@ impl MachInstEmit for Inst {
                         | machreg_to_vec(rd.to_reg()),
                 );
             }
-            &Inst::VecDupFromFpu { rd, rn, ty } => {
-                let imm5 = match ty {
-                    F32 => 0b00100,
-                    F64 => 0b01000,
+            &Inst::VecDupFromFpu { rd, rn, size } => {
+                let imm5 = match size {
+                    VectorSize::Size32x4 => 0b00100,
+                    VectorSize::Size64x2 => 0b01000,
                     _ => unimplemented!(),
                 };
                 sink.put4(
@@ -1283,38 +1316,26 @@ impl MachInstEmit for Inst {
                 rn,
                 rm,
                 alu_op,
-                ty,
+                size,
             } => {
-                let enc_size = match ty {
-                    I8X16 => 0b00,
-                    I16X8 => 0b01,
-                    I32X4 => 0b10,
-                    I64X2 => 0b11,
+                let enc_size = match size {
+                    VectorSize::Size8x16 => 0b00,
+                    VectorSize::Size16x8 => 0b01,
+                    VectorSize::Size32x4 => 0b10,
+                    VectorSize::Size64x2 => 0b11,
                     _ => 0,
                 };
-                let enc_size_for_fcmp = match ty {
-                    F32X4 => 0b0,
-                    F64X2 => 0b1,
+                let enc_size_for_fcmp = match size {
+                    VectorSize::Size32x4 => 0b0,
+                    VectorSize::Size64x2 => 0b1,
                     _ => 0,
                 };
 
                 let (top11, bit15_10) = match alu_op {
-                    VecALUOp::SQAddScalar => {
-                        debug_assert_eq!(I64, ty);
-                        (0b010_11110_11_1, 0b000011)
-                    }
-                    VecALUOp::SQSubScalar => {
-                        debug_assert_eq!(I64, ty);
-                        (0b010_11110_11_1, 0b001011)
-                    }
-                    VecALUOp::UQAddScalar => {
-                        debug_assert_eq!(I64, ty);
-                        (0b011_11110_11_1, 0b000011)
-                    }
-                    VecALUOp::UQSubScalar => {
-                        debug_assert_eq!(I64, ty);
-                        (0b011_11110_11_1, 0b001011)
-                    }
+                    VecALUOp::Sqadd => (0b010_01110_00_1 | enc_size << 1, 0b000011),
+                    VecALUOp::Sqsub => (0b010_01110_00_1 | enc_size << 1, 0b001011),
+                    VecALUOp::Uqadd => (0b011_01110_00_1 | enc_size << 1, 0b000011),
+                    VecALUOp::Uqsub => (0b011_01110_00_1 | enc_size << 1, 0b001011),
                     VecALUOp::Cmeq => (0b011_01110_00_1 | enc_size << 1, 0b100011),
                     VecALUOp::Cmge => (0b010_01110_00_1 | enc_size << 1, 0b001111),
                     VecALUOp::Cmgt => (0b010_01110_00_1 | enc_size << 1, 0b001101),
@@ -1325,33 +1346,20 @@ impl MachInstEmit for Inst {
                     VecALUOp::Fcmge => (0b011_01110_00_1 | enc_size_for_fcmp << 1, 0b111001),
                     // The following logical instructions operate on bytes, so are not encoded differently
                     // for the different vector types.
-                    VecALUOp::And => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b010_01110_00_1, 0b000111)
-                    }
-                    VecALUOp::Bic => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b010_01110_01_1, 0b000111)
-                    }
-                    VecALUOp::Orr => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b010_01110_10_1, 0b000111)
-                    }
-                    VecALUOp::Eor => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b011_01110_00_1, 0b000111)
-                    }
-                    VecALUOp::Bsl => {
-                        debug_assert_eq!(128, ty_bits(ty));
-                        (0b011_01110_01_1, 0b000111)
-                    }
+                    VecALUOp::And => (0b010_01110_00_1, 0b000111),
+                    VecALUOp::Bic => (0b010_01110_01_1, 0b000111),
+                    VecALUOp::Orr => (0b010_01110_10_1, 0b000111),
+                    VecALUOp::Eor => (0b011_01110_00_1, 0b000111),
+                    VecALUOp::Bsl => (0b011_01110_01_1, 0b000111),
                     VecALUOp::Umaxp => (0b011_01110_00_1 | enc_size << 1, 0b101001),
                     VecALUOp::Add => (0b010_01110_00_1 | enc_size << 1, 0b100001),
                     VecALUOp::Sub => (0b011_01110_00_1 | enc_size << 1, 0b100001),
                     VecALUOp::Mul => {
-                        debug_assert_ne!(I64X2, ty);
+                        debug_assert_ne!(size, VectorSize::Size64x2);
                         (0b010_01110_00_1 | enc_size << 1, 0b100111)
                     }
+                    VecALUOp::Sshl => (0b010_01110_00_1 | enc_size << 1, 0b010001),
+                    VecALUOp::Ushl => (0b011_01110_00_1 | enc_size << 1, 0b010001),
                 };
                 sink.put4(enc_vec_rrr(top11, rm, bit15_10, rn, rd));
             }
@@ -1456,6 +1464,9 @@ impl MachInstEmit for Inst {
                 // Noop; this is just a placeholder for epilogues.
             }
             &Inst::Call { ref info } => {
+                if let Some(s) = state.take_stackmap() {
+                    sink.add_stackmap(4, s);
+                }
                 sink.add_reloc(info.loc, Reloc::Arm64Call, &info.dest, 0);
                 sink.put4(enc_jump26(0b100101, 0));
                 if info.opcode.is_call() {
@@ -1463,6 +1474,9 @@ impl MachInstEmit for Inst {
                 }
             }
             &Inst::CallInd { ref info } => {
+                if let Some(s) = state.take_stackmap() {
+                    sink.add_stackmap(4, s);
+                }
                 sink.put4(0b1101011_0001_11111_000000_00000_00000 | (machreg_to_gpr(info.rn) << 5));
                 if info.opcode.is_call() {
                     sink.add_call_site(info.loc, info.opcode);
@@ -1518,6 +1532,9 @@ impl MachInstEmit for Inst {
             &Inst::Udf { trap_info } => {
                 let (srcloc, code) = trap_info;
                 sink.add_trap(srcloc, code);
+                if let Some(s) = state.take_stackmap() {
+                    sink.add_stackmap(4, s);
+                }
                 sink.put4(0xd4a00000);
             }
             &Inst::Adr { rd, off } => {
@@ -1591,6 +1608,10 @@ impl MachInstEmit for Inst {
                 let jt_off = sink.cur_offset();
                 for &target in info.targets.iter() {
                     let word_off = sink.cur_offset();
+                    // off_into_table is an addend here embedded in the label to be later patched
+                    // at the end of codegen. The offset is initially relative to this jump table
+                    // entry; with the extra addend, it'll be relative to the jump table's start,
+                    // after patching.
                     let off_into_table = word_off - jt_off;
                     sink.use_label_at_offset(
                         word_off,
@@ -1698,7 +1719,7 @@ impl MachInstEmit for Inst {
                 debug!(
                     "virtual sp offset adjusted by {} -> {}",
                     offset,
-                    state.virtual_sp_offset + offset
+                    state.virtual_sp_offset + offset,
                 );
                 state.virtual_sp_offset += offset;
             }
@@ -1717,5 +1738,11 @@ impl MachInstEmit for Inst {
 
         let end_off = sink.cur_offset();
         debug_assert!((end_off - start_off) <= Inst::worst_case_size());
+
+        state.clear_post_insn();
+    }
+
+    fn pretty_print(&self, mb_rru: Option<&RealRegUniverse>, state: &mut EmitState) -> String {
+        self.print_with_state(mb_rru, state)
     }
 }

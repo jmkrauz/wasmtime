@@ -1,7 +1,7 @@
 use crate::r#ref::ExternRef;
 use crate::{Func, Store, ValType};
 use anyhow::{bail, Result};
-use std::ptr::{self, NonNull};
+use std::ptr;
 use wasmtime_runtime::{self as runtime, VMExternRef};
 
 /// Possible runtime values that a WebAssembly module can either consume or
@@ -174,6 +174,18 @@ impl Val {
         self.externref().expect("expected externref")
     }
 
+    pub(crate) fn into_table_element(self) -> Result<runtime::TableElement> {
+        match self {
+            Val::FuncRef(Some(f)) => Ok(runtime::TableElement::FuncRef(
+                f.caller_checked_anyfunc().as_ptr(),
+            )),
+            Val::FuncRef(None) => Ok(runtime::TableElement::FuncRef(ptr::null_mut())),
+            Val::ExternRef(Some(x)) => Ok(runtime::TableElement::ExternRef(Some(x.inner))),
+            Val::ExternRef(None) => Ok(runtime::TableElement::ExternRef(None)),
+            _ => bail!("value does not match table element type"),
+        }
+    }
+
     pub(crate) fn comes_from_same_store(&self, store: &Store) -> bool {
         match self {
             Val::FuncRef(Some(f)) => Store::same(store, f.store()),
@@ -258,17 +270,5 @@ pub(crate) unsafe fn from_checked_anyfunc(
     anyfunc: *mut wasmtime_runtime::VMCallerCheckedAnyfunc,
     store: &Store,
 ) -> Val {
-    let anyfunc = match NonNull::new(anyfunc) {
-        None => return Val::FuncRef(None),
-        Some(f) => f,
-    };
-
-    debug_assert!(
-        anyfunc.as_ref().type_index != wasmtime_runtime::VMSharedSignatureIndex::default()
-    );
-    let instance_handle = wasmtime_runtime::InstanceHandle::from_vmctx(anyfunc.as_ref().vmctx);
-    let export = wasmtime_runtime::ExportFunction { anyfunc };
-    let instance = store.existing_instance_handle(instance_handle);
-    let f = Func::from_wasmtime_function(export, instance);
-    Val::FuncRef(Some(f))
+    Val::FuncRef(Func::from_caller_checked_anyfunc(store, anyfunc))
 }

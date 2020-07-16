@@ -49,6 +49,33 @@ pub enum Inst {
         dst: Writable<Reg>,
     },
 
+    /// Integer quotient and remainder: (div idiv) $rax $rdx (reg addr)
+    Div {
+        size: u8, // 1, 2, 4 or 8
+        signed: bool,
+        divisor: RegMem,
+        loc: SourceLoc,
+    },
+
+    /// A synthetic sequence to implement the right inline checks for remainder and division,
+    /// assuming the dividend is in $rax.
+    /// Puts the result back into $rax if is_div, $rdx if !is_div, to mimic what the div
+    /// instruction does.
+    /// The generated code sequence is described in the emit's function match arm for this
+    /// instruction.
+    CheckedDivOrRemSeq {
+        is_div: bool,
+        is_signed: bool,
+        size: u8,
+        divisor: Reg,
+        loc: SourceLoc,
+    },
+
+    /// Do a sign-extend based on the sign of the value in rax into rdx: (cwd cdq cqo)
+    SignExtendRaxRdx {
+        size: u8, // 1, 2, 4 or 8
+    },
+
     /// Constant materialization: (imm32 imm64) reg.
     /// Either: movl $imm32, %reg32 or movabsq $imm64, %reg32.
     Imm_R {
@@ -117,6 +144,16 @@ pub enum Inst {
 
     /// Materializes the requested condition code in the destination reg.
     Setcc { cc: CC, dst: Writable<Reg> },
+
+    /// Integer conditional move.
+    /// Overwrites the destination register.
+    Cmove {
+        /// Possible values are 2, 4 or 8. Checked in the related factory.
+        size: u8,
+        cc: CC,
+        src: RegMem,
+        dst: Writable<Reg>,
+    },
 
     // =====================================
     // Stack manipulation.
@@ -190,8 +227,27 @@ pub enum Inst {
         not_taken: BranchTarget,
     },
 
+    /// Jump-table sequence, as one compound instruction (see note in lower.rs for rationale).
+    /// The generated code sequence is described in the emit's function match arm for this
+    /// instruction.
+    JmpTableSeq {
+        idx: Reg,
+        tmp1: Writable<Reg>,
+        tmp2: Writable<Reg>,
+        default_target: BranchTarget,
+        targets: Vec<BranchTarget>,
+        targets_for_term: Vec<MachLabel>,
+    },
+
     /// Indirect jump: jmpq (reg mem).
     JmpUnknown { target: RegMem },
+
+    /// Traps if the condition code is set.
+    TrapIf {
+        cc: CC,
+        trap_code: TrapCode,
+        srcloc: SourceLoc,
+    },
 
     /// A debug trap.
     Hlt,
@@ -234,6 +290,20 @@ impl Inst {
             src,
             dst,
         }
+    }
+
+    pub(crate) fn div(size: u8, signed: bool, divisor: RegMem, loc: SourceLoc) -> Inst {
+        debug_assert!(size == 8 || size == 4 || size == 2 || size == 1);
+        Inst::Div {
+            size,
+            signed,
+            divisor,
+            loc,
+        }
+    }
+    pub(crate) fn sign_extend_rax_to_rdx(size: u8) -> Inst {
+        debug_assert!(size == 8 || size == 4 || size == 2);
+        Inst::SignExtendRaxRdx { size }
     }
 
     pub(crate) fn imm_r(dst_is_64: bool, simm64: u64, dst: Writable<Reg>) -> Inst {
@@ -345,9 +415,21 @@ impl Inst {
         Inst::Cmp_RMI_R { size, src, dst }
     }
 
+    pub(crate) fn trap(srcloc: SourceLoc, trap_code: TrapCode) -> Inst {
+        Inst::Ud2 {
+            trap_info: (srcloc, trap_code),
+        }
+    }
+
     pub(crate) fn setcc(cc: CC, dst: Writable<Reg>) -> Inst {
         debug_assert!(dst.to_reg().get_class() == RegClass::I64);
         Inst::Setcc { cc, dst }
+    }
+
+    pub(crate) fn cmove(size: u8, cc: CC, src: RegMem, dst: Writable<Reg>) -> Inst {
+        debug_assert!(size == 8 || size == 4 || size == 2);
+        debug_assert!(dst.to_reg().get_class() == RegClass::I64);
+        Inst::Cmove { size, cc, src, dst }
     }
 
     pub(crate) fn push64(src: RegMemImm) -> Inst {
@@ -413,6 +495,14 @@ impl Inst {
     pub(crate) fn jmp_unknown(target: RegMem) -> Inst {
         Inst::JmpUnknown { target }
     }
+
+    pub(crate) fn trap_if(cc: CC, trap_code: TrapCode, srcloc: SourceLoc) -> Inst {
+        Inst::TrapIf {
+            cc,
+            trap_code,
+            srcloc,
+        }
+    }
 }
 
 //=============================================================================
@@ -469,6 +559,39 @@ impl ShowWithRRU for Inst {
                 src.show_rru_sized(mb_rru, sizeLQ(*is_64)),
                 show_ireg_sized(dst.to_reg(), mb_rru, sizeLQ(*is_64)),
             ),
+            Inst::Div {
+                size,
+                signed,
+                divisor,
+                ..
+            } => format!(
+                "{} {}",
+                ljustify(if *signed {
+                    "idiv".to_string()
+                } else {
+                    "div".into()
+                }),
+                divisor.show_rru_sized(mb_rru, *size)
+            ),
+            Inst::CheckedDivOrRemSeq {
+                is_div,
+                is_signed,
+                size,
+                divisor,
+                ..
+            } => format!(
+                "{}{} $rax:$rdx, {}",
+                if *is_signed { "s" } else { "u" },
+                if *is_div { "div " } else { "rem " },
+                show_ireg_sized(*divisor, mb_rru, *size),
+            ),
+            Inst::SignExtendRaxRdx { size } => match size {
+                2 => "cwd",
+                4 => "cdq",
+                8 => "cqo",
+                _ => unreachable!(),
+            }
+            .into(),
             Inst::XMM_Mov_RM_R { op, src, dst } => format!(
                 "{} {}, {}",
                 ljustify(op.to_string()),
@@ -585,6 +708,12 @@ impl ShowWithRRU for Inst {
                 ljustify2("set".to_string(), cc.to_string()),
                 show_ireg_sized(dst.to_reg(), mb_rru, 1)
             ),
+            Inst::Cmove { size, cc, src, dst } => format!(
+                "{} {}, {}",
+                ljustify(format!("cmov{}{}", cc.to_string(), suffixBWLQ(*size))),
+                src.show_rru_sized(mb_rru, *size),
+                show_ireg_sized(dst.to_reg(), mb_rru, *size)
+            ),
             Inst::Push64 { src } => {
                 format!("{} {}", ljustify("pushq".to_string()), src.show_rru(mb_rru))
             }
@@ -612,12 +741,18 @@ impl ShowWithRRU for Inst {
                 taken.show_rru(mb_rru),
                 not_taken.show_rru(mb_rru)
             ),
+            Inst::JmpTableSeq { idx, .. } => {
+                format!("{} {}", ljustify("br_table".into()), idx.show_rru(mb_rru))
+            }
             //
             Inst::JmpUnknown { target } => format!(
                 "{} *{}",
                 ljustify("jmp".to_string()),
                 target.show_rru(mb_rru)
             ),
+            Inst::TrapIf { cc, trap_code, .. } => {
+                format!("j{} ; ud2 {} ;", cc.invert().to_string(), trap_code)
+            }
             Inst::VirtualSPOffsetAdj { offset } => format!("virtual_sp_offset_adjust {}", offset),
             Inst::Hlt => "hlt".into(),
             Inst::Ud2 { trap_info } => format!("ud2 {}", trap_info.1),
@@ -647,6 +782,20 @@ fn x64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         } => {
             src.get_regs_as_uses(collector);
             collector.add_mod(*dst);
+        }
+        Inst::Div { divisor, .. } => {
+            collector.add_mod(Writable::from_reg(regs::rax()));
+            collector.add_mod(Writable::from_reg(regs::rdx()));
+            divisor.get_regs_as_uses(collector);
+        }
+        Inst::CheckedDivOrRemSeq { divisor, .. } => {
+            collector.add_mod(Writable::from_reg(regs::rax()));
+            collector.add_mod(Writable::from_reg(regs::rdx()));
+            collector.add_use(*divisor);
+        }
+        Inst::SignExtendRaxRdx { .. } => {
+            collector.add_use(regs::rax());
+            collector.add_mod(Writable::from_reg(regs::rdx()));
         }
         Inst::XMM_Mov_RM_R { src, dst, .. } => {
             src.get_regs_as_uses(collector);
@@ -701,6 +850,10 @@ fn x64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         Inst::Setcc { dst, .. } => {
             collector.add_def(*dst);
         }
+        Inst::Cmove { src, dst, .. } => {
+            src.get_regs_as_uses(collector);
+            collector.add_def(*dst);
+        }
         Inst::Push64 { src } => {
             src.get_regs_as_uses(collector);
             collector.add_mod(Writable::from_reg(regs::rsp()));
@@ -727,12 +880,24 @@ fn x64_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             dest.get_regs_as_uses(collector);
         }
 
+        Inst::JmpTableSeq {
+            ref idx,
+            ref tmp1,
+            ref tmp2,
+            ..
+        } => {
+            collector.add_use(*idx);
+            collector.add_def(*tmp1);
+            collector.add_def(*tmp2);
+        }
+
         Inst::Ret
         | Inst::EpiloguePlaceholder
         | Inst::JmpKnown { .. }
         | Inst::JmpCond { .. }
         | Inst::Nop { .. }
         | Inst::JmpUnknown { .. }
+        | Inst::TrapIf { .. }
         | Inst::VirtualSPOffsetAdj { .. }
         | Inst::Hlt
         | Inst::Ud2 { .. } => {
@@ -781,6 +946,9 @@ impl Amode {
                 map_use(map, base);
                 map_use(map, index);
             }
+            Amode::RipRelative { .. } => {
+                // RIP isn't involved in regalloc.
+            }
         }
     }
 }
@@ -817,6 +985,11 @@ fn x64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             src.map_uses(mapper);
             map_mod(mapper, dst);
         }
+        Inst::Div { divisor, .. } => divisor.map_uses(mapper),
+        Inst::CheckedDivOrRemSeq { divisor, .. } => {
+            map_use(mapper, divisor);
+        }
+        Inst::SignExtendRaxRdx { .. } => {}
         Inst::XMM_Mov_RM_R {
             ref mut src,
             ref mut dst,
@@ -899,6 +1072,14 @@ fn x64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             map_use(mapper, dst);
         }
         Inst::Setcc { ref mut dst, .. } => map_def(mapper, dst),
+        Inst::Cmove {
+            ref mut src,
+            ref mut dst,
+            ..
+        } => {
+            src.map_uses(mapper);
+            map_def(mapper, dst)
+        }
         Inst::Push64 { ref mut src } => src.map_uses(mapper),
         Inst::Pop64 { ref mut dst } => {
             map_def(mapper, dst);
@@ -932,12 +1113,24 @@ fn x64_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             dest.map_uses(mapper);
         }
 
+        Inst::JmpTableSeq {
+            ref mut idx,
+            ref mut tmp1,
+            ref mut tmp2,
+            ..
+        } => {
+            map_use(mapper, idx);
+            map_def(mapper, tmp1);
+            map_def(mapper, tmp2);
+        }
+
         Inst::Ret
         | Inst::EpiloguePlaceholder
         | Inst::JmpKnown { .. }
         | Inst::JmpCond { .. }
         | Inst::Nop { .. }
         | Inst::JmpUnknown { .. }
+        | Inst::TrapIf { .. }
         | Inst::VirtualSPOffsetAdj { .. }
         | Inst::Ud2 { .. }
         | Inst::Hlt => {
@@ -998,6 +1191,10 @@ impl MachInst for Inst {
                 taken,
                 not_taken,
             } => MachTerminator::Cond(taken.as_label().unwrap(), not_taken.as_label().unwrap()),
+            &Self::JmpTableSeq {
+                ref targets_for_term,
+                ..
+            } => MachTerminator::Indirect(&targets_for_term[..]),
             // All other cases are boring.
             _ => MachTerminator::None,
         }
@@ -1061,6 +1258,10 @@ impl MachInst for Inst {
         15
     }
 
+    fn ref_type_regclass(_: &settings::Flags) -> RegClass {
+        RegClass::I64
+    }
+
     type LabelUse = LabelUse;
 }
 
@@ -1076,6 +1277,18 @@ impl MachInstEmit for Inst {
     fn emit(&self, sink: &mut MachBuffer<Inst>, flags: &settings::Flags, state: &mut Self::State) {
         emit::emit(self, sink, flags, state);
     }
+
+    fn pretty_print(&self, mb_rru: Option<&RealRegUniverse>, _: &mut Self::State) -> String {
+        self.show_rru(mb_rru)
+    }
+}
+
+impl MachInstEmitState<Inst> for EmitState {
+    fn new(_: &dyn ABIBody<I = Inst>) -> Self {
+        EmitState {
+            virtual_sp_offset: 0,
+        }
+    }
 }
 
 /// A label-use (internal relocation) in generated code.
@@ -1085,6 +1298,10 @@ pub enum LabelUse {
     /// location. Used for control flow instructions which consider an offset from the start of the
     /// next instruction (so the size of the payload -- 4 bytes -- is subtracted from the payload).
     JmpRel32,
+
+    /// A 32-bit offset from location of relocation itself, added to the existing value at that
+    /// location.
+    PCRel32,
 }
 
 impl MachInstLabelUse for LabelUse {
@@ -1092,19 +1309,19 @@ impl MachInstLabelUse for LabelUse {
 
     fn max_pos_range(self) -> CodeOffset {
         match self {
-            LabelUse::JmpRel32 => 0x7fff_ffff,
+            LabelUse::JmpRel32 | LabelUse::PCRel32 => 0x7fff_ffff,
         }
     }
 
     fn max_neg_range(self) -> CodeOffset {
         match self {
-            LabelUse::JmpRel32 => 0x8000_0000,
+            LabelUse::JmpRel32 | LabelUse::PCRel32 => 0x8000_0000,
         }
     }
 
     fn patch_size(self) -> CodeOffset {
         match self {
-            LabelUse::JmpRel32 => 4,
+            LabelUse::JmpRel32 | LabelUse::PCRel32 => 4,
         }
     }
 
@@ -1119,24 +1336,29 @@ impl MachInstLabelUse for LabelUse {
                 let value = pc_rel.wrapping_add(addend).wrapping_sub(4);
                 buffer.copy_from_slice(&value.to_le_bytes()[..]);
             }
+            LabelUse::PCRel32 => {
+                let addend = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+                let value = pc_rel.wrapping_add(addend);
+                buffer.copy_from_slice(&value.to_le_bytes()[..]);
+            }
         }
     }
 
     fn supports_veneer(self) -> bool {
         match self {
-            LabelUse::JmpRel32 => false,
+            LabelUse::JmpRel32 | LabelUse::PCRel32 => false,
         }
     }
 
     fn veneer_size(self) -> CodeOffset {
         match self {
-            LabelUse::JmpRel32 => 0,
+            LabelUse::JmpRel32 | LabelUse::PCRel32 => 0,
         }
     }
 
     fn generate_veneer(self, _: &mut [u8], _: CodeOffset) -> (CodeOffset, LabelUse) {
         match self {
-            LabelUse::JmpRel32 => {
+            LabelUse::JmpRel32 | LabelUse::PCRel32 => {
                 panic!("Veneer not supported for JumpRel32 label-use.");
             }
         }

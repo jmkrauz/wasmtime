@@ -2,19 +2,27 @@ pub use crate::read_debuginfo::{read_debuginfo, DebugInfoData, WasmFileInfo};
 pub use crate::transform::transform_dwarf;
 use gimli::write::{Address, Dwarf, EndianVec, FrameTable, Result, Sections, Writer};
 use gimli::{RunTimeEndian, SectionId};
+use wasmtime_environ::entity::{EntityRef, PrimaryMap};
 use wasmtime_environ::isa::{unwind::UnwindInfo, TargetIsa};
-use wasmtime_environ::{Compilation, ModuleAddressMap, ModuleVmctxInfo, ValueLabelsRanges};
+use wasmtime_environ::wasm::DefinedFuncIndex;
+use wasmtime_environ::{ModuleAddressMap, ModuleVmctxInfo, ValueLabelsRanges};
+
+#[derive(Clone)]
+pub enum DwarfSectionRelocTarget {
+    Func(usize),
+    Section(&'static str),
+}
 
 #[derive(Clone)]
 pub struct DwarfSectionReloc {
-    pub target: String,
+    pub target: DwarfSectionRelocTarget,
     pub offset: u32,
     pub addend: i32,
     pub size: u8,
 }
 
 pub struct DwarfSection {
-    pub name: String,
+    pub name: &'static str,
     pub body: Vec<u8>,
     pub relocs: Vec<DwarfSectionReloc>,
 }
@@ -31,7 +39,7 @@ fn emit_dwarf_sections(
 
     let mut result = Vec::new();
     sections.for_each_mut(|id, s| -> anyhow::Result<()> {
-        let name = id.name().to_string();
+        let name = id.name();
         let body = s.writer.take();
         let mut relocs = vec![];
         ::std::mem::swap(&mut relocs, &mut s.relocs);
@@ -80,10 +88,9 @@ impl Writer for WriterRelocate {
         match address {
             Address::Constant(val) => self.write_udata(val, size),
             Address::Symbol { symbol, addend } => {
-                let target = format!("_wasm_function_{}", symbol);
                 let offset = self.len() as u32;
                 self.relocs.push(DwarfSectionReloc {
-                    target,
+                    target: DwarfSectionRelocTarget::Func(symbol),
                     offset,
                     size,
                     addend: addend as i32,
@@ -95,7 +102,7 @@ impl Writer for WriterRelocate {
 
     fn write_offset(&mut self, val: usize, section: SectionId, size: u8) -> Result<()> {
         let offset = self.len() as u32;
-        let target = section.name().to_string();
+        let target = DwarfSectionRelocTarget::Section(section.name());
         self.relocs.push(DwarfSectionReloc {
             target,
             offset,
@@ -112,7 +119,7 @@ impl Writer for WriterRelocate {
         section: SectionId,
         size: u8,
     ) -> Result<()> {
-        let target = section.name().to_string();
+        let target = DwarfSectionRelocTarget::Section(section.name());
         self.relocs.push(DwarfSectionReloc {
             target,
             offset: offset as u32,
@@ -125,18 +132,18 @@ impl Writer for WriterRelocate {
 
 fn create_frame_table<'a>(
     isa: &dyn TargetIsa,
-    infos: impl Iterator<Item = &'a Option<UnwindInfo>>,
+    infos: &PrimaryMap<DefinedFuncIndex, &Option<UnwindInfo>>,
 ) -> Option<FrameTable> {
     let mut table = FrameTable::default();
 
     let cie_id = table.add_cie(isa.create_systemv_cie()?);
 
-    for (i, info) in infos.enumerate() {
+    for (i, info) in infos {
         if let Some(UnwindInfo::SystemV(info)) = info {
             table.add_fde(
                 cie_id,
                 info.to_fde(Address::Symbol {
-                    symbol: i,
+                    symbol: i.index(),
                     addend: 0,
                 }),
             );
@@ -146,16 +153,16 @@ fn create_frame_table<'a>(
     Some(table)
 }
 
-pub fn emit_dwarf(
+pub fn emit_dwarf<'a>(
     isa: &dyn TargetIsa,
     debuginfo_data: &DebugInfoData,
     at: &ModuleAddressMap,
     vmctx_info: &ModuleVmctxInfo,
     ranges: &ValueLabelsRanges,
-    compilation: &Compilation,
+    unwind_info: &PrimaryMap<DefinedFuncIndex, &Option<UnwindInfo>>,
 ) -> anyhow::Result<Vec<DwarfSection>> {
     let dwarf = transform_dwarf(isa, debuginfo_data, at, vmctx_info, ranges)?;
-    let frame_table = create_frame_table(isa, compilation.into_iter().map(|f| &f.unwind_info));
+    let frame_table = create_frame_table(isa, unwind_info);
     let sections = emit_dwarf_sections(dwarf, frame_table)?;
     Ok(sections)
 }

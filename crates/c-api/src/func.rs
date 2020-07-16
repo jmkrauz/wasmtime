@@ -2,10 +2,11 @@ use crate::{wasm_extern_t, wasm_functype_t, wasm_store_t, wasm_val_t};
 use crate::{wasm_name_t, wasm_trap_t, wasmtime_error_t};
 use anyhow::anyhow;
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::str;
-use wasmtime::{Caller, Extern, Func, Trap};
+use wasmtime::{Caller, Extern, Func, Trap, Val};
 
 #[derive(Clone)]
 #[repr(transparent)]
@@ -89,6 +90,7 @@ fn create_function(
     let func = Func::new(store, ty, move |caller, params, results| {
         let params = params
             .iter()
+            .cloned()
             .map(|p| wasm_val_t::from_val(p))
             .collect::<Vec<_>>();
         let mut out_results = vec![wasm_val_t::default(); results.len()];
@@ -163,7 +165,7 @@ pub extern "C" fn wasmtime_func_new_with_env(
 pub unsafe extern "C" fn wasm_func_call(
     wasm_func: &wasm_func_t,
     args: *const wasm_val_t,
-    results: *mut wasm_val_t,
+    results: *mut MaybeUninit<wasm_val_t>,
 ) -> *mut wasm_trap_t {
     let func = wasm_func.func();
     let mut trap = ptr::null_mut();
@@ -186,7 +188,7 @@ pub unsafe extern "C" fn wasmtime_func_call(
     func: &wasm_func_t,
     args: *const wasm_val_t,
     num_args: usize,
-    results: *mut wasm_val_t,
+    results: *mut MaybeUninit<wasm_val_t>,
     num_results: usize,
     trap_ptr: &mut *mut wasm_trap_t,
 ) -> Option<Box<wasmtime_error_t>> {
@@ -201,7 +203,7 @@ pub unsafe extern "C" fn wasmtime_func_call(
 fn _wasmtime_func_call(
     func: &wasm_func_t,
     args: &[wasm_val_t],
-    results: &mut [wasm_val_t],
+    results: &mut [MaybeUninit<wasm_val_t>],
     trap_ptr: &mut *mut wasm_trap_t,
 ) -> Option<Box<wasmtime_error_t>> {
     let func = func.func();
@@ -217,8 +219,8 @@ fn _wasmtime_func_call(
     let result = panic::catch_unwind(AssertUnwindSafe(|| func.call(&params)));
     match result {
         Ok(Ok(out)) => {
-            for (slot, val) in results.iter_mut().zip(out.iter()) {
-                *slot = wasm_val_t::from_val(val);
+            for (slot, val) in results.iter_mut().zip(out.into_vec().into_iter()) {
+                crate::initialize(slot, wasm_val_t::from_val(val));
             }
             None
         }
@@ -272,4 +274,22 @@ pub extern "C" fn wasmtime_caller_export_get(
     let name = str::from_utf8(name.as_slice()).ok()?;
     let which = caller.caller.get_export(name)?;
     Some(Box::new(wasm_extern_t { which }))
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_func_as_funcref(
+    func: &wasm_func_t,
+    funcrefp: &mut MaybeUninit<wasm_val_t>,
+) {
+    let funcref = wasm_val_t::from_val(Val::FuncRef(Some(func.func().clone())));
+    crate::initialize(funcrefp, funcref);
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_funcref_as_func(val: &wasm_val_t) -> Option<Box<wasm_func_t>> {
+    if let Val::FuncRef(Some(f)) = val.val() {
+        Some(Box::new(f.into()))
+    } else {
+        None
+    }
 }
