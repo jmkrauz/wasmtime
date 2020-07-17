@@ -82,6 +82,7 @@ fn to_object_relocations<'a>(
                 RelocationEncoding::Generic,
                 32,
             ),
+            Reloc::Arm32Call => (RelocationKind::Elf(elf::R_ARM_THM_PC22), RelocationEncoding::Generic, 32),
             other => unimplemented!("Unimplemented relocation {:?}", other),
         };
         Some(ObjectRelocation {
