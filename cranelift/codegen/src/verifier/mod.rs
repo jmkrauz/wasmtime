@@ -1766,8 +1766,8 @@ impl<'a> Verifier<'a> {
         }
 
         let isa = match self.isa {
-            Some(isa) => isa,
-            None => return Ok(()),
+            Some(isa) if isa.get_mach_backend().is_none() => isa,
+            _ => return Ok(()),
         };
 
         let encoding = self.func.encodings[inst];

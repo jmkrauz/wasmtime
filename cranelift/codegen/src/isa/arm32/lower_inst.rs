@@ -250,6 +250,15 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 ctx.emit(Inst::CmpImm8 { rn, imm8: 0 });
                 Cond::Ne
             } else {
+                // Verification ensures that the input is always a single-def ifcmp.
+                let cmp_insn = ctx
+                    .get_input(inputs[0].insn, inputs[0].input)
+                    .inst
+                    .unwrap()
+                    .0;
+                debug_assert_eq!(ctx.data(cmp_insn).opcode(), Opcode::Ifcmp);
+                emit_cmp(ctx, cmp_insn);
+
                 let condcode = inst_condcode(ctx.data(insn)).unwrap();
                 lower_condcode(condcode)
             };

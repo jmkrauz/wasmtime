@@ -163,9 +163,19 @@ impl<'a> CompiledFunction<'a> {
         let arguments_address = values.as_mut_ptr();
         let function_address = self.as_ptr();
 
-        let callable_trampoline: fn(*const u8, *mut u128) -> () =
-            unsafe { mem::transmute(self.trampoline.as_ptr()) };
-        callable_trampoline(function_address, arguments_address);
+        #[cfg(not(target_arch = "arm"))]
+        {
+            let callable_trampoline: fn(*const u8, *mut u128) -> () =
+                unsafe { mem::transmute(self.trampoline.as_ptr()) };
+            callable_trampoline(function_address, arguments_address);
+        }
+        #[cfg(target_arch = "arm")]
+        {
+            let callable_trampoline: fn(*const u8, *mut u128) -> () =
+                unsafe { mem::transmute(self.trampoline.as_ptr() as usize | 1) };
+            let function_address: *const u8 = unsafe { mem::transmute(function_address as usize | 1) };
+            callable_trampoline(function_address, arguments_address);
+        }
 
         values.collect_returns(&self.signature)
     }

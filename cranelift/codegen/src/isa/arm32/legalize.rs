@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::cursor::{Cursor, FuncCursor};
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::entities::Value;

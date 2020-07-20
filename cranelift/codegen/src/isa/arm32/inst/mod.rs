@@ -1,5 +1,7 @@
 //! This module defines 32-bit ARM specific machine instruction types.
 
+#![allow(dead_code)]
+
 use crate::binemit::CodeOffset;
 use crate::ir::types::{B1, B16, B32, B8, I16, I32, I8, IFLAGS};
 use crate::ir::{ExternalName, Opcode, SourceLoc, TrapCode, Type};
@@ -787,7 +789,12 @@ impl MachInst for Inst {
         }
     }
 
-    fn gen_constant(to_reg: Writable<Reg>, value: u64, ty: Type) -> SmallVec<[Inst; 4]> {
+    fn gen_constant<F: FnMut(RegClass, Type) -> Writable<Reg>>(
+        to_reg: Writable<Reg>,
+        value: u64,
+        ty: Type,
+        _alloc_tmp: F,
+    ) -> SmallVec<[Inst; 4]> {
         match ty {
             B1 | I8 | B8 | I16 | B16 | I32 | B32 => {
                 let v: i64 = value as i64;
@@ -1113,7 +1120,7 @@ impl Inst {
                 let cond = cond.show_rru(mb_rru);
                 let mut ret = format!("it{} {}", te, cond);
                 for inst in insts.into_iter() {
-                    ret.push_str(" ");
+                    ret.push_str("; ");
                     ret.push_str(&inst.inst.show_rru(mb_rru));
                 }
                 ret
