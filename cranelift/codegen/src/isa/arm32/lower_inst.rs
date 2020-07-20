@@ -244,7 +244,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 insts: it_insts,
             });
         }
-        Opcode::Select | Opcode::Selectif => {
+        Opcode::Select | Opcode::Selectif | Opcode::SelectifSpectreGuard => {
             let cond = if op == Opcode::Select {
                 let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
                 ctx.emit(Inst::CmpImm8 { rn, imm8: 0 });

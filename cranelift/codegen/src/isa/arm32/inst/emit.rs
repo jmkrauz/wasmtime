@@ -1,6 +1,6 @@
 //! 32-bit ARM ISA: binary code emission.
 
-use crate::binemit::Reloc;
+use crate::binemit::{Reloc, Stackmap};
 use crate::isa::arm32::inst::*;
 
 use core::convert::TryFrom;
@@ -218,7 +218,37 @@ fn emit_32(inst: u32, sink: &mut MachBuffer<Inst>) {
 /// State carried between emissions of a sequence of instructions.
 #[derive(Default, Clone, Debug)]
 pub struct EmitState {
-    virtual_sp_offset: i32,
+    /// Addend to convert nominal-SP offsets to real-SP offsets at the current
+    /// program point.
+    pub(crate) virtual_sp_offset: i32,
+    /// Offset of FP from nominal-SP.
+    pub(crate) nominal_sp_to_fp: i32,
+    /// Safepoint stackmap for upcoming instruction, as provided to `pre_safepoint()`.
+    stackmap: Option<Stackmap>,
+}
+
+impl MachInstEmitState<Inst> for EmitState {
+    fn new(abi: &dyn ABIBody<I = Inst>) -> Self {
+        EmitState {
+            virtual_sp_offset: 0,
+            nominal_sp_to_fp: abi.frame_size() as i32,
+            stackmap: None,
+        }
+    }
+
+    fn pre_safepoint(&mut self, stackmap: Stackmap) {
+        self.stackmap = Some(stackmap);
+    }
+}
+
+impl EmitState {
+    fn take_stackmap(&mut self) -> Option<Stackmap> {
+        self.stackmap.take()
+    }
+
+    fn clear_post_insn(&mut self) {
+        self.stackmap = None;
+    }
 }
 
 impl MachInstEmit for Inst {
@@ -791,5 +821,9 @@ impl MachInstEmit for Inst {
 
         let end_off = sink.cur_offset();
         debug_assert!((end_off - start_off) <= Inst::worst_case_size());
+    }
+
+    fn pretty_print(&self, mb_rru: Option<&RealRegUniverse>, state: &mut EmitState) -> String {
+        self.print_with_state(mb_rru, state)
     }
 }

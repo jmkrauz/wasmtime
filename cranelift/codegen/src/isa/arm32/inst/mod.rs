@@ -838,13 +838,17 @@ impl MachInst for Inst {
         // It with four 32-bit instructions
         2 + 4 * 4
     }
+
+    fn ref_type_regclass(_: &settings::Flags) -> RegClass {
+        RegClass::I32
+    }
 }
 
 //=============================================================================
 // Pretty-printing of instructions.
 
-fn mem_finalize_for_show(mem: &MemArg, mb_rru: Option<&RealRegUniverse>) -> (String, MemArg) {
-    let (mem_insts, mem) = mem_finalize(mem, &mut Default::default());
+fn mem_finalize_for_show(mem: &MemArg, mb_rru: Option<&RealRegUniverse>, state: &EmitState) -> (String, MemArg) {
+    let (mem_insts, mem) = mem_finalize(mem, state);
     let mut mem_str = mem_insts
         .into_iter()
         .map(|inst| inst.show_rru(mb_rru))
@@ -859,6 +863,12 @@ fn mem_finalize_for_show(mem: &MemArg, mb_rru: Option<&RealRegUniverse>) -> (Str
 
 impl ShowWithRRU for Inst {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
+        self.pretty_print(mb_rru, &mut EmitState::default())
+    }
+}
+
+impl Inst {
+    fn print_with_state(&self, mb_rru: Option<&RealRegUniverse>, state: &mut EmitState) -> String {
         fn op_name(alu_op: ALUOp) -> &'static str {
             match alu_op {
                 ALUOp::Add => "add",
@@ -1025,7 +1035,7 @@ impl ShowWithRRU for Inst {
                     _ => panic!("Unsupported Store case: {:?}", self),
                 };
                 let rt = rt.show_rru(mb_rru);
-                let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru);
+                let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru, state);
                 let mem = mem.show_rru(mb_rru);
                 format!("{}{} {}, {}", mem_str, op, rt, mem)
             }
@@ -1045,13 +1055,13 @@ impl ShowWithRRU for Inst {
                     _ => panic!("Unsupported Load case: {:?}", self),
                 };
                 let rt = rt.show_rru(mb_rru);
-                let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru);
+                let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru, state);
                 let mem = mem.show_rru(mb_rru);
                 format!("{}{} {}, {}", mem_str, op, rt, mem)
             }
             &Inst::LoadAddr { rd, ref mem } => {
                 let mut ret = String::new();
-                let (mem_insts, mem) = mem_finalize(mem, &EmitState::default());
+                let (mem_insts, mem) = mem_finalize(mem, state);
                 for inst in mem_insts.into_iter() {
                     ret.push_str(&inst.show_rru(mb_rru));
                 }
@@ -1103,6 +1113,7 @@ impl ShowWithRRU for Inst {
                 let cond = cond.show_rru(mb_rru);
                 let mut ret = format!("it{} {}", te, cond);
                 for inst in insts.into_iter() {
+                    ret.push_str(" ");
                     ret.push_str(&inst.inst.show_rru(mb_rru));
                 }
                 ret

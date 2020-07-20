@@ -1,5 +1,6 @@
 //! Implementation of the 32-bit ARM ABI.
 
+use crate::binemit::Stackmap;
 use crate::abi::{legalize_args, ArgAction, ArgAssigner, ValueConversion};
 use crate::ir;
 use crate::ir::types;
@@ -493,6 +494,29 @@ impl ABIBody for Arm32ABIBody {
         store_stack(MemArg::NominalSPOffset(sp_off as i32), from_reg, ty)
     }
 
+    fn spillslots_to_stackmap(&self, slots: &[SpillSlot], state: &EmitState) -> Stackmap {
+        assert!(state.virtual_sp_offset >= 0);
+        trace!(
+            "spillslots_to_stackmap: slots = {:?}, state = {:?}",
+            slots,
+            state
+        );
+        let map_size = (state.virtual_sp_offset + state.nominal_sp_to_fp) as u32;
+        let map_words = (map_size + 3) / 4;
+        let mut bits = std::iter::repeat(false)
+            .take(map_words as usize)
+            .collect::<Vec<bool>>();
+
+        let first_spillslot_word =
+            ((self.stackslots_size + state.virtual_sp_offset as u32) / 4) as usize;
+        for &slot in slots {
+            let slot = slot.get() as usize;
+            bits[first_spillslot_word + slot] = true;
+        }
+
+        Stackmap::from_slice(&bits[..])
+    }
+
     fn gen_prologue(&mut self) -> Vec<Inst> {
         let mut insts = vec![];
         let mut reg_list = SmallVec::<[Reg; 16]>::new();
@@ -586,6 +610,10 @@ impl ABIBody for Arm32ABIBody {
             .expect("frame size not computed before prologue generation")
     }
 
+    fn stack_args_size(&self) -> u32 {
+        self.sig.stack_arg_space
+    }
+
     fn get_spillslot_size(&self, rc: RegClass, _ty: Type) -> u32 {
         // Allocate in terms of 8-byte slots.
         match rc {
@@ -594,12 +622,25 @@ impl ABIBody for Arm32ABIBody {
         }
     }
 
-    fn gen_spill(&self, to_slot: SpillSlot, from_reg: RealReg, ty: Type) -> Inst {
+    fn gen_spill(&self, to_slot: SpillSlot, from_reg: RealReg, ty: Option<Type>) -> Inst {
+        let ty = ty_from_ty_hint_or_reg_class(from_reg.to_reg(), ty);
         self.store_spillslot(to_slot, ty, from_reg.to_reg())
     }
 
-    fn gen_reload(&self, to_reg: Writable<RealReg>, from_slot: SpillSlot, ty: Type) -> Inst {
+    fn gen_reload(&self, to_reg: Writable<RealReg>, from_slot: SpillSlot, ty: Option<Type>) -> Inst {
+        let ty = ty_from_ty_hint_or_reg_class(to_reg.to_reg().to_reg(), ty);
         self.load_spillslot(from_slot, ty, to_reg.map(|r| r.to_reg()))
+    }
+}
+
+fn ty_from_ty_hint_or_reg_class(r: Reg, ty: Option<Type>) -> Type {
+    match (ty, r.get_class()) {
+        // If the type is provided
+        (Some(t), _) => t,
+        // If no type is provided, this should be a register spill for a
+        // safepoint, so we only expect I64 (integer) registers.
+        (None, RegClass::I32) => I32,
+        _ => panic!("Unexpected register class!"),
     }
 }
 
