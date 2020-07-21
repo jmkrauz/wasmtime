@@ -1,7 +1,7 @@
 //! Implementation of the 32-bit ARM ABI.
 
-use crate::binemit::Stackmap;
 use crate::abi::{legalize_args, ArgAction, ArgAssigner, ValueConversion};
+use crate::binemit::Stackmap;
 use crate::ir;
 use crate::ir::types;
 use crate::ir::types::*;
@@ -627,7 +627,12 @@ impl ABIBody for Arm32ABIBody {
         self.store_spillslot(to_slot, ty, from_reg.to_reg())
     }
 
-    fn gen_reload(&self, to_reg: Writable<RealReg>, from_slot: SpillSlot, ty: Option<Type>) -> Inst {
+    fn gen_reload(
+        &self,
+        to_reg: Writable<RealReg>,
+        from_slot: SpillSlot,
+        ty: Option<Type>,
+    ) -> Inst {
         let ty = ty_from_ty_hint_or_reg_class(to_reg.to_reg().to_reg(), ty);
         self.load_spillslot(from_slot, ty, to_reg.map(|r| r.to_reg()))
     }

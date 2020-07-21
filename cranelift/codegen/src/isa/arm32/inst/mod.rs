@@ -854,7 +854,11 @@ impl MachInst for Inst {
 //=============================================================================
 // Pretty-printing of instructions.
 
-fn mem_finalize_for_show(mem: &MemArg, mb_rru: Option<&RealRegUniverse>, state: &EmitState) -> (String, MemArg) {
+fn mem_finalize_for_show(
+    mem: &MemArg,
+    mb_rru: Option<&RealRegUniverse>,
+    state: &EmitState,
+) -> (String, MemArg) {
     let (mem_insts, mem) = mem_finalize(mem, state);
     let mut mem_str = mem_insts
         .into_iter()

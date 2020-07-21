@@ -173,7 +173,8 @@ impl<'a> CompiledFunction<'a> {
         {
             let callable_trampoline: fn(*const u8, *mut u128) -> () =
                 unsafe { mem::transmute(self.trampoline.as_ptr() as usize | 1) };
-            let function_address: *const u8 = unsafe { mem::transmute(function_address as usize | 1) };
+            let function_address: *const u8 =
+                unsafe { mem::transmute(function_address as usize | 1) };
             callable_trampoline(function_address, arguments_address);
         }
 

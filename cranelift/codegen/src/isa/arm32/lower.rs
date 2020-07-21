@@ -99,9 +99,9 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
     let in_reg = if let Some(c) = inputs.constant {
         // Generate constants fresh at each use to minimize long-range register pressure.
         let to_reg = ctx.alloc_tmp(Inst::rc_for_type(ty).unwrap(), ty);
-        for inst in Inst::gen_constant(to_reg, c, ty, |reg_class, ty| {
-            ctx.alloc_tmp(reg_class, ty)
-        }).into_iter() {
+        for inst in Inst::gen_constant(to_reg, c, ty, |reg_class, ty| ctx.alloc_tmp(reg_class, ty))
+            .into_iter()
+        {
             ctx.emit(inst);
         }
         to_reg.to_reg()
