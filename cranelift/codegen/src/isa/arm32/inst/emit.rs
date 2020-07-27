@@ -11,9 +11,9 @@ use core::convert::TryFrom;
 /// of this amode.
 pub fn mem_finalize(mem: &MemArg, state: &EmitState) -> (SmallVec<[Inst; 4]>, MemArg) {
     match mem {
-        &MemArg::Offset12(_, off) | &MemArg::SPOffset(off) | &MemArg::NominalSPOffset(off) => {
+        &MemArg::RegOffset(_, off) | &MemArg::SPOffset(off) | &MemArg::NominalSPOffset(off) => {
             let basereg = match mem {
-                &MemArg::Offset12(reg, _) => reg,
+                &MemArg::RegOffset(reg, _) => reg,
                 &MemArg::SPOffset(_) | &MemArg::NominalSPOffset(_) => sp_reg(),
                 _ => unreachable!(),
             };
@@ -272,7 +272,7 @@ impl MachInstEmit for Inst {
                     ALUOp::Qsub => (0b111110101000, 0b1111, 0b1010),
                     ALUOp::Mul => (0b111110110000, 0b1111, 0b0000),
                     ALUOp::Udiv => (0b111110111011, 0b1111, 0b1111),
-                    ALUOp::Sdiv => (0b11111011101, 0b1111, 0b1111),
+                    ALUOp::Sdiv => (0b111110111001, 0b1111, 0b1111),
                     _ => panic!("Invalid ALUOp {:?} in RRR form!", alu_op),
                 };
                 emit_32(
@@ -376,9 +376,13 @@ impl MachInstEmit for Inst {
                     ALUOp::Orn => 0b00110,
                     ALUOp::Eor => 0b01000,
                     ALUOp::Add => 0b10000,
+                    ALUOp::Adds => 0b10001,
                     ALUOp::Adc => 0b10100,
+                    ALUOp::Adcs => 0b10101,
                     ALUOp::Sbc => 0b10110,
+                    ALUOp::Sbcs => 0b10111,
                     ALUOp::Sub => 0b11010,
+                    ALUOp::Subs => 0b11011,
                     ALUOp::Rsb => 0b11100,
                     _ => panic!("Invalid ALUOp {:?} in RRImm8 form!", alu_op),
                 };
@@ -433,7 +437,7 @@ impl MachInstEmit for Inst {
                 rt,
                 ref mem,
                 srcloc,
-                bits,
+                bytes,
             } => {
                 let (mem_insts, mem) = mem_finalize(mem, state);
                 for inst in mem_insts.into_iter() {
@@ -445,20 +449,18 @@ impl MachInstEmit for Inst {
                 }
                 match mem {
                     MemArg::RegReg(rn, rm, imm2) => {
-                        let bits_24_20 = match bits {
-                            32 => 0b00100,
-                            16 => 0b00010,
-                            8 => 0b00000,
-                            _ => panic!("Unsupported Store case {:?}", self),
+                        let bits_24_20 = match bytes {
+                            ByteAmt::Word => 0b00100,
+                            ByteAmt::Halfword => 0b00010,
+                            ByteAmt::Byte => 0b00000,
                         };
                         emit_32(enc_32_mem_r(bits_24_20, rt, rn, rm, imm2), sink);
                     }
-                    MemArg::Offset12(rn, off12) => {
-                        let bits_24_20 = match bits {
-                            32 => 0b01100,
-                            16 => 0b01010,
-                            8 => 0b01000,
-                            _ => panic!("Unsupported Store case {:?}", self),
+                    MemArg::RegOffset(rn, off12) => {
+                        let bits_24_20 = match bytes {
+                            ByteAmt::Word => 0b01100,
+                            ByteAmt::Halfword => 0b01010,
+                            ByteAmt::Byte => 0b01000,
                         };
                         emit_32(enc_32_mem_off12(bits_24_20, rt, rn, off12 as u32), sink);
                     }
@@ -469,7 +471,7 @@ impl MachInstEmit for Inst {
                 rt,
                 ref mem,
                 srcloc,
-                bits,
+                bytes,
                 sign_extend,
             } => {
                 let (mem_insts, mem) = mem_finalize(mem, state);
@@ -482,24 +484,22 @@ impl MachInstEmit for Inst {
                 }
                 match mem {
                     MemArg::RegReg(rn, rm, imm2) => {
-                        let bits_24_20 = match (bits, sign_extend) {
-                            (32, _) => 0b00101,
-                            (16, true) => 0b10011,
-                            (16, false) => 0b00011,
-                            (8, true) => 0b10001,
-                            (8, false) => 0b00001,
-                            _ => panic!("Unsupported Load case: {:?}", self),
+                        let bits_24_20 = match (bytes, sign_extend) {
+                            (ByteAmt::Word, _) => 0b00101,
+                            (ByteAmt::Halfword, true) => 0b10011,
+                            (ByteAmt::Halfword, false) => 0b00011,
+                            (ByteAmt::Byte, true) => 0b10001,
+                            (ByteAmt::Byte, false) => 0b00001,
                         };
                         emit_32(enc_32_mem_r(bits_24_20, rt.to_reg(), rn, rm, imm2), sink);
                     }
-                    MemArg::Offset12(rn, off12) => {
-                        let bits_24_20 = match (bits, sign_extend) {
-                            (32, _) => 0b01101,
-                            (16, true) => 0b11011,
-                            (16, false) => 0b01011,
-                            (8, true) => 0b11001,
-                            (8, false) => 0b01001,
-                            _ => panic!("Unsupported Load case: {:?}", self),
+                    MemArg::RegOffset(rn, off12) => {
+                        let bits_24_20 = match (bytes, sign_extend) {
+                            (ByteAmt::Word, _) => 0b01101,
+                            (ByteAmt::Halfword, true) => 0b11011,
+                            (ByteAmt::Halfword, false) => 0b01011,
+                            (ByteAmt::Byte, true) => 0b11001,
+                            (ByteAmt::Byte, false) => 0b01001,
                         };
                         emit_32(
                             enc_32_mem_off12(bits_24_20, rt.to_reg(), rn, off12 as u32),
@@ -526,7 +526,7 @@ impl MachInstEmit for Inst {
                             shift: Some(shift),
                         }
                     }
-                    MemArg::Offset12(reg, off12) => Inst::AluRRImm12 {
+                    MemArg::RegOffset(reg, off12) => Inst::AluRRImm12 {
                         alu_op: ALUOp::Add,
                         rd,
                         rn: reg,
@@ -539,25 +539,25 @@ impl MachInstEmit for Inst {
             &Inst::Extend {
                 rd,
                 rm,
-                from_bits,
+                from_bytes,
                 signed,
             } => {
                 let rd = rd.to_reg();
                 if machreg_is_lo(rd) && machreg_is_lo(rm) {
-                    let bits_15_9 = match (from_bits, signed) {
-                        (16, true) => 0b1011001000,
-                        (16, false) => 0b1011001010,
-                        (8, true) => 0b1011001001,
-                        (8, false) => 0b1011001011,
+                    let bits_15_9 = match (from_bytes, signed) {
+                        (ByteAmt::Halfword, true) => 0b1011001000,
+                        (ByteAmt::Halfword, false) => 0b1011001010,
+                        (ByteAmt::Byte, true) => 0b1011001001,
+                        (ByteAmt::Byte, false) => 0b1011001011,
                         _ => panic!("Unsupported Extend case: {:?}", self),
                     };
                     sink.put2(enc_16_rr(bits_15_9, rd, rm));
                 } else {
-                    let bits_22_20 = match (from_bits, signed) {
-                        (16, true) => 0b000,
-                        (16, false) => 0b001,
-                        (8, true) => 0b100,
-                        (8, false) => 0b101,
+                    let bits_22_20 = match (from_bytes, signed) {
+                        (ByteAmt::Halfword, true) => 0b000,
+                        (ByteAmt::Halfword, false) => 0b001,
+                        (ByteAmt::Byte, true) => 0b100,
+                        (ByteAmt::Byte, false) => 0b101,
                         _ => panic!("Unsupported Extend case: {:?}", self),
                     };
                     let inst = 0b111110100_000_11111111_0000_1000_0000 | (bits_22_20 << 20);
@@ -618,24 +618,17 @@ impl MachInstEmit for Inst {
                     emit_32(inst, sink);
                 }
             },
-            &Inst::Call {
-                ref dest,
-                loc,
-                opcode,
-                ..
-            } => {
-                sink.add_reloc(loc, Reloc::Arm32Call, dest, 0);
-                sink.put4(0b11110_0_0000000000_11_0_1_0_00000000000);
-                if opcode.is_call() {
-                    sink.add_call_site(loc, opcode);
+            &Inst::Call { ref info } => {
+                sink.add_reloc(info.loc, Reloc::Arm32Call, &info.dest, 0);
+                emit_32(0b11110_0_0000000000_11_0_1_0_00000000000, sink);
+                if info.opcode.is_call() {
+                    sink.add_call_site(info.loc, info.opcode);
                 }
             }
-            &Inst::CallInd {
-                rm, loc, opcode, ..
-            } => {
-                sink.put2(0b01000111_1_0000_000 | (machreg_to_gpr(rm) << 3));
-                if opcode.is_call() {
-                    sink.add_call_site(loc, opcode);
+            &Inst::CallInd { ref info } => {
+                sink.put2(0b01000111_1_0000_000 | (machreg_to_gpr(info.rm) << 3));
+                if info.opcode.is_call() {
+                    sink.add_call_site(info.loc, info.opcode);
                 }
             }
             &Inst::LoadExtName {
@@ -681,7 +674,7 @@ impl MachInstEmit for Inst {
                 let inst = Inst::Load {
                     rt: rtmp2,
                     mem: MemArg::reg_plus_reg(rtmp1.to_reg(), rtmp2.to_reg(), 2),
-                    bits: 32,
+                    bytes: ByteAmt::Word,
                     sign_extend: false,
                     srcloc: None, // can't cause a user trap.
                 };
@@ -730,44 +723,18 @@ impl MachInstEmit for Inst {
             &Inst::CondBr {
                 taken,
                 not_taken,
-                kind,
+                cond,
             } => {
                 // Conditional part first.
                 let cond_off = sink.cur_offset();
                 if let Some(l) = taken.as_label() {
-                    let label_use = if let CondBrKind::Cond(_) = kind {
-                        LabelUse::Branch20
-                    } else {
-                        LabelUse::Branch6
-                    };
+                    let label_use = LabelUse::Branch20;
                     sink.use_label_at_offset(cond_off, l, label_use);
-                    match kind {
-                        CondBrKind::Zero(reg) => {
-                            let inverted = enc_16_comp_branch(reg, false, taken).to_le_bytes();
-                            sink.add_cond_branch(cond_off, cond_off + 2, l, &inverted[..]);
-                        }
-                        CondBrKind::NotZero(reg) => {
-                            let inverted = enc_16_comp_branch(reg, true, taken).to_le_bytes();
-                            sink.add_cond_branch(cond_off, cond_off + 2, l, &inverted[..]);
-                        }
-                        CondBrKind::Cond(c) => {
-                            let inverted = enc_32_cond_branch(c.invert(), taken);
-                            let inverted = u32_swap_halfwords(inverted).to_le_bytes();
-                            sink.add_cond_branch(cond_off, cond_off + 4, l, &inverted[..]);
-                        }
-                    }
+                    let inverted = enc_32_cond_branch(cond.invert(), taken);
+                    let inverted = u32_swap_halfwords(inverted).to_le_bytes();
+                    sink.add_cond_branch(cond_off, cond_off + 4, l, &inverted[..]);
                 }
-                match kind {
-                    CondBrKind::Zero(reg) => {
-                        sink.put2(enc_16_comp_branch(reg, true, taken));
-                    }
-                    CondBrKind::NotZero(reg) => {
-                        sink.put2(enc_16_comp_branch(reg, false, taken));
-                    }
-                    CondBrKind::Cond(c) => {
-                        emit_32(enc_32_cond_branch(c, taken), sink);
-                    }
-                }
+                emit_32(enc_32_cond_branch(cond, taken), sink);
 
                 // Unconditional part.
                 let uncond_off = sink.cur_offset();
@@ -777,30 +744,16 @@ impl MachInstEmit for Inst {
                 }
                 emit_32(enc_32_jump(not_taken), sink);
             }
-            &Inst::OneWayCondBr { target, kind } => {
+            &Inst::OneWayCondBr { target, cond } => {
                 let off = sink.cur_offset();
                 if let Some(l) = target.as_label() {
-                    let label_use = if let CondBrKind::Cond(_) = kind {
-                        LabelUse::Branch20
-                    } else {
-                        LabelUse::Branch6
-                    };
+                    let label_use = LabelUse::Branch20;
                     sink.use_label_at_offset(off, l, label_use);
                 }
-                match kind {
-                    CondBrKind::Zero(reg) => {
-                        sink.put2(enc_16_comp_branch(reg, true, target));
-                    }
-                    CondBrKind::NotZero(reg) => {
-                        sink.put2(enc_16_comp_branch(reg, false, target));
-                    }
-                    CondBrKind::Cond(c) => {
-                        emit_32(enc_32_cond_branch(c, target), sink);
-                    }
-                }
+                emit_32(enc_32_cond_branch(cond, target), sink);
             }
             &Inst::IndirectBr { rm, .. } => {
-                let inst = 0b010001111_0000_000 | (machreg_to_gpr(rm) << 3);
+                let inst = 0b010001110_0000_000 | (machreg_to_gpr(rm) << 3);
                 sink.put2(inst);
             }
             &Inst::VirtualSPOffsetAdj { offset } => {

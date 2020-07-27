@@ -23,6 +23,9 @@ pub use self::emit::*;
 mod regs;
 pub use self::regs::*;
 
+#[cfg(test)]
+mod emit_tests;
+
 //=============================================================================
 // Instructions (top level): definition
 
@@ -77,6 +80,26 @@ pub enum BitOp {
 pub struct JTSequenceInfo {
     pub targets: Vec<BranchTarget>,
     pub targets_for_term: Vec<MachLabel>, // needed for MachTerminator.
+}
+
+/// Additional information for (direct) Call instructions.
+#[derive(Clone, Debug)]
+pub struct CallInfo {
+    pub dest: ExternalName,
+    pub uses: Vec<Reg>,
+    pub defs: Vec<Writable<Reg>>,
+    pub loc: SourceLoc,
+    pub opcode: Opcode,
+}
+
+/// Additional information for CallInd instructions.
+#[derive(Clone, Debug)]
+pub struct CallIndInfo {
+    pub rm: Reg,
+    pub uses: Vec<Reg>,
+    pub defs: Vec<Writable<Reg>>,
+    pub loc: SourceLoc,
+    pub opcode: Opcode,
 }
 
 /// Instruction formats.
@@ -177,14 +200,14 @@ pub enum Inst {
         rt: Reg,
         mem: MemArg,
         srcloc: Option<SourceLoc>,
-        bits: u8,
+        bytes: ByteAmt,
     },
 
     Load {
         rt: Writable<Reg>,
         mem: MemArg,
         srcloc: Option<SourceLoc>,
-        bits: u8,
+        bytes: ByteAmt,
         sign_extend: bool,
     },
 
@@ -198,7 +221,7 @@ pub enum Inst {
     Extend {
         rd: Writable<Reg>,
         rm: Reg,
-        from_bits: u8,
+        from_bytes: ByteAmt,
         signed: bool,
     },
 
@@ -227,19 +250,11 @@ pub enum Inst {
 
     /// A machine call instruction.
     Call {
-        dest: Box<ExternalName>,
-        uses: Box<Vec<Reg>>,
-        defs: Box<Vec<Writable<Reg>>>,
-        loc: SourceLoc,
-        opcode: Opcode,
+        info: Box<CallInfo>,
     },
     /// A machine indirect-call instruction.
     CallInd {
-        rm: Reg,
-        uses: Box<Vec<Reg>>,
-        defs: Box<Vec<Writable<Reg>>>,
-        loc: SourceLoc,
-        opcode: Opcode,
+        info: Box<CallIndInfo>,
     },
 
     /// Load an inline symbol reference.
@@ -271,14 +286,14 @@ pub enum Inst {
     CondBr {
         taken: BranchTarget,
         not_taken: BranchTarget,
-        kind: CondBrKind,
+        cond: Cond,
     },
 
     /// A one-way conditional branch, invisible to the CFG processing; used *only* as part of
     /// straight-line sequences in code to be emitted.
     OneWayCondBr {
         target: BranchTarget,
-        kind: CondBrKind,
+        cond: Cond,
     },
 
     /// An indirect branch through a register, augmented with set of all
@@ -356,7 +371,7 @@ fn memarg_regs(memarg: &MemArg, collector: &mut RegUsageCollector) {
             collector.add_use(rn);
             collector.add_use(rm);
         }
-        &MemArg::Offset12(rn, ..) => {
+        &MemArg::RegOffset(rn, ..) => {
             collector.add_use(rn);
         }
         &MemArg::SPOffset(_) | &MemArg::NominalSPOffset(..) => {
@@ -372,11 +387,12 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
         | &Inst::Bkpt
         | &Inst::Udf { .. }
         | &Inst::Ret
-        | &Inst::Call { .. }
         | &Inst::VirtualSPOffsetAdj { .. }
         | &Inst::EpiloguePlaceholder
         | &Inst::EmitIsland { .. }
-        | &Inst::Jump { .. } => {}
+        | &Inst::Jump { .. }
+        | &Inst::CondBr { .. }
+        | &Inst::OneWayCondBr { .. } => {}
         &Inst::AluRRR { rd, rn, rm, .. } => {
             collector.add_def(rd);
             collector.add_use(rn);
@@ -465,15 +481,14 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
                 collector.add_def(*reg);
             }
         }
-        &Inst::CallInd {
-            rm,
-            ref uses,
-            ref defs,
-            ..
-        } => {
-            collector.add_uses(uses);
-            collector.add_defs(defs);
-            collector.add_use(rm);
+        &Inst::Call { ref info, .. } => {
+            collector.add_uses(&*info.uses);
+            collector.add_defs(&*info.defs);
+        }
+        &Inst::CallInd { ref info, .. } => {
+            collector.add_uses(&*info.uses);
+            collector.add_defs(&*info.defs);
+            collector.add_use(info.rm);
         }
         &Inst::LoadExtName { rt, .. } => {
             collector.add_def(rt);
@@ -485,18 +500,6 @@ fn arm32_get_regs(inst: &Inst, collector: &mut RegUsageCollector) {
             collector.add_def(rtmp1);
             collector.add_def(rtmp2);
         }
-        &Inst::CondBr { ref kind, .. } => match kind {
-            CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
-                collector.add_use(*rt);
-            }
-            CondBrKind::Cond(_) => {}
-        },
-        &Inst::OneWayCondBr { ref kind, .. } => match kind {
-            CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
-                collector.add_use(*rt);
-            }
-            CondBrKind::Cond(_) => {}
-        },
         &Inst::IndirectBr { rm, .. } => {
             collector.add_use(rm);
         }
@@ -534,16 +537,8 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_use(m, rn);
                 map_use(m, rm);
             }
-            &mut MemArg::Offset12(ref mut rn, ..) => map_use(m, rn),
+            &mut MemArg::RegOffset(ref mut rn, ..) => map_use(m, rn),
             &mut MemArg::SPOffset(_) | &mut MemArg::NominalSPOffset(..) => {}
-        };
-    }
-
-    fn map_br<RUM: RegUsageMapper>(m: &RUM, br: &mut CondBrKind) {
-        match br {
-            &mut CondBrKind::Zero(ref mut reg) => map_use(m, reg),
-            &mut CondBrKind::NotZero(ref mut reg) => map_use(m, reg),
-            &mut CondBrKind::Cond(..) => {}
         };
     }
 
@@ -552,12 +547,13 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
         | &mut Inst::Nop2
         | &mut Inst::Bkpt
         | &mut Inst::Udf { .. }
-        | &mut Inst::Call { .. }
         | &mut Inst::Ret
         | &mut Inst::VirtualSPOffsetAdj { .. }
         | &mut Inst::EpiloguePlaceholder
         | &mut Inst::EmitIsland { .. }
-        | &mut Inst::Jump { .. } => {}
+        | &mut Inst::Jump { .. }
+        | &mut Inst::CondBr { .. }
+        | &mut Inst::OneWayCondBr { .. } => {}
         &mut Inst::AluRRR {
             ref mut rd,
             ref mut rn,
@@ -695,19 +691,22 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
                 map_def(mapper, reg);
             }
         }
-        &mut Inst::CallInd {
-            ref mut rm,
-            ref mut uses,
-            ref mut defs,
-            ..
-        } => {
-            for r in uses.iter_mut() {
+        &mut Inst::Call { ref mut info } => {
+            for r in info.uses.iter_mut() {
                 map_use(mapper, r);
             }
-            for r in defs.iter_mut() {
+            for r in info.defs.iter_mut() {
                 map_def(mapper, r);
             }
-            map_use(mapper, rm);
+        }
+        &mut Inst::CallInd { ref mut info, .. } => {
+            for r in info.uses.iter_mut() {
+                map_use(mapper, r);
+            }
+            for r in info.defs.iter_mut() {
+                map_def(mapper, r);
+            }
+            map_use(mapper, &mut info.rm);
         }
         &mut Inst::LoadExtName { ref mut rt, .. } => {
             map_def(mapper, rt);
@@ -721,12 +720,6 @@ fn arm32_map_regs<RUM: RegUsageMapper>(inst: &mut Inst, mapper: &RUM) {
             map_use(mapper, ridx);
             map_def(mapper, rtmp1);
             map_def(mapper, rtmp2);
-        }
-        &mut Inst::CondBr { ref mut kind, .. } => {
-            map_br(mapper, kind);
-        }
-        &mut Inst::OneWayCondBr { ref mut kind, .. } => {
-            map_br(mapper, kind);
         }
         &mut Inst::IndirectBr { ref mut rm, .. } => {
             map_use(mapper, rm);
@@ -1021,7 +1014,7 @@ impl Inst {
             }
             &Inst::MovImm16 { rd, imm16 } => {
                 let rd = rd.show_rru(mb_rru);
-                format!("movw {}, #{}", rd, imm16)
+                format!("mov {}, #{}", rd, imm16)
             }
             &Inst::Movt { rd, imm16 } => {
                 let rd = rd.show_rru(mb_rru);
@@ -1037,13 +1030,12 @@ impl Inst {
                 format!("cmp {}, #{}", rn, imm8)
             }
             &Inst::Store {
-                rt, ref mem, bits, ..
+                rt, ref mem, bytes, ..
             } => {
-                let op = match bits {
-                    32 => "str",
-                    16 => "strh",
-                    8 => "strb",
-                    _ => panic!("Unsupported Store case: {:?}", self),
+                let op = match bytes {
+                    ByteAmt::Word => "str",
+                    ByteAmt::Halfword => "strh",
+                    ByteAmt::Byte => "strb",
                 };
                 let rt = rt.show_rru(mb_rru);
                 let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru, state);
@@ -1053,17 +1045,16 @@ impl Inst {
             &Inst::Load {
                 rt,
                 ref mem,
-                bits,
+                bytes,
                 sign_extend,
                 ..
             } => {
-                let op = match (bits, sign_extend) {
-                    (32, _) => "ldr",
-                    (16, true) => "ldrsh",
-                    (16, false) => "ldrh",
-                    (8, true) => "ldrsb",
-                    (8, false) => "ldrb",
-                    _ => panic!("Unsupported Load case: {:?}", self),
+                let op = match (bytes, sign_extend) {
+                    (ByteAmt::Word, _) => "ldr",
+                    (ByteAmt::Halfword, true) => "ldrsh",
+                    (ByteAmt::Halfword, false) => "ldrh",
+                    (ByteAmt::Byte, true) => "ldrsb",
+                    (ByteAmt::Byte, false) => "ldrb",
                 };
                 let rt = rt.show_rru(mb_rru);
                 let (mem_str, mem) = mem_finalize_for_show(mem, mb_rru, state);
@@ -1088,7 +1079,7 @@ impl Inst {
                             shift: Some(shift),
                         }
                     }
-                    MemArg::Offset12(reg, off12) => Inst::AluRRImm12 {
+                    MemArg::RegOffset(reg, off12) => Inst::AluRRImm12 {
                         alu_op: ALUOp::Add,
                         rd,
                         rn: reg,
@@ -1102,14 +1093,14 @@ impl Inst {
             &Inst::Extend {
                 rd,
                 rm,
-                from_bits,
+                from_bytes,
                 signed,
             } => {
-                let op = match (from_bits, signed) {
-                    (16, true) => "sxth",
-                    (16, false) => "uxth",
-                    (8, true) => "sxtb",
-                    (8, false) => "uxtb",
+                let op = match (from_bytes, signed) {
+                    (ByteAmt::Halfword, true) => "sxth",
+                    (ByteAmt::Halfword, false) => "uxth",
+                    (ByteAmt::Byte, true) => "sxtb",
+                    (ByteAmt::Byte, false) => "uxtb",
                     _ => panic!("Unsupported Extend case: {:?}", self),
                 };
                 let rd = rd.show_rru(mb_rru);
@@ -1119,18 +1110,19 @@ impl Inst {
             &Inst::It { cond, ref insts } => {
                 let te: String = insts
                     .iter()
+                    .skip(1)
                     .map(|i| if i.then { "t" } else { "e" })
                     .collect();
                 let cond = cond.show_rru(mb_rru);
                 let mut ret = format!("it{} {}", te, cond);
                 for inst in insts.into_iter() {
-                    ret.push_str("; ");
+                    ret.push_str(" ; ");
                     ret.push_str(&inst.inst.show_rru(mb_rru));
                 }
                 ret
             }
             &Inst::Bkpt => "bkpt #0".to_string(),
-            &Inst::Udf { .. } => "udf".to_string(),
+            &Inst::Udf { .. } => "udf #0".to_string(),
             &Inst::Push { ref reg_list } => {
                 assert!(!reg_list.is_empty());
                 let first_reg = reg_list[0].show_rru(mb_rru);
@@ -1151,9 +1143,9 @@ impl Inst {
                     .collect();
                 format!("pop {{{}{}}}", first_reg, regs)
             }
-            &Inst::Call { dest: _, .. } => format!("bl 0"),
-            &Inst::CallInd { rm, .. } => {
-                let rm = rm.show_rru(mb_rru);
+            &Inst::Call { .. } => format!("bl 0"),
+            &Inst::CallInd { ref info, .. } => {
+                let rm = info.rm.show_rru(mb_rru);
                 format!("blx {}", rm)
             }
             &Inst::LoadExtName {
@@ -1197,44 +1189,20 @@ impl Inst {
             &Inst::CondBr {
                 ref taken,
                 ref not_taken,
-                ref kind,
+                ref cond,
             } => {
                 let taken = taken.show_rru(mb_rru);
                 let not_taken = not_taken.show_rru(mb_rru);
-                match kind {
-                    &CondBrKind::Zero(reg) => {
-                        let reg = reg.show_rru(mb_rru);
-                        format!("cbz {}, {} ; b {}", reg, taken, not_taken)
-                    }
-                    &CondBrKind::NotZero(reg) => {
-                        let reg = reg.show_rru(mb_rru);
-                        format!("cbnz {}, {} ; b {}", reg, taken, not_taken)
-                    }
-                    &CondBrKind::Cond(c) => {
-                        let c = c.show_rru(mb_rru);
-                        format!("b.{} {} ; b {}", c, taken, not_taken)
-                    }
-                }
+                let c = cond.show_rru(mb_rru);
+                format!("b{} {} ; b {}", c, taken, not_taken)
             }
             &Inst::OneWayCondBr {
                 ref target,
-                ref kind,
+                ref cond,
             } => {
                 let target = target.show_rru(mb_rru);
-                match kind {
-                    &CondBrKind::Zero(reg) => {
-                        let reg = reg.show_rru(mb_rru);
-                        format!("cbz {}, {}", reg, target)
-                    }
-                    &CondBrKind::NotZero(reg) => {
-                        let reg = reg.show_rru(mb_rru);
-                        format!("cbnz {}, {}", reg, target)
-                    }
-                    &CondBrKind::Cond(c) => {
-                        let c = c.show_rru(mb_rru);
-                        format!("b.{} {}", c, target)
-                    }
-                }
+                let c = cond.show_rru(mb_rru);
+                format!("b{} {}", c, target)
             }
             &Inst::IndirectBr { rm, .. } => {
                 let rm = rm.show_rru(mb_rru);

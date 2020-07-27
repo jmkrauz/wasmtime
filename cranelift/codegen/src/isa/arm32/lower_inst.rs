@@ -303,13 +303,12 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             } else {
                 None
             };
-            let bits = elem_ty.bits() as u8;
-
+            let bytes = ByteAmt::from_bits(elem_ty.bits()).unwrap();
             ctx.emit(Inst::Store {
                 rt,
                 mem,
                 srcloc,
-                bits,
+                bytes,
             });
         }
         Opcode::Load
@@ -362,12 +361,12 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             } else {
                 None
             };
-            let bits = elem_ty.bits() as u8;
+            let bytes = ByteAmt::from_bits(elem_ty.bits()).unwrap();
             ctx.emit(Inst::Load {
                 rt: out_reg,
                 mem,
                 srcloc,
-                bits,
+                bytes,
                 sign_extend,
             });
         }
@@ -393,10 +392,11 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                     imm8: 0x1,
                 });
             } else if from_bits < to_bits {
+                let from_bytes = ByteAmt::from_bits(from_bits).unwrap();
                 ctx.emit(Inst::Extend {
                     rd,
                     rm,
-                    from_bits,
+                    from_bytes,
                     signed,
                 });
             }
@@ -458,7 +458,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             let cond = lower_condcode(condcode);
             ctx.emit(Inst::OneWayCondBr {
                 target: BranchTarget::ResolvedOffset(2),
-                kind: CondBrKind::Cond(cond),
+                cond,
             });
             ctx.emit(Inst::Udf { trap_info });
         }
@@ -547,9 +547,9 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                     },
                     NarrowValueMode::ZeroExtend,
                 );
-                let kind = match op0 {
-                    Opcode::Brz => CondBrKind::Cond(Cond::Eq),
-                    Opcode::Brnz => CondBrKind::Cond(Cond::Ne),
+                let cond = match op0 {
+                    Opcode::Brz => Cond::Eq,
+                    Opcode::Brnz => Cond::Ne,
                     _ => unreachable!(),
                 };
 
@@ -557,7 +557,7 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                 ctx.emit(Inst::CondBr {
                     taken,
                     not_taken,
-                    kind,
+                    cond,
                 });
             }
             Opcode::BrIcmp => unimplemented!(),
@@ -625,7 +625,7 @@ pub(crate) fn lower_branch<C: LowerCtx<I = Inst>>(
                 let default_target = BranchTarget::Label(targets[0]);
                 ctx.emit(Inst::OneWayCondBr {
                     target: default_target.clone(),
-                    kind: CondBrKind::Cond(Cond::Hs), // unsigned >=
+                    cond: Cond::Hs, // unsigned >=
                 });
 
                 let jt_targets: Vec<BranchTarget> = targets

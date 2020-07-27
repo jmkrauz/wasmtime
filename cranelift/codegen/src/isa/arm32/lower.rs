@@ -124,21 +124,23 @@ pub(crate) fn input_to_reg<C: LowerCtx<I = Inst>>(
         }
         (NarrowValueMode::ZeroExtend, n) if n < 32 => {
             let tmp = ctx.alloc_tmp(RegClass::I32, I32);
+            let from_bytes = ByteAmt::from_bits(n).unwrap();
             ctx.emit(Inst::Extend {
                 rd: tmp,
                 rm: in_reg,
                 signed: false,
-                from_bits,
+                from_bytes,
             });
             tmp.to_reg()
         }
         (NarrowValueMode::SignExtend, n) if n < 32 => {
             let tmp = ctx.alloc_tmp(RegClass::I32, I32);
+            let from_bytes = ByteAmt::from_bits(n).unwrap();
             ctx.emit(Inst::Extend {
                 rd: tmp,
                 rm: in_reg,
                 signed: true,
-                from_bits,
+                from_bytes,
             });
             tmp.to_reg()
         }

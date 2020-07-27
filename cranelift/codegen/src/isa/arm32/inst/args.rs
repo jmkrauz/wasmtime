@@ -6,6 +6,34 @@ use regalloc::{RealRegUniverse, Reg};
 
 use std::string::String;
 
+/// A byte amount for load/store/extend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ByteAmt {
+    Word,
+    Halfword,
+    Byte,
+}
+
+impl ByteAmt {
+    pub fn bits(self) -> u32 {
+        match self {
+            ByteAmt::Word => 32,
+            ByteAmt::Halfword => 16,
+            ByteAmt::Byte => 8,
+        }
+    }
+
+    pub fn from_bits<I: Into<usize>>(bits: I) -> Option<ByteAmt> {
+        let bits: usize = bits.into();
+        match bits {
+            32 => Some(ByteAmt::Word),
+            16 => Some(ByteAmt::Halfword),
+            8 => Some(ByteAmt::Byte),
+            _ => None,
+        }
+    }
+}
+
 /// A shift operator for a register or immediate.
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
@@ -75,8 +103,8 @@ pub enum MemArg {
     /// Register plus register offset, which can be shifted by imm2.
     RegReg(Reg, Reg, u32),
 
-    /// Unsigned 12-bit immediate offset from reg.
-    Offset12(Reg, i32),
+    /// Unsigned immediate offset from reg.
+    RegOffset(Reg, i32),
 
     SPOffset(i32),
 
@@ -89,7 +117,7 @@ impl MemArg {
         if offset >= (1 << 12) || offset < 0 {
             None
         } else {
-            Some(MemArg::Offset12(reg, offset))
+            Some(MemArg::RegOffset(reg, offset))
         }
     }
 
@@ -257,7 +285,13 @@ impl BranchTarget {
 
 impl ShowWithRRU for ShiftOpAndAmt {
     fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        format!("{:?} {}", self.op(), self.amt().value())
+        let op = match self.op() {
+            ShiftOp::LSL => "lsl",
+            ShiftOp::LSR => "lsr",
+            ShiftOp::ASR => "asr",
+            ShiftOp::ROR => "ror",
+        };
+        format!("{} #{}", op, self.amt().value())
     }
 }
 
@@ -266,7 +300,7 @@ impl ShowWithRRU for MemArg {
         match self {
             &MemArg::RegReg(rn, rm, imm2) => {
                 let shift = if imm2 != 0 {
-                    format!(", LSL #{}", imm2)
+                    format!(", lsl #{}", imm2)
                 } else {
                     "".to_string()
                 };
@@ -277,7 +311,7 @@ impl ShowWithRRU for MemArg {
                     shift
                 )
             }
-            &MemArg::Offset12(rn, off) => format!("[{}, #{}]", rn.show_rru(mb_rru), off),
+            &MemArg::RegOffset(rn, off) => format!("[{}, #{}]", rn.show_rru(mb_rru), off),
             &MemArg::SPOffset(_) | &MemArg::NominalSPOffset(_) => panic!("unexpected mem mode"),
         }
     }

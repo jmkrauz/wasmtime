@@ -222,7 +222,7 @@ fn load_stack(mem: MemArg, into_reg: Writable<Reg>, ty: Type) -> Inst {
                 rt: into_reg,
                 mem,
                 srcloc: None,
-                bits: 32,
+                bytes: ByteAmt::Word,
                 sign_extend: false,
             }
         }
@@ -237,7 +237,7 @@ fn store_stack(mem: MemArg, from_reg: Reg, ty: Type) -> Inst {
                 rt: from_reg,
                 mem,
                 srcloc: None,
-                bits: 32,
+                bytes: ByteAmt::Word,
             }
         }
         _ => unimplemented!("store_stack({})", ty),
@@ -382,22 +382,22 @@ impl ABIBody for Arm32ABIBody {
         let mut ret = Vec::new();
         match &self.sig.rets[idx] {
             &ABIArg::Reg(r, ty) => {
-                let from_bits = ty.bits() as u8;
+                let from_bytes = ByteAmt::from_bits(ty.bits()).unwrap();
                 let dest_reg = Writable::from_reg(r.to_reg());
-                match (ext, from_bits) {
-                    (ArgumentExtension::Uext, n) if n < 32 => {
+                match (ext, from_bytes) {
+                    (ArgumentExtension::Uext, n) if n != ByteAmt::Word => {
                         ret.push(Inst::Extend {
                             rd: dest_reg,
                             rm: from_reg.to_reg(),
-                            from_bits,
+                            from_bytes,
                             signed: false,
                         });
                     }
-                    (ArgumentExtension::Sext, n) if n < 32 => {
+                    (ArgumentExtension::Sext, n) if n != ByteAmt::Word => {
                         ret.push(Inst::Extend {
                             rd: dest_reg,
                             rm: from_reg.to_reg(),
-                            from_bits,
+                            from_bytes,
                             signed: true,
                         });
                     }
@@ -405,22 +405,22 @@ impl ABIBody for Arm32ABIBody {
                 };
             }
             &ABIArg::Stack(off, ty) => {
-                let from_bits = ty.bits() as u8;
+                let from_bytes = ByteAmt::from_bits(ty.bits()).unwrap();
                 // Trash the from_reg; it should be its last use.
-                match (ext, from_bits) {
-                    (ArgumentExtension::Uext, n) if n < 32 => {
+                match (ext, from_bytes) {
+                    (ArgumentExtension::Uext, n) if n != ByteAmt::Word => {
                         ret.push(Inst::Extend {
                             rd: from_reg,
                             rm: from_reg.to_reg(),
-                            from_bits,
+                            from_bytes,
                             signed: false,
                         });
                     }
-                    (ArgumentExtension::Sext, n) if n < 32 => {
+                    (ArgumentExtension::Sext, n) if n != ByteAmt::Word => {
                         ret.push(Inst::Extend {
                             rd: from_reg,
                             rm: from_reg.to_reg(),
-                            from_bits,
+                            from_bytes,
                             signed: true,
                         });
                     }
@@ -828,11 +828,13 @@ impl ABICall for Arm32ABICall {
         );
         match &self.dest {
             &CallDest::ExtName(ref name, RelocDistance::Near) => ctx.emit(Inst::Call {
-                dest: Box::new(name.clone()),
-                uses: Box::new(uses),
-                defs: Box::new(defs),
-                loc: self.loc,
-                opcode: self.opcode,
+                info: Box::new(CallInfo {
+                    dest: name.clone(),
+                    uses: uses,
+                    defs: defs,
+                    loc: self.loc,
+                    opcode: self.opcode,
+                }),
             }),
             &CallDest::ExtName(ref name, RelocDistance::Far) => {
                 ctx.emit(Inst::LoadExtName {
@@ -842,19 +844,23 @@ impl ABICall for Arm32ABICall {
                     srcloc: self.loc,
                 });
                 ctx.emit(Inst::CallInd {
-                    rm: ip_reg(),
-                    uses: Box::new(uses),
-                    defs: Box::new(defs),
-                    loc: self.loc,
-                    opcode: self.opcode,
+                    info: Box::new(CallIndInfo {
+                        rm: ip_reg(),
+                        uses: uses,
+                        defs: defs,
+                        loc: self.loc,
+                        opcode: self.opcode,
+                    }),
                 });
             }
             &CallDest::Reg(reg) => ctx.emit(Inst::CallInd {
-                rm: reg,
-                uses: Box::new(uses),
-                defs: Box::new(defs),
-                loc: self.loc,
-                opcode: self.opcode,
+                info: Box::new(CallIndInfo {
+                    rm: reg,
+                    uses: uses,
+                    defs: defs,
+                    loc: self.loc,
+                    opcode: self.opcode,
+                }),
             }),
         }
     }
