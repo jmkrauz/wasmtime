@@ -209,7 +209,7 @@ pub struct Arm32ABIBody {
 
 fn in_int_reg(ty: ir::Type) -> bool {
     match ty {
-        types::I8 | types::I16 | types::I32 => true,
+        types::I8 | types::I16 | types::I32 | types::IFLAGS => true,
         types::B1 | types::B8 | types::B16 | types::B32 => true,
         _ => false,
     }
@@ -280,7 +280,9 @@ impl Arm32ABIBody {
         let call_conv = f.signature.call_conv;
         // Only this calling conventions are supported.
         assert!(
-            call_conv == isa::CallConv::SystemV,
+            call_conv == isa::CallConv::SystemV
+                || call_conv == isa::CallConv::Fast
+                || call_conv == isa::CallConv::Cold,
             "Unsupported calling convention: {:?}",
             call_conv
         );

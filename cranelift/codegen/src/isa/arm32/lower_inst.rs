@@ -103,6 +103,16 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
             };
             ctx.emit(Inst::AluRRR { alu_op, rd, rn, rm });
         }
+        Opcode::Ineg => {
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rn = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
+            ctx.emit(Inst::AluRRImm8 {
+                alu_op: ALUOp::Rsb,
+                rd,
+                rn,
+                imm8: 0,
+            });
+        }
         Opcode::Ishl | Opcode::Ushr | Opcode::Sshr | Opcode::Rotr => {
             if ty.unwrap().bits() != 32 {
                 unimplemented!()
@@ -207,20 +217,63 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
                 shift: None,
             });
         }
-        Opcode::Clz | Opcode::Bitrev => {
+        Opcode::Clz | Opcode::Ctz => {
+            let rd = output_to_reg(ctx, outputs[0]);
+            let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::ZeroExtend);
+            let ty = ctx.output_ty(insn, 0);
+
+            let in_reg = if op == Opcode::Ctz {
+                ctx.emit(Inst::BitOpRR {
+                    bit_op: BitOp::Rbit,
+                    rd,
+                    rm,
+                });
+                rd.to_reg()
+            } else {
+                rm
+            };
+            ctx.emit(Inst::BitOpRR {
+                bit_op: BitOp::Clz,
+                rd,
+                rm: in_reg,
+            });
+
+            if ty.bits() < 32 {
+                ctx.emit(Inst::AluRRImm12 {
+                    alu_op: ALUOp::Sub,
+                    rd,
+                    rn: rd.to_reg(),
+                    imm12: 32 - ty.bits(),
+                });
+            }
+        }
+        Opcode::Bitrev => {
             let rd = output_to_reg(ctx, outputs[0]);
             let rm = input_to_reg(ctx, inputs[0], NarrowValueMode::None);
             let ty = ctx.output_ty(insn, 0);
-            let bit_op = match op {
-                Opcode::Clz => BitOp::Clz,
-                Opcode::Bitrev => BitOp::Rbit,
-                _ => unreachable!(),
-            };
+            let bit_op = BitOp::Rbit;
 
-            if ty != I32 && ty != B32 {
-                unimplemented!()
+            match ty.bits() {
+                32 => ctx.emit(Inst::BitOpRR { bit_op, rd, rm }),
+                n if n < 32 => {
+                    let shift = ShiftOpAndAmt::new(
+                        ShiftOp::LSL,
+                        ShiftOpShiftImm::maybe_from_shift(32 - n as u32).unwrap(),
+                    );
+                    ctx.emit(Inst::AluRRShift {
+                        alu_op: ALUOp1::Mov,
+                        rd,
+                        rm,
+                        shift: Some(shift),
+                    });
+                    ctx.emit(Inst::BitOpRR {
+                        bit_op,
+                        rd,
+                        rm: rd.to_reg(),
+                    });
+                }
+                _ => panic!("Unexpected output type {}", ty),
             }
-            ctx.emit(Inst::BitOpRR { bit_op, rd, rm });
         }
         Opcode::Icmp => {
             let condcode = inst_condcode(ctx.data(insn)).unwrap();
@@ -464,7 +517,7 @@ pub(crate) fn lower_insn_to_regs<C: LowerCtx<I = Inst>>(
         }
         Opcode::FallthroughReturn | Opcode::Return => {
             for (i, input) in inputs.iter().enumerate() {
-                let reg = input_to_reg(ctx, *input, NarrowValueMode::ZeroExtend);
+                let reg = input_to_reg(ctx, *input, NarrowValueMode::None);
                 let retval_reg = ctx.retval(i);
                 let ty = ctx.input_ty(insn, i);
                 ctx.emit(Inst::gen_move(retval_reg, reg, ty));

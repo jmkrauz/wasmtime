@@ -40,10 +40,9 @@ pub fn legalize_inst(
         | ir::Opcode::Sload32
         | ir::Opcode::Istore32
         | ir::Opcode::Ireduce => return Some(arm32_expand),
-        op if op.is_ghost() => return None,
         _ => {}
     }
-    if ctrl_typevar == ir::types::I64 {
+    if !inst.opcode().is_ghost() && ctrl_typevar == ir::types::I64 {
         Some(arm32_narrow)
     } else {
         None

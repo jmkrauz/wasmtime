@@ -1,0 +1,201 @@
+test compile
+target arm
+
+function %iadd(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = iadd v0, v1
+  return v2
+}
+
+; check: add r0, r0, r1
+; nextln: bx lr
+
+function %sadd_sat(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = sadd_sat v0, v1
+  return v2
+}
+
+; check: qadd r0, r0, r1
+; nextln: bx lr
+
+function %isub(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = isub v0, v1
+  return v2
+}
+
+; check: sub r0, r0, r1
+; nextln: bx lr
+
+function %ssub_sat(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = ssub_sat v0, v1
+  return v2
+}
+
+; check: qsub r0, r0, r1
+; nextln: bx lr
+
+function %ineg(i32) -> i32 {
+block0(v0: i32):
+  v1 = ineg v0
+  return v1
+}
+
+; check: rsb r0, r0, #0
+; nextln: bx lr
+
+function %imul(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = imul v0, v1
+  return v2
+}
+
+; check: mul r0, r0, r1
+; nextln: bx lr
+
+function %umulhi(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = umulhi v0, v1
+  return v2
+}
+
+; check: umull r1, r0, r0, r1
+; nextln: bx lr
+
+function %smulhi(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = smulhi v0, v1
+  return v2
+}
+
+; check: smull r1, r0, r0, r1
+; nextln: bx lr
+
+function %udiv(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = udiv v0, v1
+  return v2
+}
+
+; check: udiv r0, r0, r1
+; nextln: bx lr
+
+function %sdiv(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = sdiv v0, v1
+  return v2
+}
+
+; check: sdiv r0, r0, r1
+; nextln: bx lr
+
+function %iadd_ifcin(i32, i32, iflags) -> i32 {
+block0(v0: i32, v1: i32, v2: iflags):
+  v3 = iadd_ifcin v0, v1, v2
+  return v3
+}
+
+; check: adc r0, r0, r1
+; nextln: bx lr
+
+function %iadd_ifcout(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2, v3 = iadd_ifcout v0, v1
+  return v2
+}
+
+; check: adds r0, r0, r1
+; nextln: bx lr
+
+function %iadd_ifcarry(i32, i32, iflags) -> i32 {
+block0(v0: i32, v1: i32, v2: iflags):
+  v3, v4 = iadd_ifcarry v0, v1, v2
+  return v3
+}
+
+; check: adcs r0, r0, r1
+; nextln: bx lr
+
+function %isub_ifbin(i32, i32, iflags) -> i32 {
+block0(v0: i32, v1: i32, v2: iflags):
+  v3 = isub_ifbin v0, v1, v2
+  return v3
+}
+
+; check: sbc r0, r0, r1
+; nextln: bx lr
+
+function %isub_ifbout(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2, v3 = isub_ifbout v0, v1
+  return v2
+}
+
+; check: subs r0, r0, r1
+; nextln: bx lr
+
+function %isub_ifborrow(i32, i32, iflags) -> i32 {
+block0(v0: i32, v1: i32, v2: iflags):
+  v3, v4 = isub_ifborrow v0, v1, v2
+  return v3
+}
+
+; check: sbcs r0, r0, r1
+; nextln: bx lr
+
+
+function %band(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = band v0, v1
+  return v2
+}
+
+; check: and r0, r0, r1
+; nextln: bx lr
+
+function %bor(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = bor v0, v1
+  return v2
+}
+
+; check: orr r0, r0, r1
+; nextln: bx lr
+
+function %bxor(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = bxor v0, v1
+  return v2
+}
+
+; check: eor r0, r0, r1
+; nextln: bx lr
+
+function %bnot(i32) -> i32 {
+block0(v0: i32):
+  v1 = bnot v0
+  return v1
+}
+
+; check: mvn r0, r0
+; nextln: bx lr
+
+function %band_not(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = band_not v0, v1
+  return v2
+}
+
+; check: bic r0, r0, r1
+; nextln: bx lr
+
+function %bor_not(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = bor_not v0, v1
+  return v2
+}
+
+; check: orn r0, r0, r1
+; nextln: bx lr
